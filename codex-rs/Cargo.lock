@@ -2505,6 +2505,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-mobile-core"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "codex-model-provider"
 version = "0.0.0"
 dependencies = [

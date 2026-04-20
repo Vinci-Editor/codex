@@ -44,6 +44,7 @@ members = [
     "login",
     "codex-mcp",
     "mcp-server",
+    "mobile-core",
     "model-provider-info",
     "models-manager",
     "network-proxy",
@@ -149,6 +150,7 @@ codex-lmstudio = { path = "lmstudio" }
 codex-login = { path = "login" }
 codex-mcp = { path = "codex-mcp" }
 codex-mcp-server = { path = "mcp-server" }
+codex-mobile-core = { path = "mobile-core" }
 codex-model-provider-info = { path = "model-provider-info" }
 codex-models-manager = { path = "models-manager" }
 codex-network-proxy = { path = "network-proxy" }
