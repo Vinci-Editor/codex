@@ -325,15 +325,22 @@ private final class CodexBrowserPresentationProvider: NSObject, ASWebAuthenticat
         if let anchor {
             return anchor()
         }
-        #if canImport(UIKit)
+#if canImport(UIKit)
         if let window = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
             .flatMap(\.windows)
             .first(where: \.isKeyWindow) {
             return window
         }
-        #endif
+        if let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first {
+            return ASPresentationAnchor(windowScene: scene)
+        }
+        preconditionFailure("CodexBrowserAuthenticator requires a UIWindowScene presentation anchor.")
+#else
         return ASPresentationAnchor()
+#endif
     }
 }
 

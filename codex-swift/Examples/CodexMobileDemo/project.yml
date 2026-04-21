@@ -40,3 +40,4 @@ targets:
         CODE_SIGN_STYLE: Automatic
         TARGETED_DEVICE_FAMILY: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64

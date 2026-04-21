@@ -18,6 +18,7 @@ struct DemoChatView: View {
     @State private var model = "gpt-5.4"
     @State private var session: CodexSession?
     @State private var isSending = false
+    @State private var isSigningIn = false
     @State private var workspace: CodexWorkspace?
     @State private var isPickingWorkspace = false
     @State private var isEditingCustomModel = false
@@ -51,10 +52,21 @@ struct DemoChatView: View {
             .navigationTitle("Codex")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Device Login") {
-                        Task { await startDeviceLogin() }
+                    Menu {
+                        Button {
+                            Task { await startBrowserLogin() }
+                        } label: {
+                            Label("Browser Login", systemImage: "globe")
+                        }
+                        Button {
+                            Task { await startDeviceLogin() }
+                        } label: {
+                            Label("Device Login", systemImage: "rectangle.and.pencil.and.ellipsis")
+                        }
+                    } label: {
+                        Label(isSigningIn ? "Signing In" : "Sign In", systemImage: "person.crop.circle.badge.checkmark")
                     }
-                    .disabled(isSending)
+                    .disabled(isSending || isSigningIn)
                 }
             }
             .fileImporter(
@@ -227,7 +239,35 @@ struct DemoChatView: View {
         }
     }
 
+    @MainActor
+    private func startBrowserLogin() async {
+        guard !isSigningIn else {
+            return
+        }
+        isSigningIn = true
+        defer {
+            isSigningIn = false
+        }
+
+        do {
+            let authenticator = CodexBrowserAuthenticator()
+            let tokens = try await authenticator.authenticate()
+            try saveSignedInTokens(tokens, source: "browser")
+        } catch {
+            appendMessage(role: .error, text: displayError(error))
+        }
+    }
+
+    @MainActor
     private func startDeviceLogin() async {
+        guard !isSigningIn else {
+            return
+        }
+        isSigningIn = true
+        defer {
+            isSigningIn = false
+        }
+
         do {
             let authenticator = CodexDeviceCodeAuthenticator()
             let code = try await authenticator.requestDeviceCode()
@@ -236,11 +276,20 @@ struct DemoChatView: View {
                 text: "Open \(code.verificationURL.absoluteString)\nCode: \(code.userCode)"
             )
             let tokens = try await authenticator.pollForTokens(deviceCode: code)
-            try authStore.saveTokens(tokens)
-            appendMessage(role: .system, text: "Signed in")
+            try saveSignedInTokens(tokens, source: "device")
         } catch {
             appendMessage(role: .error, text: displayError(error))
         }
+    }
+
+    private func saveSignedInTokens(_ tokens: CodexAuthTokens, source: String) throws {
+        try authStore.saveTokens(tokens)
+        session = nil
+
+        let metadata = tokens.resolvedAccountMetadata
+        let account = metadata.email ?? metadata.accountID ?? "ChatGPT account"
+        let plan = metadata.planType.map { " (\($0))" } ?? ""
+        appendMessage(role: .system, text: "Signed in with \(source) login: \(account)\(plan).")
     }
 
     private func makeSession() -> CodexSession {
@@ -305,7 +354,7 @@ struct DemoChatView: View {
             case .httpStatus(let status, let body):
                 return body.isEmpty ? "HTTP \(status)" : "HTTP \(status)\n\(body)"
             case .missingAuthentication:
-                return "Sign in with Device Login first."
+                return "Sign in with Browser Login or Device Login first."
             case .unknownTool(let name):
                 return "Unknown tool: \(name)"
             case .workspacePathError(let message):

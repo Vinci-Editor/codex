@@ -5,7 +5,9 @@ Minimal iOS 26 demo app source for embedding `CodexKit`.
 This folder intentionally keeps the app narrow:
 
 - ChatGPT device-code sign-in
+- ChatGPT browser PKCE sign-in
 - provider selection
+- model selection
 - workspace selection
 - streaming chat
 - built-in tool transcript
