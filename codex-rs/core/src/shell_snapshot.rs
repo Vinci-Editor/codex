@@ -29,6 +29,11 @@ pub struct ShellSnapshot {
     pub cwd: AbsolutePathBuf,
 }
 
+// On iOS the shell environment is minimal and snapshot attempts frequently
+// timeout, adding 10s to every thread/start.
+#[cfg(target_os = "ios")]
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(target_os = "ios"))]
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const SNAPSHOT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 3); // 3 days retention.
 const SNAPSHOT_DIR: &str = "shell_snapshots";

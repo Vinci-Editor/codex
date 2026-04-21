@@ -319,6 +319,7 @@ mod tests {
             session_mode: RealtimeSessionMode::Conversational,
             output_modality: RealtimeOutputModality::Audio,
             voice: RealtimeVoice::Marin,
+            dynamic_tools: None,
         }
     }
 

@@ -2509,11 +2509,15 @@ name = "codex-mobile-core"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "codex-apply-patch",
+ "codex-exec-server",
+ "codex-utils-absolute-path",
  "pretty_assertions",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

@@ -454,6 +454,16 @@ client_request_definitions! {
         params: v2::ThreadRealtimeStopParams,
         response: v2::ThreadRealtimeStopResponse,
     },
+    #[experimental("thread/realtime/resolveHandoff")]
+    ThreadRealtimeResolveHandoff => "thread/realtime/resolveHandoff" {
+        params: v2::ThreadRealtimeResolveHandoffParams,
+        response: v2::ThreadRealtimeResolveHandoffResponse,
+    },
+    #[experimental("thread/realtime/finalizeHandoff")]
+    ThreadRealtimeFinalizeHandoff => "thread/realtime/finalizeHandoff" {
+        params: v2::ThreadRealtimeFinalizeHandoffParams,
+        response: v2::ThreadRealtimeFinalizeHandoffResponse,
+    },
     #[experimental("thread/realtime/listVoices")]
     ThreadRealtimeListVoices => "thread/realtime/listVoices" {
         params: v2::ThreadRealtimeListVoicesParams,
@@ -1830,6 +1840,9 @@ mod tests {
                 session_id: Some("sess_456".to_string()),
                 transport: None,
                 voice: Some(RealtimeVoice::Marin),
+
+                client_controlled_handoff: false,
+                dynamic_tools: None,
             },
         };
         assert_eq!(
@@ -1842,7 +1855,9 @@ mod tests {
                     "prompt": "You are on a call",
                     "sessionId": "sess_456",
                     "transport": null,
-                    "voice": "marin"
+                    "voice": "marin",
+                    "clientControlledHandoff": false,
+                    "dynamicTools": null
                 }
             }),
             serde_json::to_value(&request)?,
@@ -1861,6 +1876,9 @@ mod tests {
                 session_id: None,
                 transport: None,
                 voice: None,
+
+                client_controlled_handoff: false,
+                dynamic_tools: None,
             },
         };
         assert_eq!(
@@ -1872,7 +1890,9 @@ mod tests {
                     "outputModality": "audio",
                     "sessionId": null,
                     "transport": null,
-                    "voice": null
+                    "voice": null,
+                    "clientControlledHandoff": false,
+                    "dynamicTools": null
                 }
             }),
             serde_json::to_value(&default_prompt_request)?,
@@ -1887,6 +1907,9 @@ mod tests {
                 session_id: None,
                 transport: None,
                 voice: None,
+
+                client_controlled_handoff: false,
+                dynamic_tools: None,
             },
         };
         assert_eq!(
@@ -1899,7 +1922,9 @@ mod tests {
                     "prompt": null,
                     "sessionId": null,
                     "transport": null,
-                    "voice": null
+                    "voice": null,
+                    "clientControlledHandoff": false,
+                    "dynamicTools": null
                 }
             }),
             serde_json::to_value(&null_prompt_request)?,
@@ -2016,6 +2041,9 @@ mod tests {
                 session_id: None,
                 transport: None,
                 voice: None,
+
+                client_controlled_handoff: false,
+                dynamic_tools: None,
             },
         };
         let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);

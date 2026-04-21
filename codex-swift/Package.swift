@@ -13,7 +13,11 @@ var targets: [Target] = [
     .target(
         name: "CodexMobileCoreBridge",
         dependencies: hasMobileCoreArtifact ? ["CodexMobileCore"] : [],
-        path: "Sources/CodexMobileCoreBridge"
+        path: "Sources/CodexMobileCoreBridge",
+        linkerSettings: [
+            .linkedFramework("SystemConfiguration", .when(platforms: [.iOS, .macOS])),
+            .linkedLibrary("z", .when(platforms: [.iOS, .macOS])),
+        ]
     ),
     .target(
         name: "CodexKit",

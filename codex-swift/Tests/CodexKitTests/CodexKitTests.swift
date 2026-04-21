@@ -100,6 +100,23 @@ func sessionExecutesBuiltinWorkspaceTools() async throws {
 
     #expect(listOutput.contains("notes.txt"))
     #expect(catOutput == "hello\n")
+
+    let patch = """
+    *** Begin Patch
+    *** Add File: added.txt
+    +patched
+    *** End Patch
+    """
+    let patchArguments = try jsonString(["patch": patch])
+    let patchData = try await session.executeToolCall(CodexToolCall(
+        callID: "call-patch",
+        name: "apply_patch",
+        arguments: patchArguments
+    ))
+    let patchOutput = try toolOutputBody(patchData)
+
+    #expect(patchOutput.contains("A added.txt"))
+    #expect(try String(contentsOf: root.appending(path: "added.txt"), encoding: .utf8) == "patched\n")
 }
 
 private func jwt(payload: [String: Any]) throws -> String {
@@ -114,4 +131,9 @@ private func jwt(payload: [String: Any]) throws -> String {
 private func toolOutputBody(_ data: Data) throws -> String {
     let item = try JSONSerialization.jsonObject(with: data) as? [String: Any]
     return item?["output"] as? String ?? ""
+}
+
+private func jsonString(_ object: [String: Any]) throws -> String {
+    let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    return String(decoding: data, as: UTF8.self)
 }

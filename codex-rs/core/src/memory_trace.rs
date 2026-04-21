@@ -168,10 +168,8 @@ fn normalize_trace_items(items: Vec<Value>, path: &Path) -> Result<Vec<Value>> {
             }
 
             match payload {
-                Value::Object(payload_item) => {
-                    if is_allowed_trace_item(payload_item) {
-                        normalized.push(Value::Object(payload_item.clone()));
-                    }
+                Value::Object(payload_item) if is_allowed_trace_item(payload_item) => {
+                    normalized.push(Value::Object(payload_item.clone()));
                 }
                 Value::Array(payload_items) => {
                     for payload_item in payload_items {

@@ -817,6 +817,18 @@ impl AppServerSession {
                             ThreadRealtimeStartTransport::Webrtc { sdp }
                         }
                     }),
+                    client_controlled_handoff: params.client_controlled_handoff,
+                    dynamic_tools: params.dynamic_tools.map(|tools| {
+                        tools
+                            .into_iter()
+                            .map(|tool| codex_app_server_protocol::DynamicToolSpec {
+                                name: tool.name,
+                                description: tool.description,
+                                input_schema: tool.input_schema,
+                                defer_loading: tool.defer_loading,
+                            })
+                            .collect()
+                    }),
                 },
             })
             .await

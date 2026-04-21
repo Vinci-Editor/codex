@@ -522,6 +522,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                                 "item_id": handoff.item_id,
                                 "input_transcript": handoff.input_transcript,
                                 "active_transcript": handoff.active_transcript,
+                                "server": handoff.server,
                             }),
                         };
                         outgoing
@@ -529,6 +530,60 @@ pub(crate) async fn apply_bespoke_event_handling(
                                 notification,
                             ))
                             .await;
+                    }
+                    RealtimeEvent::ToolCallRequested(item) => {
+                        let call_id = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let tool_name = item
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments_str = item
+                            .get("arguments")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("{}")
+                            .to_string();
+                        let arguments: serde_json::Value = serde_json::from_str(&arguments_str)
+                            .unwrap_or(serde_json::Value::Object(Default::default()));
+
+                        let params = DynamicToolCallParams {
+                            thread_id: conversation_id.to_string(),
+                            turn_id: String::new(),
+                            call_id: call_id.clone(),
+                            tool: tool_name,
+                            arguments,
+                        };
+                        let (_pending_request_id, rx) = outgoing
+                            .send_request(ServerRequestPayload::DynamicToolCall(params))
+                            .await;
+
+                        // Wait for client response, then submit the tool output back
+                        // through the core so it reaches the realtime API.
+                        let thread = conversation.clone();
+                        tokio::spawn(async move {
+                            let output = match rx.await {
+                                Ok(Ok(value)) => value
+                                    .get("contentItems")
+                                    .and_then(serde_json::Value::as_array)
+                                    .and_then(|items| items.first())
+                                    .and_then(|item| item.get("text"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                _ => "Tool call failed".to_string(),
+                            };
+                            let _ = thread
+                                .submit(codex_protocol::protocol::Op::RealtimeResolveDynamicTool {
+                                    call_id,
+                                    output,
+                                })
+                                .await;
+                        });
                     }
                     RealtimeEvent::Error(message) => {
                         let notification = ThreadRealtimeErrorNotification {

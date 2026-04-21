@@ -550,7 +550,7 @@ impl ModelsManager {
 
     /// Build picker-ready presets from the active catalog snapshot.
     fn build_available_models(&self, mut remote_models: Vec<ModelInfo>) -> Vec<ModelPreset> {
-        remote_models.sort_by(|a, b| a.priority.cmp(&b.priority));
+        remote_models.sort_by_key(|a| a.priority);
 
         let mut presets: Vec<ModelPreset> = remote_models.into_iter().map(Into::into).collect();
         let auth_mode = self
@@ -594,7 +594,7 @@ impl ModelsManager {
             return model.to_string();
         }
         let mut models = Self::load_remote_models_from_file().unwrap_or_default();
-        models.sort_by(|a, b| a.priority.cmp(&b.priority));
+        models.sort_by_key(|a| a.priority);
         let presets: Vec<ModelPreset> = models.into_iter().map(Into::into).collect();
         presets
             .iter()

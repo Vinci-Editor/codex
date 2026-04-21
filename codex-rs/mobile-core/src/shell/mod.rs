@@ -1,6 +1,6 @@
 mod commands;
 mod parser;
-mod workspace;
+pub(crate) mod workspace;
 
 use serde::Deserialize;
 use serde::Serialize;

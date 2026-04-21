@@ -293,7 +293,7 @@ async fn reasoning_selection_in_plan_mode_model_switch_does_not_open_scope_promp
     let _ = drain_insert_history(&mut rx);
     set_chatgpt_auth(&mut chat);
 
-    let preset = get_available_model(&chat, "gpt-5.2");
+    let preset = get_available_model(&chat, "gpt-5.4-mini");
     chat.open_reasoning_popup(preset);
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
 
@@ -301,7 +301,7 @@ async fn reasoning_selection_in_plan_mode_model_switch_does_not_open_scope_promp
     assert!(
         events.iter().any(|event| matches!(
             event,
-            AppEvent::UpdateModel(model) if model == "gpt-5.2"
+            AppEvent::UpdateModel(model) if model == "gpt-5.4-mini"
         )),
         "expected model update event; events: {events:?}"
     );
@@ -1428,10 +1428,10 @@ async fn collab_mode_applies_default_preset() {
 
 #[tokio::test]
 async fn user_turn_includes_personality_from_config() {
-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.set_feature_enabled(Feature::Personality, /*enabled*/ true);
     chat.thread_id = Some(ThreadId::new());
-    chat.set_model("gpt-5.3-codex");
+    chat.set_model("gpt-5.4");
     chat.set_personality(Personality::Friendly);
 
     chat.bottom_pane

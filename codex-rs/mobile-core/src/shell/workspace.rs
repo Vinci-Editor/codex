@@ -34,6 +34,10 @@ impl Workspace {
         &self.cwd
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn resolve_existing(&self, raw: &str) -> Result<PathBuf, String> {
         let path = self.lexical_path(raw)?;
         let canonical = path

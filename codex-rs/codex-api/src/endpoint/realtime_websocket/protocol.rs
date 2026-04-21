@@ -1,5 +1,6 @@
 use crate::endpoint::realtime_websocket::protocol_v1::parse_realtime_event_v1;
 use crate::endpoint::realtime_websocket::protocol_v2::parse_realtime_event_v2;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 pub use codex_protocol::protocol::RealtimeAudioFrame;
 pub use codex_protocol::protocol::RealtimeEvent;
 pub use codex_protocol::protocol::RealtimeOutputModality;
@@ -20,7 +21,7 @@ pub enum RealtimeSessionMode {
     Transcription,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RealtimeSessionConfig {
     pub instructions: String,
     pub model: Option<String>,
@@ -29,6 +30,7 @@ pub struct RealtimeSessionConfig {
     pub session_mode: RealtimeSessionMode,
     pub output_modality: RealtimeOutputModality,
     pub voice: RealtimeVoice,
+    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

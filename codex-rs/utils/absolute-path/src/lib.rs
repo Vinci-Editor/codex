@@ -304,6 +304,32 @@ impl Drop for AbsolutePathBufGuard {
     }
 }
 
+/// True when `path` looks absolute on _some_ platform even if `Path::is_absolute`
+/// returns `false` on the current one. This lets a POSIX mobile client consume
+/// Windows paths from a cross-platform RPC server (and vice versa) without
+/// mangling them through `path_absolutize::Absolutize`, which would happily
+/// join a Windows path onto a POSIX cwd.
+fn looks_cross_platform_absolute(path: &Path) -> bool {
+    let Some(s) = path.to_str() else {
+        return false;
+    };
+    let bytes = s.as_bytes();
+    if bytes.starts_with(b"/") {
+        return true;
+    }
+    if bytes.starts_with(b"\\\\") {
+        return true;
+    }
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    false
+}
+
 impl<'de> Deserialize<'de> for AbsolutePathBuf {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -315,6 +341,7 @@ impl<'de> Deserialize<'de> for AbsolutePathBuf {
             None if path.is_absolute() => {
                 Self::from_absolute_path(path).map_err(SerdeError::custom)
             }
+            None if looks_cross_platform_absolute(&path) => Ok(Self(path)),
             None => Err(SerdeError::custom(
                 "AbsolutePathBuf deserialized without a base path",
             )),
@@ -483,6 +510,17 @@ mod tests {
             abs_path_buf.as_path(),
             base_dir.join(relative_path).as_path()
         );
+    }
+
+    #[test]
+    fn cross_platform_absolute_paths_deserialize_without_base_path() {
+        let windows_drive = serde_json::from_str::<AbsolutePathBuf>(r#""C:\\Users\\ada\\repo""#)
+            .expect("windows drive path should deserialize");
+        assert_eq!(windows_drive.as_path(), Path::new(r"C:\Users\ada\repo"));
+
+        let windows_unc = serde_json::from_str::<AbsolutePathBuf>(r#""\\\\server\\share\\repo""#)
+            .expect("windows UNC path should deserialize");
+        assert_eq!(windows_unc.as_path(), Path::new(r"\\server\share\repo"));
     }
 
     #[test]

@@ -15047,6 +15047,28 @@
       "ThreadReadResponse": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "approvalPolicy": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AskForApproval"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "sandbox": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/SandboxPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "thread": {
             "$ref": "#/definitions/v2/Thread"
           }

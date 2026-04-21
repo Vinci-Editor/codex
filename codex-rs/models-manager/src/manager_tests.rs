@@ -857,6 +857,28 @@ fn build_available_models_picks_default_after_hiding_hidden_models() {
 }
 
 #[test]
+fn bundled_models_default_to_gpt_5_4() {
+    let codex_home = tempdir().expect("temp dir");
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let provider = provider_for("http://example.test".to_string());
+    let manager = ModelsManager::with_provider_for_tests(
+        codex_home.path().to_path_buf(),
+        auth_manager,
+        provider,
+    );
+    let response = crate::bundled_models_response()
+        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
+
+    let available = manager.build_available_models(response.models);
+    let default_model = available
+        .iter()
+        .find(|preset| preset.is_default)
+        .expect("bundled models should include a default");
+
+    assert_eq!(default_model.model, "gpt-5.4");
+}
+
+#[test]
 fn bundled_models_json_roundtrips() {
     let response = crate::bundled_models_response()
         .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));

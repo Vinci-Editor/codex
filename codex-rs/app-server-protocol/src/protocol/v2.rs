@@ -3711,6 +3711,10 @@ pub struct ThreadReadParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadReadResponse {
     pub thread: Thread,
+    #[serde(default)]
+    pub approval_policy: Option<AskForApproval>,
+    #[serde(default)]
+    pub sandbox: Option<SandboxPolicy>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -4472,6 +4476,10 @@ pub struct ThreadRealtimeStartParams {
     pub transport: Option<ThreadRealtimeStartTransport>,
     #[ts(optional = nullable)]
     pub voice: Option<RealtimeVoice>,
+    #[serde(default)]
+    pub client_controlled_handoff: bool,
+    #[ts(optional = nullable)]
+    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
 }
 
 /// EXPERIMENTAL - transport used by thread realtime.
@@ -4536,6 +4544,35 @@ pub struct ThreadRealtimeStopParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadRealtimeStopResponse {}
+
+/// EXPERIMENTAL - resolve a client-controlled handoff with tool output.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRealtimeResolveHandoffParams {
+    pub thread_id: String,
+    pub tool_call_output: String,
+}
+
+/// EXPERIMENTAL - response for resolving a handoff.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRealtimeResolveHandoffResponse {}
+
+/// EXPERIMENTAL - finalize a resolved handoff (triggers response.create).
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRealtimeFinalizeHandoffParams {
+    pub thread_id: String,
+}
+
+/// EXPERIMENTAL - response for finalizing a handoff.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRealtimeFinalizeHandoffResponse {}
 
 /// EXPERIMENTAL - list voices supported by thread realtime.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]

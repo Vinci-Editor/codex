@@ -79,6 +79,7 @@ pub(super) fn parse_realtime_event_v1(payload: &str) -> Option<RealtimeEvent> {
                 item_id,
                 input_transcript,
                 active_transcript: Vec::new(),
+                server: None,
             }))
         }
         "error" => parse_error_event(&parsed),

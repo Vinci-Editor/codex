@@ -8,6 +8,8 @@ CRATE_DIR="${REPO_ROOT}/codex-rs/mobile-core"
 BUILD_DIR="${PACKAGE_DIR}/.build/mobile-core"
 ARTIFACT_DIR="${PACKAGE_DIR}/Artifacts"
 XCFRAMEWORK="${ARTIFACT_DIR}/CodexMobileCore.xcframework"
+IOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-26.0}"
+MACOS_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-26.0}"
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo is required to build CodexMobileCore.xcframework" >&2
@@ -40,6 +42,7 @@ CodexMobileBuffer codex_mobile_build_responses_request_json(const char *input);
 CodexMobileBuffer codex_mobile_parse_sse_event_json(const char *input);
 CodexMobileBuffer codex_mobile_tool_output_json(const char *input);
 CodexMobileBuffer codex_mobile_emulate_shell_json(const char *input);
+CodexMobileBuffer codex_mobile_apply_patch_json(const char *input);
 CodexMobileBuffer codex_mobile_device_code_request_json(const char *input);
 CodexMobileBuffer codex_mobile_refresh_token_request_json(const char *input);
 CodexMobileBuffer codex_mobile_parse_chatgpt_token_claims_json(const char *input);
@@ -54,10 +57,26 @@ MODULEMAP
 
 build_target() {
   local target="$1"
-  cargo build \
-    --manifest-path "${CRATE_DIR}/Cargo.toml" \
-    --target "${target}" \
-    --release
+  case "${target}" in
+    aarch64-apple-ios | aarch64-apple-ios-sim)
+      IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" cargo build \
+        --manifest-path "${CRATE_DIR}/Cargo.toml" \
+        --target "${target}" \
+        --release
+      ;;
+    aarch64-apple-darwin)
+      MACOSX_DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET}" cargo build \
+        --manifest-path "${CRATE_DIR}/Cargo.toml" \
+        --target "${target}" \
+        --release
+      ;;
+    *)
+      cargo build \
+        --manifest-path "${CRATE_DIR}/Cargo.toml" \
+        --target "${target}" \
+        --release
+      ;;
+  esac
 }
 
 build_target aarch64-apple-ios

@@ -1,3 +1,26 @@
+# Fork Focus: Swift Integration
+
+This fork is focused on making Codex embeddable from Swift for iOS 26 and macOS 26.
+Treat `codex-swift/` and `codex-rs/mobile-core/` as first-class project areas, not
+experimental throwaway code.
+
+- Preserve a maintainable link to upstream Codex behavior. Prefer moving portable
+  request/event/tool/auth logic into reusable Rust layers and bridging it into
+  Swift instead of reimplementing divergent Swift-only behavior.
+- Keep iPhone support free of macOS-only APIs. Swift app lifecycle, URLSession,
+  Keychain, security-scoped file access, and UI belong in Swift; canonical Codex
+  JSON, provider defaults, auth payload helpers, and the iOS-safe built-in tool
+  engine belong in Rust mobile-core.
+- The Swift package API should remain understandable to app developers. When
+  changing `CodexKit` integration points, update `codex-swift/README.md` so a
+  developer can learn how to embed the Codex harness in their own app.
+- The demo app in `codex-swift/Examples/CodexMobileDemo` should stay narrow:
+  sign-in, provider/model selection, workspace selection, streaming chat, tool
+  transcript, and a small custom Swift tool. Avoid growing it into a full product.
+- App Server, TUI, desktop sandboxing, MCP subprocess servers, and arbitrary iOS
+  interpreter/process execution are out of scope for this fork unless explicitly
+  requested.
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:

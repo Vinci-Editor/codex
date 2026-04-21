@@ -8,6 +8,56 @@
     "AgentPath": {
       "type": "string"
     },
+    "AskForApproval": {
+      "oneOf": [
+        {
+          "enum": [
+            "untrusted",
+            "on-failure",
+            "on-request",
+            "never"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "granular": {
+              "properties": {
+                "mcp_elicitations": {
+                  "type": "boolean"
+                },
+                "request_permissions": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "rules": {
+                  "type": "boolean"
+                },
+                "sandbox_approval": {
+                  "type": "boolean"
+                },
+                "skill_approval": {
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "mcp_elicitations",
+                "rules",
+                "sandbox_approval"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "granular"
+          ],
+          "title": "GranularAskForApproval",
+          "type": "object"
+        }
+      ]
+    },
     "ByteRange": {
       "properties": {
         "end": {
@@ -547,6 +597,13 @@
         }
       ]
     },
+    "NetworkAccess": {
+      "enum": [
+        "restricted",
+        "enabled"
+      ],
+      "type": "string"
+    },
     "NonSteerableTurnKind": {
       "enum": [
         "review",
@@ -621,6 +678,53 @@
         }
       ]
     },
+    "ReadOnlyAccess": {
+      "oneOf": [
+        {
+          "properties": {
+            "includePlatformDefaults": {
+              "default": true,
+              "type": "boolean"
+            },
+            "readableRoots": {
+              "default": [],
+              "items": {
+                "$ref": "#/definitions/AbsolutePathBuf"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "restricted"
+              ],
+              "title": "RestrictedReadOnlyAccessType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "RestrictedReadOnlyAccess",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "fullAccess"
+              ],
+              "title": "FullAccessReadOnlyAccessType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "FullAccessReadOnlyAccess",
+          "type": "object"
+        }
+      ]
+    },
     "ReasoningEffort": {
       "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
       "enum": [
@@ -632,6 +736,125 @@
         "xhigh"
       ],
       "type": "string"
+    },
+    "SandboxPolicy": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "dangerFullAccess"
+              ],
+              "title": "DangerFullAccessSandboxPolicyType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "DangerFullAccessSandboxPolicy",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "access": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ReadOnlyAccess"
+                }
+              ],
+              "default": {
+                "type": "fullAccess"
+              }
+            },
+            "networkAccess": {
+              "default": false,
+              "type": "boolean"
+            },
+            "type": {
+              "enum": [
+                "readOnly"
+              ],
+              "title": "ReadOnlySandboxPolicyType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "ReadOnlySandboxPolicy",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "networkAccess": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/NetworkAccess"
+                }
+              ],
+              "default": "restricted"
+            },
+            "type": {
+              "enum": [
+                "externalSandbox"
+              ],
+              "title": "ExternalSandboxSandboxPolicyType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "ExternalSandboxSandboxPolicy",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "excludeSlashTmp": {
+              "default": false,
+              "type": "boolean"
+            },
+            "excludeTmpdirEnvVar": {
+              "default": false,
+              "type": "boolean"
+            },
+            "networkAccess": {
+              "default": false,
+              "type": "boolean"
+            },
+            "readOnlyAccess": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ReadOnlyAccess"
+                }
+              ],
+              "default": {
+                "type": "fullAccess"
+              }
+            },
+            "type": {
+              "enum": [
+                "workspaceWrite"
+              ],
+              "title": "WorkspaceWriteSandboxPolicyType",
+              "type": "string"
+            },
+            "writableRoots": {
+              "default": [],
+              "items": {
+                "$ref": "#/definitions/AbsolutePathBuf"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "WorkspaceWriteSandboxPolicy",
+          "type": "object"
+        }
+      ]
     },
     "SessionSource": {
       "oneOf": [
@@ -1959,6 +2182,28 @@
     }
   },
   "properties": {
+    "approvalPolicy": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/AskForApproval"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "sandbox": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SandboxPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "thread": {
       "$ref": "#/definitions/Thread"
     }

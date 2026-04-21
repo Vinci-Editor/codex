@@ -1,5 +1,6 @@
 ---
 source: tui/src/chatwidget/tests/guardian.rs
+assertion_line: 422
 expression: normalize_snapshot_paths(rendered)
 ---
 • Reviewing 2 approval requests (0s • esc to interrupt)

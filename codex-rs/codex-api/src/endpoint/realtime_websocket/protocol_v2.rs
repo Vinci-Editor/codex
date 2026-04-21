@@ -133,6 +133,16 @@ fn parse_conversation_item_done_event(parsed: &Value) -> Option<RealtimeEvent> {
         return Some(noop);
     }
 
+    // Emit ToolCallRequested for non-background-agent function calls (dynamic tools).
+    if item.get("type").and_then(Value::as_str) == Some("function_call")
+        && item.get("status").and_then(Value::as_str) == Some("completed")
+        && item.get("name").and_then(Value::as_str) != Some(BACKGROUND_AGENT_TOOL_NAME)
+    {
+        return Some(RealtimeEvent::ToolCallRequested(Value::Object(
+            item.clone(),
+        )));
+    }
+
     item.get("id")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -157,11 +167,23 @@ fn parse_handoff_requested_event(item: &JsonMap<String, Value>) -> Option<Realti
         .to_string();
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
 
+    let parsed_args: Option<serde_json::Value> = serde_json::from_str(arguments).ok();
+    let server = parsed_args
+        .as_ref()
+        .and_then(|v| {
+            v.get("server")
+                .or_else(|| v.get("server_hint"))
+                .or_else(|| v.get("serverHint"))
+        })
+        .and_then(Value::as_str)
+        .map(String::from);
+
     Some(RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
         handoff_id: call_id.to_string(),
         item_id,
         input_transcript: extract_input_transcript(arguments),
         active_transcript: Vec::new(),
+        server,
     }))
 }
 

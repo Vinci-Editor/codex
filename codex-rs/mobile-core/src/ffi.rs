@@ -123,6 +123,13 @@ pub extern "C" fn codex_mobile_emulate_shell_json(input: *const c_char) -> Codex
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn codex_mobile_apply_patch_json(input: *const c_char) -> CodexMobileBuffer {
+    call_json(input, |input| {
+        crate::apply_patch_json(input).map_err(|error| error.to_string())
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn codex_mobile_device_code_request_json(input: *const c_char) -> CodexMobileBuffer {
     call_json(input, |input| {
         crate::device_code_request_json(input).map_err(|error| error.to_string())

@@ -24,6 +24,8 @@ fn prefers_handoff_input_transcript_over_active_transcript() {
                 text: "hi there".to_string(),
             },
         ],
+
+        server: None,
     };
     assert_eq!(
         realtime_text_from_handoff_request(&handoff),
@@ -81,6 +83,8 @@ fn extracts_text_from_handoff_request_input_transcript_if_messages_missing() {
         item_id: "item_1".to_string(),
         input_transcript: "ignored".to_string(),
         active_transcript: vec![],
+
+        server: None,
     };
     assert_eq!(
         realtime_text_from_handoff_request(&handoff),
@@ -95,6 +99,8 @@ fn ignores_empty_handoff_request_input_transcript() {
         item_id: "item_1".to_string(),
         input_transcript: String::new(),
         active_transcript: vec![],
+
+        server: None,
     };
     assert_eq!(realtime_text_from_handoff_request(&handoff), None);
 }

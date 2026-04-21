@@ -47,6 +47,21 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use codex_utils_pty::process_group::kill_child_process_group;
 
+#[cfg(target_os = "ios")]
+use std::sync::OnceLock;
+
+/// Pluggable executor for platforms that cannot fork/exec (e.g. iOS).
+#[cfg(target_os = "ios")]
+pub(crate) static IOS_EXEC_HOOK: OnceLock<
+    fn(&[String], &Path, &HashMap<String, String>) -> (i32, Vec<u8>),
+> = OnceLock::new();
+
+/// Register the iOS exec hook before starting the server.
+#[cfg(target_os = "ios")]
+pub fn set_ios_exec_hook(f: fn(&[String], &Path, &HashMap<String, String>) -> (i32, Vec<u8>)) {
+    let _ = IOS_EXEC_HOOK.set(f);
+}
+
 pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
 
 // Hardcode these since it does not seem worth including the libc crate just
@@ -864,6 +879,34 @@ async fn exec(
     } = params;
     if let Some(network) = network.as_ref() {
         network.apply_to_env(&mut env);
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let (code, data) = IOS_EXEC_HOOK
+            .get()
+            .map(|f| f(&command, &cwd, &env))
+            .unwrap_or_else(|| {
+                (
+                    -1,
+                    b"shell exec unavailable: no iOS exec hook registered\n".to_vec(),
+                )
+            });
+        return Ok(RawExecToolCallOutput {
+            exit_status: synthetic_exit_status(code),
+            stdout: StreamOutput {
+                text: data.clone(),
+                truncated_after_lines: None,
+            },
+            stderr: StreamOutput {
+                text: Vec::new(),
+                truncated_after_lines: None,
+            },
+            aggregated_output: StreamOutput {
+                text: data,
+                truncated_after_lines: None,
+            },
+            timed_out: false,
+        });
     }
 
     let (program, args) = command.split_first().ok_or_else(|| {

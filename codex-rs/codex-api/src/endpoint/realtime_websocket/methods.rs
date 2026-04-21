@@ -309,12 +309,33 @@ impl RealtimeWebsocketWriter {
             .await
     }
 
+    pub async fn send_dynamic_tool_output(
+        &self,
+        call_id: String,
+        output_text: String,
+    ) -> Result<(), ApiError> {
+        let payload = serde_json::json!({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output_text,
+            }
+        });
+        let encoded = serde_json::to_string(&payload).map_err(|err| {
+            ApiError::Stream(format!("failed to encode dynamic tool output: {err}"))
+        })?;
+        debug!("realtime websocket dynamic tool output: {}", encoded);
+        self.send_payload(encoded).await
+    }
+
     pub async fn send_session_update(
         &self,
         instructions: String,
         session_mode: RealtimeSessionMode,
         output_modality: RealtimeOutputModality,
         voice: RealtimeVoice,
+        dynamic_tools: Option<Vec<codex_protocol::dynamic_tools::DynamicToolSpec>>,
     ) -> Result<(), ApiError> {
         let session_mode = normalized_session_mode(self.event_parser, session_mode);
         let session = session_update_session(
@@ -323,6 +344,7 @@ impl RealtimeWebsocketWriter {
             session_mode,
             output_modality,
             voice,
+            dynamic_tools,
         );
         self.send_json(&RealtimeOutboundMessage::SessionUpdate { session })
             .await
@@ -477,6 +499,7 @@ impl RealtimeWebsocketEvents {
             | RealtimeEvent::ConversationItemDone { .. }
             | RealtimeEvent::NoopRequested(_)
             | RealtimeEvent::ConversationItemAdded(_)
+            | RealtimeEvent::ToolCallRequested(_)
             | RealtimeEvent::Error(_) => {}
         }
     }
@@ -687,6 +710,7 @@ impl RealtimeWebsocketClient {
                 config.session_mode,
                 config.output_modality,
                 config.voice,
+                config.dynamic_tools,
             )
             .await?;
         Ok(connection)
@@ -933,6 +957,8 @@ mod tests {
                 item_id: "item_123".to_string(),
                 input_transcript: "delegate this".to_string(),
                 active_transcript: Vec::new(),
+
+                server: None,
             }))
         );
     }
@@ -1092,6 +1118,8 @@ mod tests {
                 item_id: "item_123".to_string(),
                 input_transcript: "delegate this".to_string(),
                 active_transcript: Vec::new(),
+
+                server: None,
             }))
         );
     }
@@ -1683,6 +1711,8 @@ mod tests {
                     session_mode: RealtimeSessionMode::Conversational,
                     output_modality: RealtimeOutputModality::Audio,
                     voice: RealtimeVoice::Breeze,
+
+                    dynamic_tools: None,
                 },
                 HeaderMap::new(),
                 HeaderMap::new(),
@@ -1798,6 +1828,8 @@ mod tests {
                         text: "working".to_string(),
                     },
                 ],
+
+                server: None,
             })
         );
 
@@ -1877,7 +1909,11 @@ mod tests {
             );
             assert_eq!(
                 first_json["session"]["tools"][0]["parameters"]["required"],
-                json!(["prompt"])
+                json!(["prompt", "server"])
+            );
+            assert_eq!(
+                first_json["session"]["tools"][0]["parameters"]["properties"]["server"]["type"],
+                Value::String("string".to_string())
             );
             assert_eq!(
                 first_json["session"]["tools"][1]["type"],
@@ -1977,6 +2013,8 @@ mod tests {
                     session_mode: RealtimeSessionMode::Conversational,
                     output_modality: RealtimeOutputModality::Audio,
                     voice: RealtimeVoice::Cedar,
+
+                    dynamic_tools: None,
                 },
                 HeaderMap::new(),
                 HeaderMap::new(),
@@ -2092,6 +2130,8 @@ mod tests {
                     session_mode: RealtimeSessionMode::Transcription,
                     output_modality: RealtimeOutputModality::Audio,
                     voice: RealtimeVoice::Marin,
+
+                    dynamic_tools: None,
                 },
                 HeaderMap::new(),
                 HeaderMap::new(),
@@ -2196,6 +2236,8 @@ mod tests {
                     session_mode: RealtimeSessionMode::Transcription,
                     output_modality: RealtimeOutputModality::Audio,
                     voice: RealtimeVoice::Cove,
+
+                    dynamic_tools: None,
                 },
                 HeaderMap::new(),
                 HeaderMap::new(),
@@ -2286,6 +2328,8 @@ mod tests {
                     session_mode: RealtimeSessionMode::Conversational,
                     output_modality: RealtimeOutputModality::Audio,
                     voice: RealtimeVoice::Cove,
+
+                    dynamic_tools: None,
                 },
                 HeaderMap::new(),
                 HeaderMap::new(),

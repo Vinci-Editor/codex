@@ -241,6 +241,9 @@ impl ChatWidget {
                 session_id: None,
                 transport,
                 voice: self.config.realtime.voice,
+
+                client_controlled_handoff: false,
+                dynamic_tools: None,
             },
         ));
     }
@@ -339,6 +342,7 @@ impl ChatWidget {
             RealtimeEvent::ConversationItemDone { .. } => {}
             RealtimeEvent::HandoffRequested(_) => {}
             RealtimeEvent::NoopRequested(_) => {}
+            RealtimeEvent::ToolCallRequested(_) => {}
             RealtimeEvent::Error(message) => {
                 self.fail_realtime_conversation(format!("Realtime voice error: {message}"));
             }

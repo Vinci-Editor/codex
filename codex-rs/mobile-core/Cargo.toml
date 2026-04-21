@@ -15,9 +15,13 @@ workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+codex-apply-patch = { workspace = true }
+codex-exec-server = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

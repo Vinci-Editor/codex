@@ -8,6 +8,7 @@
 
 mod auth;
 mod ffi;
+mod patch;
 mod providers;
 mod responses;
 mod shell;
@@ -17,6 +18,7 @@ pub use auth::device_code_request_json;
 pub use auth::parse_chatgpt_token_claims_json;
 pub use auth::refresh_token_request_json;
 pub use ffi::CodexMobileBuffer;
+pub use patch::apply_patch_json;
 pub use providers::provider_defaults_json;
 pub use responses::build_responses_request_json;
 pub use responses::parse_sse_event_json;

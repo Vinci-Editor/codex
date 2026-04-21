@@ -243,7 +243,7 @@ async fn run_jobs(
     claimed_candidates: Vec<codex_state::Stage1JobClaim>,
     stage_one_context: RequestContext,
 ) -> Vec<JobResult> {
-    futures::stream::iter(claimed_candidates.into_iter())
+    futures::stream::iter(claimed_candidates)
         .map(|claim| {
             let session = Arc::clone(session);
             let stage_one_context = stage_one_context.clone();

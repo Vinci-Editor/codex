@@ -318,6 +318,9 @@ impl RealtimeE2eHarness {
                     sdp: offer_sdp.to_string(),
                 }),
                 voice: None,
+
+                client_controlled_handoff: false,
+                dynamic_tools: None,
             })
             .await?;
         let start_response: JSONRPCResponse = timeout(
@@ -555,6 +558,9 @@ async fn realtime_conversation_streams_v2_notifications() -> Result<()> {
             session_id: None,
             transport: None,
             voice: Some(RealtimeVoice::Cedar),
+
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         })
         .await?;
     let start_response: JSONRPCResponse = timeout(
@@ -804,6 +810,9 @@ async fn realtime_text_output_modality_requests_text_output_and_final_transcript
             session_id: None,
             transport: None,
             voice: None,
+
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         })
         .await?;
     let start_response: JSONRPCResponse = timeout(
@@ -978,6 +987,9 @@ async fn realtime_conversation_stop_emits_closed_notification() -> Result<()> {
             session_id: None,
             transport: None,
             voice: None,
+
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         })
         .await?;
     let start_response: JSONRPCResponse = timeout(
@@ -1077,6 +1089,9 @@ async fn realtime_webrtc_start_emits_sdp_notification() -> Result<()> {
                 sdp: "v=offer\r\n".to_string(),
             }),
             voice: None,
+
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         })
         .await?;
     let start_response: JSONRPCResponse = timeout(
@@ -1155,7 +1170,7 @@ async fn realtime_webrtc_start_emits_sdp_notification() -> Result<()> {
         Some("multipart/form-data; boundary=codex-realtime-call-boundary")
     );
     let body = String::from_utf8(request.body).context("multipart body should be utf-8")?;
-    let session = r#"{"tool_choice":"auto","type":"realtime","model":"gpt-realtime-1.5","instructions":"backend prompt\n\nstartup context","output_modalities":["audio"],"audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"noise_reduction":{"type":"near_field"},"transcription":{"model":"gpt-4o-mini-transcribe"},"turn_detection":{"type":"server_vad","interrupt_response":true,"create_response":true,"silence_duration_ms":500}},"output":{"format":{"type":"audio/pcm","rate":24000},"voice":"marin"}},"tools":[{"type":"function","name":"background_agent","description":"Send a user request to the background agent. Use this as the default action. Do not rephrase the user's ask or rewrite it in your own words; pass along the user's own words. If the background agent is idle, this starts a new task and returns the final result to the user. If the background agent is already working on a task, this sends the request as guidance to steer that previous task. If the user asks to do something next, later, after this, or once current work finishes, call this tool so the work is actually queued instead of merely promising to do it later.","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"The user request to delegate to the background agent."}},"required":["prompt"],"additionalProperties":false}},{"type":"function","name":"remain_silent","description":"Call this when the best response is to say nothing. Use it instead of speaking after hidden system/control messages, after background agent updates in silent modes, or whenever acknowledging aloud would be distracting. This tool has no user-visible effect.","parameters":{"type":"object","properties":{},"additionalProperties":false}}]}"#;
+    let session = r#"{"tool_choice":"auto","type":"realtime","model":"gpt-realtime-1.5","instructions":"backend prompt\n\nstartup context","output_modalities":["audio"],"audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"noise_reduction":{"type":"near_field"},"transcription":{"model":"gpt-4o-mini-transcribe"},"turn_detection":{"type":"server_vad","interrupt_response":true,"create_response":true,"silence_duration_ms":500}},"output":{"format":{"type":"audio/pcm","rate":24000},"voice":"marin"}},"tools":[{"type":"function","name":"background_agent","description":"Send a user request to the background agent. Use this as the default action. Do not rephrase the user's ask or rewrite it in your own words; pass along the user's own words. If the background agent is idle, this starts a new task and returns the final result to the user. If the background agent is already working on a task, this sends the request as guidance to steer that previous task. If the user asks to do something next, later, after this, or once current work finishes, call this tool so the work is actually queued instead of merely promising to do it later.","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"The user request to delegate to the background agent."},"server":{"type":"string","description":"Target server identifier for routing the handoff."}},"required":["prompt","server"],"additionalProperties":false}},{"type":"function","name":"remain_silent","description":"Call this when the best response is to say nothing. Use it instead of speaking after hidden system/control messages, after background agent updates in silent modes, or whenever acknowledging aloud would be distracting. This tool has no user-visible effect.","parameters":{"type":"object","properties":{},"additionalProperties":false}}]}"#;
     let session = normalized_json_string(session)?;
     assert_eq!(
         body,
@@ -1992,6 +2007,9 @@ async fn realtime_webrtc_start_surfaces_backend_error() -> Result<()> {
                 sdp: "v=offer\r\n".to_string(),
             }),
             voice: None,
+
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         })
         .await?;
     let start_response: JSONRPCResponse = timeout(
@@ -2049,6 +2067,9 @@ async fn realtime_conversation_requires_feature_flag() -> Result<()> {
             session_id: None,
             transport: None,
             voice: None,
+
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         })
         .await?;
     let error = timeout(

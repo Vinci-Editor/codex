@@ -151,6 +151,8 @@ async fn realtime_ws_e2e_session_create_and_event_flow() {
                 session_mode: RealtimeSessionMode::Conversational,
                 output_modality: RealtimeOutputModality::Audio,
                 voice: RealtimeVoice::Cove,
+
+                dynamic_tools: None,
             },
             HeaderMap::new(),
             HeaderMap::new(),
@@ -255,6 +257,8 @@ async fn realtime_ws_connect_webrtc_sideband_retries_join_until_server_is_availa
                 session_mode: RealtimeSessionMode::Conversational,
                 output_modality: RealtimeOutputModality::Audio,
                 voice: RealtimeVoice::Marin,
+
+                dynamic_tools: None,
             },
             "rtc_test",
             HeaderMap::new(),
@@ -327,6 +331,8 @@ async fn realtime_ws_e2e_send_while_next_event_waits() {
                 session_mode: RealtimeSessionMode::Conversational,
                 output_modality: RealtimeOutputModality::Audio,
                 voice: RealtimeVoice::Cove,
+
+                dynamic_tools: None,
             },
             HeaderMap::new(),
             HeaderMap::new(),
@@ -395,6 +401,8 @@ async fn realtime_ws_e2e_disconnected_emitted_once() {
                 session_mode: RealtimeSessionMode::Conversational,
                 output_modality: RealtimeOutputModality::Audio,
                 voice: RealtimeVoice::Cove,
+
+                dynamic_tools: None,
             },
             HeaderMap::new(),
             HeaderMap::new(),
@@ -459,6 +467,8 @@ async fn realtime_ws_e2e_ignores_unknown_text_events() {
                 session_mode: RealtimeSessionMode::Conversational,
                 output_modality: RealtimeOutputModality::Audio,
                 voice: RealtimeVoice::Cove,
+
+                dynamic_tools: None,
             },
             HeaderMap::new(),
             HeaderMap::new(),
@@ -566,6 +576,8 @@ async fn realtime_ws_e2e_realtime_v2_parser_emits_handoff_requested() {
                 session_mode: RealtimeSessionMode::Conversational,
                 output_modality: RealtimeOutputModality::Audio,
                 voice: RealtimeVoice::Marin,
+
+                dynamic_tools: None,
             },
             HeaderMap::new(),
             HeaderMap::new(),
@@ -625,6 +637,7 @@ async fn realtime_ws_e2e_realtime_v2_parser_emits_handoff_requested() {
                     text: "secret context".to_string(),
                 },
             ],
+            server: None,
         })
     );
 

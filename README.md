@@ -57,4 +57,14 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Installing & building**](./docs/install.md)
 - [**Open source fund**](./docs/open-source-fund.md)
 
+## Swift Integration Fork
+
+This fork also contains [`codex-swift/`](./codex-swift) and
+[`codex-rs/mobile-core`](./codex-rs/mobile-core) for embedding Codex from Swift
+on iOS 26 and macOS 26.
+
+Credit: the mobile architecture and several Codex iOS portability patches were
+informed by [dnakov/litter](https://github.com/dnakov/litter), a native mobile
+Codex client.
+
 This repository is licensed under the [Apache-2.0 License](LICENSE).

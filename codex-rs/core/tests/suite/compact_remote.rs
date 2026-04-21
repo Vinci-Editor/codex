@@ -125,6 +125,9 @@ async fn start_realtime_conversation(codex: &codex_core::CodexThread) -> Result<
             session_id: None,
             transport: None,
             voice: None,
+
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         }))
         .await?;
 

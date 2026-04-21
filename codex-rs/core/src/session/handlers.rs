@@ -1054,6 +1054,20 @@ pub(super) async fn submission_loop(
                     handle_realtime_conversation_close(&sess, sub.id.clone()).await;
                     false
                 }
+                Op::RealtimeConversationResolveHandoff { tool_call_output } => {
+                    sess.conversation.resolve_handoff(tool_call_output).await;
+                    false
+                }
+                Op::RealtimeResolveDynamicTool { call_id, output } => {
+                    sess.conversation
+                        .resolve_realtime_dynamic_tool(call_id, output)
+                        .await;
+                    false
+                }
+                Op::RealtimeConversationFinalizeHandoff => {
+                    sess.conversation.finalize_handoff().await;
+                    false
+                }
                 Op::RealtimeConversationListVoices => {
                     realtime_conversation_list_voices(&sess, sub.id.clone()).await;
                     false

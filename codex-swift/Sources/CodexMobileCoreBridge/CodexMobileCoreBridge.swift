@@ -80,6 +80,15 @@ public enum CodexMobileCoreBridge {
         #endif
     }
 
+    public static func applyPatch(_ input: [String: Any]) throws -> [String: Any] {
+        #if canImport(CodexMobileCore)
+        let data = try rustData(input: input, codex_mobile_apply_patch_json)
+        return try decodeObject(data)
+        #else
+        return fallbackApplyPatch(input)
+        #endif
+    }
+
     public static func parseChatGPTTokenClaims(token: String) throws -> [String: Any] {
         #if canImport(CodexMobileCore)
         let data = try rustData(input: ["token": token], codex_mobile_parse_chatgpt_token_claims_json)
@@ -272,6 +281,17 @@ public enum CodexMobileCoreBridge {
             "stdout": "",
             "stderr": "\(command): shell emulator unavailable\n",
             "output": "\(command): shell emulator unavailable\n",
+            "wall_time_seconds": 0,
+            "truncated": false,
+        ]
+    }
+
+    private static func fallbackApplyPatch(_ input: [String: Any]) -> [String: Any] {
+        [
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": "apply_patch unavailable without CodexMobileCore artifact\n",
+            "output": "apply_patch unavailable without CodexMobileCore artifact\n",
             "wall_time_seconds": 0,
             "truncated": false,
         ]

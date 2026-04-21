@@ -275,10 +275,7 @@ public actor CodexSession {
         case "shell_command", "exec_command":
             return try executeShell(call)
         case "apply_patch":
-            return CodexToolResult(
-                output: "apply_patch execution is not implemented in this CodexKit demo yet.",
-                success: false
-            )
+            return try executeApplyPatch(call)
         default:
             throw CodexSessionError.unknownTool(call.name)
         }
@@ -323,6 +320,35 @@ public actor CodexSession {
                 input["workdir"] = workdir
             }
             let response = try CodexMobileCoreBridge.emulateShell(input)
+            let exitCode = Self.intValue(response["exit_code"]) ?? 1
+            let output = response["output"] as? String ?? ""
+            return CodexToolResult(
+                output: output.isEmpty ? "(no output)" : output,
+                success: exitCode == 0
+            )
+        }
+    }
+
+    private func executeApplyPatch(_ call: CodexToolCall) throws -> CodexToolResult {
+        let arguments = try Self.decodeArguments(call.arguments)
+        let patch = arguments["patch"] as? String ?? ""
+        guard !patch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return CodexToolResult(output: "Missing patch.", success: false)
+        }
+        guard let workspace = configuration.workspace else {
+            return CodexToolResult(output: "No workspace selected.", success: false)
+        }
+
+        return try workspace.withSecurityScope { root in
+            var input: [String: Any] = [
+                "workspaceRoot": root.path,
+                "patch": patch,
+                "maxOutputBytes": 64 * 1024,
+            ]
+            if let workdir = arguments["workdir"] as? String {
+                input["workdir"] = workdir
+            }
+            let response = try CodexMobileCoreBridge.applyPatch(input)
             let exitCode = Self.intValue(response["exit_code"]) ?? 1
             let output = response["output"] as? String ?? ""
             return CodexToolResult(

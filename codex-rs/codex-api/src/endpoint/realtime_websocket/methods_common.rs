@@ -13,6 +13,7 @@ use crate::endpoint::realtime_websocket::protocol::RealtimeSessionConfig;
 use crate::endpoint::realtime_websocket::protocol::RealtimeSessionMode;
 use crate::endpoint::realtime_websocket::protocol::RealtimeVoice;
 use crate::endpoint::realtime_websocket::protocol::SessionUpdateSession;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use serde_json::Result as JsonResult;
 use serde_json::Value;
 use serde_json::to_value;
@@ -62,13 +63,18 @@ pub(super) fn session_update_session(
     session_mode: RealtimeSessionMode,
     output_modality: RealtimeOutputModality,
     voice: RealtimeVoice,
+    dynamic_tools: Option<Vec<DynamicToolSpec>>,
 ) -> SessionUpdateSession {
     let session_mode = normalized_session_mode(event_parser, session_mode);
     match event_parser {
         RealtimeEventParser::V1 => v1_session_update_session(instructions, voice),
-        RealtimeEventParser::RealtimeV2 => {
-            v2_session_update_session(instructions, session_mode, output_modality, voice)
-        }
+        RealtimeEventParser::RealtimeV2 => v2_session_update_session(
+            instructions,
+            session_mode,
+            output_modality,
+            voice,
+            dynamic_tools,
+        ),
     }
 }
 
@@ -79,6 +85,7 @@ pub fn session_update_session_json(config: RealtimeSessionConfig) -> JsonResult<
         config.session_mode,
         config.output_modality,
         config.voice,
+        config.dynamic_tools,
     );
     session.id = config.session_id;
     session.model = config.model;

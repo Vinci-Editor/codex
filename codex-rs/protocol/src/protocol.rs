@@ -160,6 +160,10 @@ pub struct ConversationStartParams {
     pub transport: Option<ConversationStartTransport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voice: Option<RealtimeVoice>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub client_controlled_handoff: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_tools: Option<Vec<crate::dynamic_tools::DynamicToolSpec>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -327,6 +331,8 @@ pub struct RealtimeHandoffRequested {
     pub item_id: String,
     pub input_transcript: String,
     pub active_transcript: Vec<RealtimeTranscriptEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -376,6 +382,7 @@ pub enum RealtimeEvent {
     },
     HandoffRequested(RealtimeHandoffRequested),
     NoopRequested(RealtimeNoopRequested),
+    ToolCallRequested(Value),
     Error(String),
 }
 
@@ -414,6 +421,15 @@ pub enum Op {
 
     /// Close the running realtime conversation stream.
     RealtimeConversationClose,
+
+    /// Resolve a handoff request with tool output (client-controlled handoff).
+    RealtimeConversationResolveHandoff { tool_call_output: String },
+
+    /// Resolve a dynamic tool call with output (sends function_call_output to realtime API).
+    RealtimeResolveDynamicTool { call_id: String, output: String },
+
+    /// Finalize a resolved handoff (triggers response.create).
+    RealtimeConversationFinalizeHandoff,
 
     /// Request the list of voices supported by realtime conversation streams.
     RealtimeConversationListVoices,
@@ -781,6 +797,11 @@ impl Op {
             Self::RealtimeConversationAudio(_) => "realtime_conversation_audio",
             Self::RealtimeConversationText(_) => "realtime_conversation_text",
             Self::RealtimeConversationClose => "realtime_conversation_close",
+            Self::RealtimeConversationResolveHandoff { .. } => {
+                "realtime_conversation_resolve_handoff"
+            }
+            Self::RealtimeResolveDynamicTool { .. } => "realtime_resolve_dynamic_tool",
+            Self::RealtimeConversationFinalizeHandoff => "realtime_conversation_finalize_handoff",
             Self::RealtimeConversationListVoices => "realtime_conversation_list_voices",
             Self::UserInput { .. } => "user_input",
             Self::UserTurn { .. } => "user_turn",
@@ -4744,6 +4765,9 @@ mod tests {
             session_id: Some("conv_1".to_string()),
             transport: None,
             voice: None,
+
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         });
         let webrtc_start = Op::RealtimeConversationStart(ConversationStartParams {
             output_modality: RealtimeOutputModality::Audio,
@@ -4753,6 +4777,9 @@ mod tests {
                 sdp: "v=offer\r\n".to_string(),
             }),
             voice: Some(RealtimeVoice::Cove),
+
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         });
         let text = Op::RealtimeConversationText(ConversationTextParams {
             text: "hello".to_string(),
@@ -4764,6 +4791,9 @@ mod tests {
             session_id: None,
             transport: None,
             voice: None,
+
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         });
         let null_prompt_start = Op::RealtimeConversationStart(ConversationStartParams {
             output_modality: RealtimeOutputModality::Audio,
@@ -4771,6 +4801,9 @@ mod tests {
             session_id: None,
             transport: None,
             voice: None,
+
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         });
         let list_voices = Op::RealtimeConversationListVoices;
 

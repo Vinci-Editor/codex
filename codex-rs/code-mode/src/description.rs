@@ -356,6 +356,7 @@ pub fn augment_tool_definition(mut definition: ToolDefinition) -> ToolDefinition
     definition
 }
 
+#[cfg(not(target_os = "ios"))]
 pub fn enabled_tool_metadata(definition: &ToolDefinition) -> EnabledToolMetadata {
     EnabledToolMetadata {
         tool_name: definition.tool_name.clone(),
@@ -365,6 +366,7 @@ pub fn enabled_tool_metadata(definition: &ToolDefinition) -> EnabledToolMetadata
     }
 }
 
+#[cfg(not(target_os = "ios"))]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EnabledToolMetadata {
     pub tool_name: ToolName,
@@ -654,7 +656,7 @@ fn render_json_schema_object(map: &serde_json::Map<String, JsonValue>) -> String
         .unwrap_or_default();
 
     let mut sorted_properties = properties.iter().collect::<Vec<_>>();
-    sorted_properties.sort_unstable_by(|(name_a, _), (name_b, _)| name_a.cmp(name_b));
+    sorted_properties.sort_unstable_by_key(|(name_a, _)| *name_a);
     if sorted_properties
         .iter()
         .any(|(_, value)| has_property_description(value))

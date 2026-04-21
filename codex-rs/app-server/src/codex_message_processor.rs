@@ -1016,6 +1016,14 @@ impl CodexMessageProcessor {
                 self.thread_realtime_stop(to_connection_request_id(request_id), params)
                     .await;
             }
+            ClientRequest::ThreadRealtimeResolveHandoff { request_id, params } => {
+                self.thread_realtime_resolve_handoff(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::ThreadRealtimeFinalizeHandoff { request_id, params } => {
+                self.thread_realtime_finalize_handoff(to_connection_request_id(request_id), params)
+                    .await;
+            }
             ClientRequest::ThreadRealtimeListVoices { request_id, params } => {
                 self.thread_realtime_list_voices(to_connection_request_id(request_id), params)
                     .await;
@@ -2568,11 +2576,9 @@ impl CodexMessageProcessor {
         }
 
         let instruction_sources = Self::instruction_sources_from_config(&config).await;
-        let dynamic_tools = dynamic_tools.unwrap_or_default();
-        let core_dynamic_tools = if dynamic_tools.is_empty() {
-            Vec::new()
-        } else {
-            if let Err(message) = validate_dynamic_tools(&dynamic_tools) {
+        let core_dynamic_tools = match core_dynamic_tools_from_api(dynamic_tools) {
+            Ok(dynamic_tools) => dynamic_tools,
+            Err(message) => {
                 let error = JSONRPCErrorError {
                     code: INVALID_REQUEST_ERROR_CODE,
                     message,
@@ -2584,16 +2590,6 @@ impl CodexMessageProcessor {
                     .await;
                 return;
             }
-            dynamic_tools
-                .into_iter()
-                .map(|tool| CoreDynamicToolSpec {
-                    namespace: tool.namespace,
-                    name: tool.name,
-                    description: tool.description,
-                    input_schema: tool.input_schema,
-                    defer_loading: tool.defer_loading,
-                })
-                .collect()
         };
         let core_dynamic_tool_count = core_dynamic_tools.len();
 
@@ -3888,7 +3884,38 @@ impl CodexMessageProcessor {
                 return;
             }
         };
-        let response = ThreadReadResponse { thread };
+        let loaded_thread = self.load_live_thread_for_read(thread_uuid).await;
+        let live_config_snapshot = if let Some(loaded) = loaded_thread.as_ref() {
+            Some(loaded.config_snapshot().await)
+        } else {
+            None
+        };
+        let persisted_metadata = if let Some(state_db_ctx) = get_state_db(&self.config).await {
+            state_db_ctx.get_thread(thread_uuid).await.ok().flatten()
+        } else {
+            None
+        };
+        let response = ThreadReadResponse {
+            thread,
+            approval_policy: live_config_snapshot
+                .as_ref()
+                .map(|config| config.approval_policy.into())
+                .or_else(|| {
+                    persisted_metadata
+                        .as_ref()
+                        .and_then(thread_metadata_approval_policy)
+                        .map(Into::into)
+                }),
+            sandbox: live_config_snapshot
+                .as_ref()
+                .map(|config| config.sandbox_policy.clone().into())
+                .or_else(|| {
+                    persisted_metadata
+                        .as_ref()
+                        .and_then(thread_metadata_sandbox_policy)
+                        .map(Into::into)
+                }),
+        };
         self.outgoing.send_response(request_id, response).await;
     }
 
@@ -7536,6 +7563,20 @@ impl CodexMessageProcessor {
             return;
         };
 
+        let dynamic_tools = match core_dynamic_tools_from_api(params.dynamic_tools) {
+            Ok(dynamic_tools) => {
+                if dynamic_tools.is_empty() {
+                    None
+                } else {
+                    Some(dynamic_tools)
+                }
+            }
+            Err(message) => {
+                self.send_invalid_request_error(request_id, message).await;
+                return;
+            }
+        };
+
         let submit = self
             .submit_core_op(
                 &request_id,
@@ -7553,6 +7594,8 @@ impl CodexMessageProcessor {
                         }
                     }),
                     voice: params.voice,
+                    client_controlled_handoff: params.client_controlled_handoff,
+                    dynamic_tools,
                 }),
             )
             .await;
@@ -7673,6 +7716,82 @@ impl CodexMessageProcessor {
                 self.send_internal_error(
                     request_id,
                     format!("failed to stop realtime conversation: {err}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn thread_realtime_resolve_handoff(
+        &self,
+        request_id: ConnectionRequestId,
+        params: codex_app_server_protocol::ThreadRealtimeResolveHandoffParams,
+    ) {
+        let Some((_, thread)) = self
+            .prepare_realtime_conversation_thread(request_id.clone(), &params.thread_id)
+            .await
+        else {
+            return;
+        };
+        let submit = self
+            .submit_core_op(
+                &request_id,
+                thread.as_ref(),
+                Op::RealtimeConversationResolveHandoff {
+                    tool_call_output: params.tool_call_output,
+                },
+            )
+            .await;
+        match submit {
+            Ok(_) => {
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        codex_app_server_protocol::ThreadRealtimeResolveHandoffResponse::default(),
+                    )
+                    .await;
+            }
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to resolve realtime handoff: {err}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn thread_realtime_finalize_handoff(
+        &self,
+        request_id: ConnectionRequestId,
+        params: codex_app_server_protocol::ThreadRealtimeFinalizeHandoffParams,
+    ) {
+        let Some((_, thread)) = self
+            .prepare_realtime_conversation_thread(request_id.clone(), &params.thread_id)
+            .await
+        else {
+            return;
+        };
+        let submit = self
+            .submit_core_op(
+                &request_id,
+                thread.as_ref(),
+                Op::RealtimeConversationFinalizeHandoff,
+            )
+            .await;
+        match submit {
+            Ok(_) => {
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        codex_app_server_protocol::ThreadRealtimeFinalizeHandoffResponse::default(),
+                    )
+                    .await;
+            }
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to finalize realtime handoff: {err}"),
                 )
                 .await;
             }
@@ -9184,6 +9303,48 @@ fn merge_persisted_resume_metadata(
             serde_json::Value::String(reasoning_effort.to_string()),
         );
     }
+}
+
+fn parse_thread_metadata_enum<T: serde::de::DeserializeOwned>(value: &str) -> Option<T> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str(trimmed)
+        .or_else(|_| serde_json::from_value(serde_json::Value::String(trimmed.to_string())))
+        .ok()
+}
+
+fn core_dynamic_tools_from_api(
+    dynamic_tools: Option<Vec<ApiDynamicToolSpec>>,
+) -> Result<Vec<CoreDynamicToolSpec>, String> {
+    let dynamic_tools = dynamic_tools.unwrap_or_default();
+    if dynamic_tools.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    validate_dynamic_tools(&dynamic_tools)?;
+    Ok(dynamic_tools
+        .into_iter()
+        .map(|tool| CoreDynamicToolSpec {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+            defer_loading: tool.defer_loading,
+        })
+        .collect())
+}
+
+fn thread_metadata_approval_policy(
+    persisted_metadata: &ThreadMetadata,
+) -> Option<codex_protocol::protocol::AskForApproval> {
+    parse_thread_metadata_enum(&persisted_metadata.approval_mode)
+}
+
+fn thread_metadata_sandbox_policy(
+    persisted_metadata: &ThreadMetadata,
+) -> Option<codex_protocol::protocol::SandboxPolicy> {
+    parse_thread_metadata_enum(&persisted_metadata.sandbox_policy)
 }
 
 fn has_model_resume_override(

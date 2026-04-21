@@ -1,5 +1,6 @@
 ---
 source: tui/src/chatwidget/tests/mcp_startup.rs
+assertion_line: 23
 expression: normalized_backend_snapshot(terminal.backend())
 ---
 "                                                                                "

@@ -1,7 +1,18 @@
 ---
 source: tui/src/chatwidget/tests/slash_commands.rs
+assertion_line: 1524
 expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
 ---
+
+
+
+
+
+
+
+
+
+
 • Working (0s • esc to interrupt)
 
 • Messages to be submitted at end of turn
