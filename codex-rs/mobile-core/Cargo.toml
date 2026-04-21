@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 base64 = { workspace = true }
 codex-apply-patch = { workspace = true }
+codex-device-key = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

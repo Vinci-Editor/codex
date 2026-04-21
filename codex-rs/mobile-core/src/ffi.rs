@@ -171,6 +171,15 @@ pub extern "C" fn codex_mobile_parse_chatgpt_token_claims_json(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn codex_mobile_device_key_signing_payload_json(
+    input: *const c_char,
+) -> CodexMobileBuffer {
+    call_json(input, |input| {
+        crate::device_key_signing_payload_json(input).map_err(|error| error.to_string())
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn codex_mobile_buffer_empty() -> CodexMobileBuffer {
     CodexMobileBuffer::empty()
 }

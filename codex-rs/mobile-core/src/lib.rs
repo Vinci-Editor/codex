@@ -7,6 +7,7 @@
 //! URLSession, Keychain, UI, and macOS `Process` execution remain in Swift.
 
 mod auth;
+mod device_key;
 mod ffi;
 mod output;
 mod patch;
@@ -20,6 +21,7 @@ pub use auth::authorization_url_json;
 pub use auth::device_code_request_json;
 pub use auth::parse_chatgpt_token_claims_json;
 pub use auth::refresh_token_request_json;
+pub use device_key::device_key_signing_payload_json;
 pub use ffi::CodexMobileBuffer;
 pub use patch::apply_patch_json;
 pub use providers::provider_defaults_json;

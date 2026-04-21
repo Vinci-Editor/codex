@@ -146,6 +146,32 @@ email, plan type, or FedRAMP account flag for account pickers or diagnostics.
 Apps can implement their own `CodexAuthStore` if they need a different secure
 storage policy.
 
+## Device-Key Payloads
+
+Upstream Codex exposes controller-local device-key protocol shapes for remote
+control enrollment and connection proofs. `CodexKit` keeps key storage and
+signing in Swift so apps can use Security framework, Keychain, Secure Enclave,
+or their own platform policy, but it asks Rust mobile-core for the canonical
+bytes to sign:
+
+```swift
+let payload = CodexDeviceKeySignPayload.remoteControlClientConnection(.init(
+    nonce: challenge.nonce,
+    sessionID: challenge.sessionID,
+    targetOrigin: "https://chatgpt.com",
+    targetPath: "/api/codex/remote/control/client",
+    accountUserID: account.userID,
+    clientID: clientID,
+    tokenExpiresAt: challenge.tokenExpiresAt,
+    tokenSHA256Base64URL: challenge.tokenSHA256Base64URL
+))
+
+let bytesToSign = try payload.signingPayloadBytes()
+```
+
+The resulting `Data` is the exact UTF-8 JSON payload covered by the device-key
+signature. Do not reserialize the payload before signing.
+
 ## Configure A Workspace
 
 The workspace is the root folder that tools can inspect or edit. For an app-owned

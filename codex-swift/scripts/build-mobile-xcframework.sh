@@ -64,6 +64,7 @@ CodexMobileBuffer codex_mobile_refresh_token_request_json(const char *input);
 CodexMobileBuffer codex_mobile_authorization_url_json(const char *input);
 CodexMobileBuffer codex_mobile_authorization_code_token_request_json(const char *input);
 CodexMobileBuffer codex_mobile_parse_chatgpt_token_claims_json(const char *input);
+CodexMobileBuffer codex_mobile_device_key_signing_payload_json(const char *input);
 HEADER
 
 cat >"${BUILD_DIR}/include/module.modulemap" <<'MODULEMAP'

@@ -254,6 +254,25 @@ func mobileBridgeExposesAuthRefreshAndBrowserRequests() throws {
 }
 
 @Test
+func deviceKeyPayloadUsesRustCanonicalSigningBytes() throws {
+    let payload = CodexDeviceKeySignPayload.remoteControlClientConnection(.init(
+        nonce: "nonce",
+        sessionID: "session",
+        targetOrigin: "https://chatgpt.com",
+        targetPath: "/api/codex/remote/control/client",
+        accountUserID: "user",
+        clientID: "client",
+        tokenExpiresAt: 123,
+        tokenSHA256Base64URL: "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"
+    ))
+
+    let bytes = try payload.signingPayloadBytes()
+    let text = String(decoding: bytes, as: UTF8.self)
+
+    #expect(text == #"{"domain":"codex-device-key-sign-payload/v1","payload":{"accountUserId":"user","audience":"remote_control_client_websocket","clientId":"client","nonce":"nonce","scopes":["remote_control_controller_websocket"],"sessionId":"session","targetOrigin":"https://chatgpt.com","targetPath":"/api/codex/remote/control/client","tokenExpiresAt":123,"tokenSha256Base64url":"47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU","type":"remoteControlClientConnection"}}"#)
+}
+
+@Test
 func jsonSchemaBuilderProducesToolInputSchema() {
     let schema = CodexJSONSchema.object(
         properties: [

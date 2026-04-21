@@ -166,6 +166,22 @@ public enum CodexMobileCoreBridge {
         #endif
     }
 
+    public static func deviceKeySigningPayload(_ payload: [String: Any]) throws -> Data {
+        #if canImport(CodexMobileCore)
+        let data = try rustData(input: ["payload": payload], codex_mobile_device_key_signing_payload_json)
+        let object = try decodeObject(data)
+        guard
+            let encoded = object["signedPayloadBase64"] as? String,
+            let signedPayload = Data(base64Encoded: encoded)
+        else {
+            throw CodexMobileCoreBridgeError.invalidJSON
+        }
+        return signedPayload
+        #else
+        return try fallbackDeviceKeySigningPayload(payload)
+        #endif
+    }
+
     private static func fallbackVersion() -> [String: Any] {
         [
             "crate": "codex-mobile-core",
@@ -695,6 +711,20 @@ public enum CodexMobileCoreBridge {
             "chatgptAccountIsFedramp": auth?["chatgpt_account_is_fedramp"] as? Bool ?? value["chatgpt_account_is_fedramp"] as? Bool ?? false,
             "expiresAt": value["exp"] ?? NSNull(),
         ]
+    }
+
+    private static func fallbackDeviceKeySigningPayload(_ payload: [String: Any]) throws -> Data {
+        let signedPayload: [String: Any] = [
+            "domain": "codex-device-key-sign-payload/v1",
+            "payload": payload,
+        ]
+        if #available(iOS 13.0, macOS 10.15, *) {
+            return try JSONSerialization.data(
+                withJSONObject: signedPayload,
+                options: [.sortedKeys, .withoutEscapingSlashes]
+            )
+        }
+        return try JSONSerialization.data(withJSONObject: signedPayload, options: [.sortedKeys])
     }
 
     private static func functionTool(
