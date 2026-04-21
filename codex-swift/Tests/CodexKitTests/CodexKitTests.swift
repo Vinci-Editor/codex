@@ -48,6 +48,8 @@ func mobileBridgeBuildsResponsesRequest() throws {
     #expect(value?["model"] as? String == "gpt-5.4")
     #expect(value?["instructions"] as? String == "Be concise")
     #expect((value?["tools"] as? [[String: Any]])?.first?["name"] as? String == "list_dir")
+    let toolNames = Set((value?["tools"] as? [[String: Any]])?.compactMap { $0["name"] as? String } ?? [])
+    #expect(toolNames.isSuperset(of: ["list_dir", "read_file", "search_files", "apply_patch", "write_file", "shell_command", "exec_command"]))
     #expect(value?["store"] as? Bool == false)
     #expect(value?["reasoning"] is NSNull)
     #expect(value?["prompt_cache_key"] as? String == "conversation-1")
@@ -246,6 +248,20 @@ func sessionExecutesBuiltinWorkspaceTools() async throws {
     ))
     let listOutput = try toolOutputBody(listData)
 
+    let readData = try await session.executeToolCall(CodexToolCall(
+        callID: "call-read",
+        name: "read_file",
+        arguments: #"{"path":"notes.txt"}"#
+    ))
+    let readOutput = try toolOutputBody(readData)
+
+    let searchData = try await session.executeToolCall(CodexToolCall(
+        callID: "call-search",
+        name: "search_files",
+        arguments: #"{"query":"hello","path":"."}"#
+    ))
+    let searchOutput = try toolOutputBody(searchData)
+
     let catData = try await session.executeToolCall(CodexToolCall(
         callID: "call-cat",
         name: "shell_command",
@@ -254,6 +270,8 @@ func sessionExecutesBuiltinWorkspaceTools() async throws {
     let catOutput = try toolOutputBody(catData)
 
     #expect(listOutput.contains("notes.txt"))
+    #expect(readOutput == "hello\n")
+    #expect(searchOutput.contains("notes.txt:1: hello"))
     #expect(catOutput == "hello\n")
 
     let patch = """
@@ -272,6 +290,16 @@ func sessionExecutesBuiltinWorkspaceTools() async throws {
 
     #expect(patchOutput.contains("A added.txt"))
     #expect(try String(contentsOf: root.appending(path: "added.txt"), encoding: .utf8) == "patched\n")
+
+    let writeData = try await session.executeToolCall(CodexToolCall(
+        callID: "call-write",
+        name: "write_file",
+        arguments: try jsonString(["path": "written.txt", "content": "written\n"])
+    ))
+    let writeOutput = try toolOutputBody(writeData)
+
+    #expect(writeOutput.contains("Wrote written.txt"))
+    #expect(try String(contentsOf: root.appending(path: "written.txt"), encoding: .utf8) == "written\n")
 }
 
 private func jwt(payload: [String: Any]) throws -> String {

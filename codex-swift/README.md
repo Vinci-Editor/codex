@@ -274,12 +274,23 @@ the stream when the user stops a turn or leaves the screen.
 `CodexKit` exposes a Codex-compatible default tool surface:
 
 - `list_dir`: lists entries inside the selected workspace.
+- `read_file`: reads UTF-8 text files inside the selected workspace without
+  going through shell.
+- `search_files`: searches UTF-8 text files inside the selected workspace
+  without going through shell.
+- `apply_patch`: applies Codex patches in-process through Rust, with the same
+  workspace jail checks as the iOS shell emulator.
+- `write_file`: writes a complete UTF-8 text file inside the selected workspace.
+  Prefer `apply_patch` for focused edits.
 - `shell_command`: runs a shell-like command. On iOS this uses the deterministic
   Rust shell emulator, not arbitrary process execution.
 - `exec_command`: accepts Codex unified exec-style arguments and uses the same
   iOS emulator.
-- `apply_patch`: applies Codex patches in-process through Rust, with the same
-  workspace jail checks as the iOS shell emulator.
+
+Session instructions steer the model toward `list_dir`, `read_file`,
+`search_files`, `apply_patch`, and `write_file` first. Shell tools remain
+available for commands that genuinely require a shell, such as builds, tests,
+package managers, or explicit user-requested commands.
 
 The iOS shell emulator is intended for coding workflows, not POSIX shell parity.
 It supports common read and edit commands such as `pwd`, `ls`, `find`, `cat`,
@@ -388,7 +399,8 @@ It demonstrates:
 - The Swift package expects iOS 26 and macOS 26.
 - `CodexKit` does not include a full app product, background agent, or TUI.
 - The iOS shell backend is an emulator. It does not run arbitrary binaries.
-- The macOS real-shell backend is not wired in this package yet.
+- The macOS shell backend runs `/bin/zsh -lc` with the working directory kept
+  inside the selected workspace.
 - MCP subprocess servers, App Server, and desktop sandboxing are out of scope for
   this mobile package.
 

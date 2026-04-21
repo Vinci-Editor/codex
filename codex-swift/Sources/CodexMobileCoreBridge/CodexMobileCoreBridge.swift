@@ -1,4 +1,7 @@
 import Foundation
+#if os(macOS)
+import Darwin
+#endif
 #if canImport(CodexMobileCore)
 import CodexMobileCore
 #endif
@@ -29,7 +32,7 @@ public enum CodexMobileCoreBridge {
         if let object = try? rustObject(codex_mobile_builtin_tools_json()),
            let tools = object["tools"] as? [[String: Any]]
         {
-            return tools
+            return mergedBuiltinTools(tools)
         }
         #endif
         return fallbackBuiltinTools()
@@ -72,11 +75,15 @@ public enum CodexMobileCoreBridge {
     }
 
     public static func emulateShell(_ input: [String: Any]) throws -> [String: Any] {
+        #if os(macOS)
+        return runNativeShell(input)
+        #else
         #if canImport(CodexMobileCore)
         let data = try rustData(input: input, codex_mobile_emulate_shell_json)
         return try decodeObject(data)
         #else
         return fallbackEmulateShell(input)
+        #endif
         #endif
     }
 
@@ -207,6 +214,27 @@ public enum CodexMobileCoreBridge {
                 ]
             ),
             functionTool(
+                name: "read_file",
+                description: "Reads a UTF-8 text file from the active workspace without using shell.",
+                required: ["path"],
+                properties: [
+                    "path": ["type": "string"],
+                    "offset": ["type": "number"],
+                    "limit": ["type": "number"],
+                ]
+            ),
+            functionTool(
+                name: "search_files",
+                description: "Searches UTF-8 text files in the active workspace without using shell.",
+                required: ["query"],
+                properties: [
+                    "query": ["type": "string"],
+                    "path": ["type": "string"],
+                    "case_sensitive": ["type": "boolean"],
+                    "limit": ["type": "number"],
+                ]
+            ),
+            functionTool(
                 name: "apply_patch",
                 description: "Applies a Codex apply_patch patch inside the active workspace.",
                 required: ["patch"],
@@ -216,8 +244,18 @@ public enum CodexMobileCoreBridge {
                 ]
             ),
             functionTool(
+                name: "write_file",
+                description: "Writes a complete UTF-8 text file in the active workspace. Prefer apply_patch for focused edits.",
+                required: ["path", "content"],
+                properties: [
+                    "path": ["type": "string"],
+                    "content": ["type": "string"],
+                    "create_directories": ["type": "boolean"],
+                ]
+            ),
+            functionTool(
                 name: "shell_command",
-                description: "Runs a shell-like command. On iOS this is a deterministic Codex emulator.",
+                description: "Runs a shell command. On macOS this uses /bin/zsh -lc; on iOS this is a deterministic Codex emulator.",
                 required: ["command"],
                 properties: [
                     "command": ["type": "string"],
@@ -227,7 +265,7 @@ public enum CodexMobileCoreBridge {
             ),
             functionTool(
                 name: "exec_command",
-                description: "Runs a shell-like command and returns Codex unified exec output.",
+                description: "Runs a shell command and returns Codex unified exec output. On macOS this uses /bin/zsh -lc; on iOS this uses the deterministic emulator.",
                 required: ["cmd"],
                 properties: [
                     "cmd": ["type": "string"],
@@ -237,6 +275,21 @@ public enum CodexMobileCoreBridge {
                 ]
             ),
         ]
+    }
+
+    private static func mergedBuiltinTools(_ tools: [[String: Any]]) -> [[String: Any]] {
+        var merged = tools
+        var names = Set(tools.compactMap { $0["name"] as? String })
+
+        for tool in fallbackBuiltinTools() {
+            guard let name = tool["name"] as? String, !names.contains(name) else {
+                continue
+            }
+            merged.append(tool)
+            names.insert(name)
+        }
+
+        return merged
     }
 
     private static func fallbackBuildResponsesRequest(_ input: [String: Any]) throws -> Data {
@@ -353,6 +406,204 @@ public enum CodexMobileCoreBridge {
         ]
     }
 
+    #if os(macOS)
+    private static func runNativeShell(_ input: [String: Any]) -> [String: Any] {
+        let started = Date()
+        let command = input["command"] as? String ?? input["cmd"] as? String ?? ""
+        guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return shellResponse(
+                exitCode: 64,
+                stdout: "",
+                stderr: "Missing command.\n",
+                started: started,
+                truncated: false
+            )
+        }
+
+        let maxOutputBytes = max(1, intValue(input["maxOutputBytes"])
+            ?? intValue(input["max_output_bytes"])
+            ?? intValue(input["max_output_tokens"]).map { $0 * 4 }
+            ?? 64 * 1024)
+        let timeoutMilliseconds = max(1, intValue(input["timeout_ms"]) ?? 120_000)
+
+        let workdir: URL
+        do {
+            workdir = try nativeShellWorkingDirectory(input)
+        } catch {
+            return shellResponse(
+                exitCode: 1,
+                stdout: "",
+                stderr: "\(error.localizedDescription)\n",
+                started: started,
+                truncated: false
+            )
+        }
+
+        let stdout = ShellOutputCollector(maxBytes: maxOutputBytes)
+        let stderr = ShellOutputCollector(maxBytes: maxOutputBytes)
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            stdout.append(handle.availableData)
+        }
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            stderr.append(handle.availableData)
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", command]
+        process.currentDirectoryURL = workdir
+        process.environment = ProcessInfo.processInfo.environment
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        let termination = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            termination.signal()
+        }
+
+        do {
+            try process.run()
+        } catch {
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            return shellResponse(
+                exitCode: 126,
+                stdout: "",
+                stderr: "\(error.localizedDescription)\n",
+                started: started,
+                truncated: false
+            )
+        }
+
+        var timedOut = false
+        if termination.wait(timeout: .now() + .milliseconds(timeoutMilliseconds)) == .timedOut {
+            timedOut = true
+            process.terminate()
+            if termination.wait(timeout: .now() + .seconds(2)) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                _ = termination.wait(timeout: .now() + .seconds(1))
+            }
+        }
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+        stdout.append(stdoutPipe.fileHandleForReading.readDataToEndOfFile())
+        stderr.append(stderrPipe.fileHandleForReading.readDataToEndOfFile())
+
+        if timedOut {
+            stderr.append(Data("Command timed out after \(timeoutMilliseconds) ms.\n".utf8))
+        }
+
+        return shellResponse(
+            exitCode: timedOut ? 124 : Int(process.terminationStatus),
+            stdout: stdout.string(),
+            stderr: stderr.string(),
+            started: started,
+            truncated: stdout.wasTruncated || stderr.wasTruncated
+        )
+    }
+
+    private static func nativeShellWorkingDirectory(_ input: [String: Any]) throws -> URL {
+        let rootPath = input["workspaceRoot"] as? String ?? input["workspace_root"] as? String ?? FileManager.default.currentDirectoryPath
+        let root = URL(fileURLWithPath: rootPath).standardizedFileURL.resolvingSymlinksInPath()
+        let rawWorkdir = input["workdir"] as? String ?? input["cwd"] as? String ?? ""
+        let candidate = rawWorkdir.isEmpty
+            ? root
+            : rawWorkdir.hasPrefix("/")
+                ? URL(fileURLWithPath: rawWorkdir)
+                : root.appending(path: rawWorkdir, directoryHint: .isDirectory)
+        let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath()
+        guard resolved.path == root.path || resolved.path.hasPrefix(root.path + "/") else {
+            throw CocoaError(.fileReadNoPermission, userInfo: [
+                NSFilePathErrorKey: resolved.path,
+                NSLocalizedDescriptionKey: "\(resolved.path): escapes workspace",
+            ])
+        }
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw CocoaError(.fileNoSuchFile, userInfo: [
+                NSFilePathErrorKey: resolved.path,
+                NSLocalizedDescriptionKey: "\(resolved.path): no such directory",
+            ])
+        }
+        return resolved
+    }
+
+    private static func shellResponse(
+        exitCode: Int,
+        stdout: String,
+        stderr: String,
+        started: Date,
+        truncated: Bool
+    ) -> [String: Any] {
+        let output: String
+        if stderr.isEmpty {
+            output = stdout
+        } else if stdout.isEmpty {
+            output = stderr
+        } else {
+            output = stdout + stderr
+        }
+        return [
+            "exit_code": exitCode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "output": output,
+            "wall_time_seconds": Date().timeIntervalSince(started),
+            "truncated": truncated,
+        ]
+    }
+
+    private final class ShellOutputCollector: @unchecked Sendable {
+        private let maxBytes: Int
+        private let lock = NSLock()
+        private var data = Data()
+        private var truncated = false
+
+        init(maxBytes: Int) {
+            self.maxBytes = maxBytes
+        }
+
+        var wasTruncated: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return truncated
+        }
+
+        func append(_ chunk: Data) {
+            guard !chunk.isEmpty else {
+                return
+            }
+            lock.lock()
+            defer { lock.unlock() }
+
+            let remaining = maxBytes - data.count
+            if remaining > 0 {
+                data.append(chunk.prefix(remaining))
+            }
+            if chunk.count > remaining {
+                truncated = true
+            }
+        }
+
+        func string() -> String {
+            lock.lock()
+            let snapshot = data
+            let wasTruncated = truncated
+            lock.unlock()
+
+            var text = String(decoding: snapshot, as: UTF8.self)
+            if wasTruncated {
+                text += "\n[output truncated]\n"
+            }
+            return text
+        }
+    }
+    #endif
+
     private static func fallbackApplyPatch(_ input: [String: Any]) -> [String: Any] {
         [
             "exit_code": 127,
@@ -467,6 +718,19 @@ public enum CodexMobileCoreBridge {
             throw CodexMobileCoreBridgeError.missingField(field)
         }
         return value
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        switch value {
+        case let value as Int:
+            return value
+        case let value as Double:
+            return Int(value)
+        case let value as String:
+            return Int(value)
+        default:
+            return nil
+        }
     }
 
     #if canImport(CodexMobileCore)

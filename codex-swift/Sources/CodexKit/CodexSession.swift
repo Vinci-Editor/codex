@@ -268,7 +268,7 @@ public actor CodexSession {
         }
         return """
         Current workspace: \(workspace.rootURL.path)
-        Use the available tools to inspect files before answering questions about the workspace. Do not claim you have read files unless a tool result has provided their contents.
+        Use list_dir, read_file, and search_files to inspect files before answering questions about the workspace. Prefer apply_patch for focused edits and write_file for complete-file writes. Use shell_command or exec_command only when a real shell is needed. Do not claim you have read files unless a tool result has provided their contents.
         """
     }
 
@@ -330,10 +330,16 @@ public actor CodexSession {
         switch call.name {
         case "list_dir":
             return try executeListDir(call)
+        case "read_file":
+            return try executeReadFile(call)
+        case "search_files":
+            return try executeSearchFiles(call)
         case "shell_command", "exec_command":
             return try executeShell(call)
         case "apply_patch":
             return try executeApplyPatch(call)
+        case "write_file":
+            return try executeWriteFile(call)
         default:
             throw CodexSessionError.unknownTool(call.name)
         }
@@ -355,6 +361,74 @@ public actor CodexSession {
             let page = entries.dropFirst(max(offset, 0)).prefix(max(limit, 1))
             let output = page.isEmpty ? "No entries." : page.joined(separator: "\n")
             return CodexToolResult(output: output)
+        }
+    }
+
+    private func executeReadFile(_ call: CodexToolCall) throws -> CodexToolResult {
+        let arguments = try Self.decodeArguments(call.arguments)
+        let path = arguments["path"] as? String ?? arguments["file_path"] as? String ?? ""
+        let offset = max(Self.intValue(arguments["offset"]) ?? 0, 0)
+        let limit = max(Self.intValue(arguments["limit"]) ?? 400, 1)
+        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return CodexToolResult(output: "Missing path.", success: false)
+        }
+        guard let workspace = configuration.workspace else {
+            return CodexToolResult(output: "No workspace selected.", success: false)
+        }
+
+        return try workspace.withSecurityScope { root in
+            let target = try Self.resolveExistingWorkspaceURL(root: root, rawPath: path)
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+                return CodexToolResult(output: "\(path): is a directory", success: false)
+            }
+
+            let text = try String(contentsOf: target, encoding: .utf8)
+            guard arguments["offset"] != nil || arguments["limit"] != nil else {
+                if text.count <= 64_000 {
+                    return CodexToolResult(output: text)
+                }
+                let index = text.index(text.startIndex, offsetBy: 64_000)
+                return CodexToolResult(output: "\(text[..<index])\n[truncated]")
+            }
+
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            guard !lines.isEmpty else {
+                return CodexToolResult(output: "")
+            }
+
+            let page = lines.dropFirst(offset).prefix(limit)
+            let output = page.joined(separator: "\n")
+            if offset + page.count < lines.count {
+                return CodexToolResult(output: "\(output)\n[showing lines \(offset + 1)-\(offset + page.count) of \(lines.count)]")
+            }
+            return CodexToolResult(output: output)
+        }
+    }
+
+    private func executeSearchFiles(_ call: CodexToolCall) throws -> CodexToolResult {
+        let arguments = try Self.decodeArguments(call.arguments)
+        let query = arguments["query"] as? String ?? arguments["pattern"] as? String ?? ""
+        let path = arguments["path"] as? String ?? "."
+        let caseSensitive = arguments["case_sensitive"] as? Bool ?? false
+        let limit = max(Self.intValue(arguments["limit"]) ?? 100, 1)
+        guard !query.isEmpty else {
+            return CodexToolResult(output: "Missing query.", success: false)
+        }
+        guard let workspace = configuration.workspace else {
+            return CodexToolResult(output: "No workspace selected.", success: false)
+        }
+
+        return try workspace.withSecurityScope { root in
+            let target = try Self.resolveExistingWorkspaceURL(root: root, rawPath: path)
+            let matches = try Self.searchFiles(
+                root: root,
+                target: target,
+                query: query,
+                caseSensitive: caseSensitive,
+                limit: limit
+            )
+            return CodexToolResult(output: matches.isEmpty ? "No matches." : matches.joined(separator: "\n"))
         }
     }
 
@@ -396,6 +470,9 @@ public actor CodexSession {
         guard let workspace = configuration.workspace else {
             return CodexToolResult(output: "No workspace selected.", success: false)
         }
+        guard !workspace.readOnly else {
+            return CodexToolResult(output: "Workspace is read-only.", success: false)
+        }
 
         return try workspace.withSecurityScope { root in
             var input: [String: Any] = [
@@ -413,6 +490,41 @@ public actor CodexSession {
                 output: output.isEmpty ? "(no output)" : output,
                 success: exitCode == 0
             )
+        }
+    }
+
+    private func executeWriteFile(_ call: CodexToolCall) throws -> CodexToolResult {
+        let arguments = try Self.decodeArguments(call.arguments)
+        let path = arguments["path"] as? String ?? arguments["file_path"] as? String ?? ""
+        let content = arguments["content"] as? String ?? ""
+        let createDirectories = arguments["create_directories"] as? Bool ?? true
+        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return CodexToolResult(output: "Missing path.", success: false)
+        }
+        guard let workspace = configuration.workspace else {
+            return CodexToolResult(output: "No workspace selected.", success: false)
+        }
+        guard !workspace.readOnly else {
+            return CodexToolResult(output: "Workspace is read-only.", success: false)
+        }
+
+        return try workspace.withSecurityScope { root in
+            let target = try Self.resolveWorkspaceURL(root: root, rawPath: path, mustExist: false)
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                return CodexToolResult(output: "\(path): is a directory", success: false)
+            }
+
+            let parent = target.deletingLastPathComponent()
+            if createDirectories {
+                try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            } else if !FileManager.default.fileExists(atPath: parent.path) {
+                return CodexToolResult(output: "\(parent.path): no such directory", success: false)
+            }
+
+            try content.write(to: target, atomically: true, encoding: .utf8)
+            let relativePath = Self.relativeWorkspacePath(root: root, url: target)
+            return CodexToolResult(output: "Wrote \(relativePath) (\(content.utf8.count) bytes).")
         }
     }
 
@@ -446,6 +558,10 @@ public actor CodexSession {
     }
 
     private static func resolveExistingWorkspaceURL(root: URL, rawPath: String) throws -> URL {
+        try resolveWorkspaceURL(root: root, rawPath: rawPath, mustExist: true)
+    }
+
+    private static func resolveWorkspaceURL(root: URL, rawPath: String, mustExist: Bool) throws -> URL {
         let rootURL = root.standardizedFileURL.resolvingSymlinksInPath()
         let candidate: URL
         if rawPath.isEmpty || rawPath == "." {
@@ -456,7 +572,7 @@ public actor CodexSession {
             candidate = rootURL.appending(path: rawPath, directoryHint: .inferFromPath)
         }
         let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath()
-        guard FileManager.default.fileExists(atPath: resolved.path) else {
+        guard !mustExist || FileManager.default.fileExists(atPath: resolved.path) else {
             throw CodexSessionError.workspacePathError("\(rawPath): no such file or directory")
         }
         guard isInsideWorkspace(url: resolved, root: rootURL) else {
@@ -498,9 +614,7 @@ public actor CodexSession {
             guard isInsideWorkspace(url: resolved, root: root) else {
                 continue
             }
-            let relative = resolved.path
-                .replacingOccurrences(of: root.path, with: "")
-                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let relative = relativeWorkspacePath(root: root, url: resolved)
             let isDirectory = values.isDirectory == true
             results.append(isDirectory ? "\(relative)/" : relative)
             if isDirectory && values.isSymbolicLink != true {
@@ -512,6 +626,63 @@ public actor CodexSession {
                 )
             }
         }
+    }
+
+    private static func searchFiles(
+        root: URL,
+        target: URL,
+        query: String,
+        caseSensitive: Bool,
+        limit: Int
+    ) throws -> [String] {
+        let rootURL = root.standardizedFileURL.resolvingSymlinksInPath()
+        let fileManager = FileManager.default
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        let urls: [URL]
+
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: target.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            guard let enumerator = fileManager.enumerator(
+                at: target,
+                includingPropertiesForKeys: keys,
+                options: [.skipsHiddenFiles]
+            ) else {
+                return []
+            }
+            urls = enumerator.compactMap { $0 as? URL }
+        } else {
+            urls = [target]
+        }
+
+        let needle = caseSensitive ? query : query.lowercased()
+        var matches: [String] = []
+
+        for url in urls {
+            let values = try url.resourceValues(forKeys: Set(keys))
+            guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+            guard isInsideWorkspace(url: resolved, root: rootURL) else { continue }
+            if let fileSize = values.fileSize, fileSize > 2_000_000 { continue }
+            guard let text = try? String(contentsOf: resolved, encoding: .utf8) else { continue }
+
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            for (index, line) in lines.enumerated() {
+                let haystack = caseSensitive ? String(line) : String(line).lowercased()
+                guard haystack.contains(needle) else { continue }
+                matches.append("\(relativeWorkspacePath(root: rootURL, url: resolved)):\(index + 1): \(line)")
+                if matches.count >= limit {
+                    return matches
+                }
+            }
+        }
+
+        return matches
+    }
+
+    private static func relativeWorkspacePath(root: URL, url: URL) -> String {
+        url.path
+            .replacingOccurrences(of: root.path, with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
     private static func isInsideWorkspace(url: URL, root: URL) -> Bool {
