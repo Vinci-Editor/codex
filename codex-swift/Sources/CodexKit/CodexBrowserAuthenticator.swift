@@ -121,23 +121,13 @@ public final class CodexBrowserAuthenticator: NSObject, @unchecked Sendable {
                 }
             }
 
+            let completionHandler = CodexWebAuthenticationCompletionHandler(attempt: attempt)
+            attempt.completionHandler = completionHandler
             let session = ASWebAuthenticationSession(
                 url: authorizeURL,
-                callbackURLScheme: nil
-            ) { [weak attempt] _, error in
-                Task { @MainActor in
-                    guard let error else {
-                        attempt?.finish(.failure(CodexBrowserAuthError.cancelled))
-                        return
-                    }
-                    if let authError = error as? ASWebAuthenticationSessionError,
-                       authError.code == .canceledLogin {
-                        attempt?.finish(.failure(CodexBrowserAuthError.cancelled))
-                    } else {
-                        attempt?.finish(.failure(error))
-                    }
-                }
-            }
+                callbackURLScheme: nil,
+                completionHandler: completionHandler.handle(callbackURL:error:)
+            )
             session.prefersEphemeralWebBrowserSession = configuration.prefersEphemeralWebBrowserSession
             session.presentationContextProvider = presentationProvider
             attempt.session = session
@@ -273,10 +263,37 @@ private struct BrowserTokenResponse: Decodable {
     }
 }
 
+private final class CodexWebAuthenticationCompletionHandler: @unchecked Sendable {
+    weak var attempt: CodexBrowserAuthAttempt?
+
+    init(attempt: CodexBrowserAuthAttempt) {
+        self.attempt = attempt
+    }
+
+    nonisolated func handle(callbackURL: URL?, error: Error?) {
+        let result: Result<URL, Error>
+        if let callbackURL {
+            result = .success(callbackURL)
+        } else if let authError = error as? ASWebAuthenticationSessionError,
+                  authError.code == .canceledLogin {
+            result = .failure(CodexBrowserAuthError.cancelled)
+        } else if let error {
+            result = .failure(error)
+        } else {
+            result = .failure(CodexBrowserAuthError.cancelled)
+        }
+
+        Task { @MainActor [weak self] in
+            self?.attempt?.finish(result)
+        }
+    }
+}
+
 @MainActor
 private final class CodexBrowserAuthAttempt {
     var session: ASWebAuthenticationSession?
     var callbackTask: Task<Void, Never>?
+    var completionHandler: CodexWebAuthenticationCompletionHandler?
 
     private let callbackServer: CodexLoopbackCallbackServer
     private let continuation: CheckedContinuation<URL, Error>
@@ -300,6 +317,7 @@ private final class CodexBrowserAuthAttempt {
         callbackServer.stop()
         session?.cancel()
         session = nil
+        completionHandler = nil
         switch result {
         case .success(let url):
             continuation.resume(returning: url)
