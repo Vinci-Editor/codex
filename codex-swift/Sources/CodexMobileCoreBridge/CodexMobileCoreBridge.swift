@@ -88,11 +88,15 @@ public enum CodexMobileCoreBridge {
     }
 
     public static func applyPatch(_ input: [String: Any]) throws -> [String: Any] {
+        #if os(macOS)
+        return nativeApplyPatch(input)
+        #else
         #if canImport(CodexMobileCore)
         let data = try rustData(input: input, codex_mobile_apply_patch_json)
         return try decodeObject(data)
         #else
         return fallbackApplyPatch(input)
+        #endif
         #endif
     }
 

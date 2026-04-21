@@ -55,6 +55,69 @@ func mobileBridgeBuildsResponsesRequest() throws {
     #expect(value?["prompt_cache_key"] as? String == "conversation-1")
 }
 
+#if os(macOS)
+@Test
+func mobileBridgeAppliesPatchWithoutMobileCoreOnMacOS() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try "old\n".write(to: root.appending(path: "notes.txt"), atomically: true, encoding: .utf8)
+    try "gone\n".write(to: root.appending(path: "obsolete.txt"), atomically: true, encoding: .utf8)
+
+    let response = try CodexMobileCoreBridge.applyPatch([
+        "workspaceRoot": root.path,
+        "patch": """
+        *** Begin Patch
+        *** Update File: notes.txt
+        @@
+        -old
+        +new
+        *** Add File: nested/added.txt
+        +added
+        *** Delete File: obsolete.txt
+        *** End Patch
+        """,
+    ])
+
+    #expect(response["exit_code"] as? Int == 0)
+    #expect((response["output"] as? String)?.contains("M notes.txt") == true)
+    #expect((response["output"] as? String)?.contains("A nested/added.txt") == true)
+    #expect((response["output"] as? String)?.contains("D obsolete.txt") == true)
+    #expect(try String(contentsOf: root.appending(path: "notes.txt"), encoding: .utf8) == "new\n")
+    #expect(try String(contentsOf: root.appending(path: "nested/added.txt"), encoding: .utf8) == "added\n")
+    #expect(!FileManager.default.fileExists(atPath: root.appending(path: "obsolete.txt").path))
+}
+
+@Test
+func mobileBridgeApplyPatchRejectsMacOSWorkspaceEscapes() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    let outside = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: outside)
+    }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+
+    let response = try CodexMobileCoreBridge.applyPatch([
+        "workspaceRoot": root.path,
+        "patch": """
+        *** Begin Patch
+        *** Add File: \(outside.path)/escape.txt
+        +bad
+        *** End Patch
+        """,
+    ])
+
+    #expect(response["exit_code"] as? Int == 1)
+    #expect((response["output"] as? String)?.contains("escapes workspace") == true)
+    #expect(!FileManager.default.fileExists(atPath: outside.appending(path: "escape.txt").path))
+}
+#endif
+
 @Test
 func mobileBridgeBuildsTurnOptionsAndMultipartInput() throws {
     let imageData = Data([0, 1, 2])

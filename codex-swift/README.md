@@ -278,14 +278,16 @@ the stream when the user stops a turn or leaves the screen.
   going through shell.
 - `search_files`: searches UTF-8 text files inside the selected workspace
   without going through shell.
-- `apply_patch`: applies Codex patches in-process through Rust, with the same
-  workspace jail checks as the iOS shell emulator.
+- `apply_patch`: applies Codex patches inside the selected workspace. macOS uses
+  a native Swift applier with workspace jail checks; iOS uses Rust mobile-core
+  when the artifact is available.
 - `write_file`: writes a complete UTF-8 text file inside the selected workspace.
   Prefer `apply_patch` for focused edits.
-- `shell_command`: runs a shell-like command. On iOS this uses the deterministic
-  Rust shell emulator, not arbitrary process execution.
-- `exec_command`: accepts Codex unified exec-style arguments and uses the same
-  iOS emulator.
+- `shell_command`: runs a shell-like command. On macOS this runs `/bin/zsh -lc`
+  inside the selected workspace. On iOS this uses the deterministic Rust shell
+  emulator, not arbitrary process execution.
+- `exec_command`: accepts Codex unified exec-style arguments. On macOS it uses
+  the same native shell runner; on iOS it uses the deterministic emulator.
 
 Session instructions steer the model toward `list_dir`, `read_file`,
 `search_files`, `apply_patch`, and `write_file` first. Shell tools remain

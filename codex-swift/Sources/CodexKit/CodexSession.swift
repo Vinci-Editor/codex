@@ -446,10 +446,16 @@ public actor CodexSession {
             var input: [String: Any] = [
                 "workspaceRoot": root.path,
                 "command": command,
-                "maxOutputBytes": 64 * 1024,
+                "maxOutputBytes": Self.intValue(arguments["maxOutputBytes"])
+                    ?? Self.intValue(arguments["max_output_bytes"])
+                    ?? Self.intValue(arguments["max_output_tokens"]).map { $0 * 4 }
+                    ?? 64 * 1024,
             ]
             if let workdir = arguments["workdir"] as? String {
                 input["workdir"] = workdir
+            }
+            if let timeoutMilliseconds = Self.intValue(arguments["timeout_ms"]) {
+                input["timeout_ms"] = timeoutMilliseconds
             }
             let response = try CodexMobileCoreBridge.emulateShell(input)
             let exitCode = Self.intValue(response["exit_code"]) ?? 1
