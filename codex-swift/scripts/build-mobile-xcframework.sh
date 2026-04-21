@@ -11,7 +11,23 @@ XCFRAMEWORK="${ARTIFACT_DIR}/CodexMobileCore.xcframework"
 IOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-26.0}"
 MACOS_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-26.0}"
 
-if ! command -v cargo >/dev/null 2>&1; then
+if command -v rustup >/dev/null 2>&1; then
+  CARGO_BIN="$(rustup which cargo 2>/dev/null || true)"
+  RUSTC_BIN="$(rustup which rustc 2>/dev/null || true)"
+else
+  CARGO_BIN=""
+  RUSTC_BIN=""
+fi
+
+if [[ -z "${CARGO_BIN}" ]]; then
+  CARGO_BIN="$(command -v cargo || true)"
+fi
+
+if [[ -z "${RUSTC_BIN}" ]]; then
+  RUSTC_BIN="$(command -v rustc || true)"
+fi
+
+if [[ -z "${CARGO_BIN}" ]]; then
   echo "cargo is required to build CodexMobileCore.xcframework" >&2
   exit 1
 fi
@@ -45,6 +61,8 @@ CodexMobileBuffer codex_mobile_emulate_shell_json(const char *input);
 CodexMobileBuffer codex_mobile_apply_patch_json(const char *input);
 CodexMobileBuffer codex_mobile_device_code_request_json(const char *input);
 CodexMobileBuffer codex_mobile_refresh_token_request_json(const char *input);
+CodexMobileBuffer codex_mobile_authorization_url_json(const char *input);
+CodexMobileBuffer codex_mobile_authorization_code_token_request_json(const char *input);
 CodexMobileBuffer codex_mobile_parse_chatgpt_token_claims_json(const char *input);
 HEADER
 
@@ -59,19 +77,19 @@ build_target() {
   local target="$1"
   case "${target}" in
     aarch64-apple-ios | aarch64-apple-ios-sim)
-      IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" cargo build \
+      IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" RUSTC="${RUSTC_BIN}" "${CARGO_BIN}" build \
         --manifest-path "${CRATE_DIR}/Cargo.toml" \
         --target "${target}" \
         --release
       ;;
     aarch64-apple-darwin)
-      MACOSX_DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET}" cargo build \
+      MACOSX_DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET}" RUSTC="${RUSTC_BIN}" "${CARGO_BIN}" build \
         --manifest-path "${CRATE_DIR}/Cargo.toml" \
         --target "${target}" \
         --release
       ;;
     *)
-      cargo build \
+      RUSTC="${RUSTC_BIN}" "${CARGO_BIN}" build \
         --manifest-path "${CRATE_DIR}/Cargo.toml" \
         --target "${target}" \
         --release

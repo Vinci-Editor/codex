@@ -146,6 +146,22 @@ pub extern "C" fn codex_mobile_refresh_token_request_json(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn codex_mobile_authorization_url_json(input: *const c_char) -> CodexMobileBuffer {
+    call_json(input, |input| {
+        crate::authorization_url_json(input).map_err(|error| error.to_string())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn codex_mobile_authorization_code_token_request_json(
+    input: *const c_char,
+) -> CodexMobileBuffer {
+    call_json(input, |input| {
+        crate::authorization_code_token_request_json(input).map_err(|error| error.to_string())
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn codex_mobile_parse_chatgpt_token_claims_json(
     input: *const c_char,
 ) -> CodexMobileBuffer {

@@ -17,12 +17,18 @@ func authTokensResolveChatGPTAccountIDFromIDToken() throws {
     let idToken = try jwt(payload: [
         "https://api.openai.com/auth": [
             "chatgpt_account_id": "account-123",
+            "chatgpt_plan_type": "plus",
+            "chatgpt_user_id": "user-123",
             "chatgpt_account_is_fedramp": false,
         ],
+        "email": "dev@example.com",
     ])
     let tokens = CodexAuthTokens(idToken: idToken, accessToken: "access", refreshToken: "refresh")
 
     #expect(tokens.resolvedChatGPTAccountID == "account-123")
+    #expect(tokens.resolvedAccountMetadata.planType == "plus")
+    #expect(tokens.resolvedAccountMetadata.userID == "user-123")
+    #expect(tokens.resolvedAccountMetadata.email == "dev@example.com")
 }
 
 @Test
@@ -48,6 +54,37 @@ func mobileBridgeBuildsResponsesRequest() throws {
 }
 
 @Test
+func mobileBridgeBuildsTurnOptionsAndMultipartInput() throws {
+    let imageData = Data([0, 1, 2])
+    let inputParts = [
+        CodexInput.text("look").responsesContentPart,
+        CodexInput.imageData(imageData, mimeType: "image/png").responsesContentPart,
+    ]
+    let body = try CodexMobileCoreBridge.buildResponsesRequest([
+        "model": "gpt-5.4-mini",
+        "input": [["type": "message", "role": "user", "content": inputParts]],
+        "tools": [],
+        "stream": true,
+        "store": false,
+        "reasoning": ["effort": "low"],
+        "serviceTier": "flex",
+        "toolChoice": "required",
+        "parallelToolCalls": false,
+    ])
+    let value = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+    let input = value?["input"] as? [[String: Any]]
+    let content = input?.first?["content"] as? [[String: Any]]
+
+    #expect(value?["model"] as? String == "gpt-5.4-mini")
+    #expect(value?["service_tier"] as? String == "flex")
+    #expect(value?["tool_choice"] as? String == "required")
+    #expect(value?["parallel_tool_calls"] as? Bool == false)
+    #expect((value?["reasoning"] as? [String: Any])?["effort"] as? String == "low")
+    #expect(content?[0]["text"] as? String == "look")
+    #expect(content?[1]["image_url"] as? String == "data:image/png;base64,AAEC")
+}
+
+@Test
 func mobileBridgeNormalizesTextDelta() throws {
     let event = try CodexMobileCoreBridge.parseSSEEvent(
         Data(#"{"type":"response.output_text.delta","delta":"hello"}"#.utf8)
@@ -55,6 +92,43 @@ func mobileBridgeNormalizesTextDelta() throws {
 
     #expect(event["type"] as? String == "outputTextDelta")
     #expect(event["delta"] as? String == "hello")
+}
+
+@Test
+func sessionDecodesReasoningAndToolArgumentDeltas() throws {
+    let reasoning = try CodexMobileCoreBridge.parseSSEEvent(
+        Data(#"{"type":"response.reasoning_summary_text.delta","delta":"working"}"#.utf8)
+    )
+    let arguments = try CodexMobileCoreBridge.parseSSEEvent(
+        Data(#"{"type":"response.function_call_arguments.delta","item_id":"item-1","output_index":0,"delta":"{\"path\""}"#.utf8)
+    )
+
+    #expect(try CodexSession.decodeStreamEvent(reasoning) == .reasoningSummaryDelta("working"))
+    #expect(try CodexSession.decodeStreamEvent(arguments) == .toolCallInputDelta(
+        itemID: "item-1",
+        outputIndex: 0,
+        delta: #"{"path""#
+    ))
+}
+
+@Test
+func sessionPreservesCustomToolCallKind() throws {
+    let event = try CodexSession.decodeStreamEvent([
+        "type": "outputItemDone",
+        "item": [
+            "type": "custom_tool_call",
+            "call_id": "call-1",
+            "name": "custom",
+            "input": #"{"value":1}"#,
+        ],
+    ])
+
+    guard case .toolCall(let call) = event else {
+        Issue.record("Expected tool call")
+        return
+    }
+    #expect(call.kind == .custom)
+    #expect(call.arguments == #"{"value":1}"#)
 }
 
 @Test
@@ -70,6 +144,87 @@ func toolOutputUsesResponsesFunctionCallOutputShape() {
     #expect(output["type"] as? String == "function_call_output")
     #expect(output["call_id"] as? String == "call-1")
     #expect(output["output"] as? String == "done")
+}
+
+@Test
+func toolOutputUsesResponsesCustomToolCallOutputShape() {
+    let output = CodexMobileCoreBridge.toolOutput(
+        callID: "call-1",
+        output: "done",
+        success: true,
+        custom: true,
+        name: "custom"
+    )
+
+    #expect(output["type"] as? String == "custom_tool_call_output")
+    #expect(output["call_id"] as? String == "call-1")
+    #expect(output["name"] as? String == "custom")
+    #expect(output["output"] as? String == "done")
+}
+
+@Test
+func mobileBridgeExposesAuthRefreshAndBrowserRequests() throws {
+    let refresh = try CodexMobileCoreBridge.refreshTokenRequest(
+        clientID: "client",
+        refreshToken: "refresh"
+    )
+    let authorizationURL = try CodexMobileCoreBridge.authorizationURL(
+        issuer: URL(string: "https://auth.openai.com")!,
+        clientID: "client",
+        redirectURI: "http://localhost:1455/auth/callback",
+        state: "state",
+        codeChallenge: "challenge"
+    )
+    let token = try CodexMobileCoreBridge.authorizationCodeTokenRequest(
+        clientID: "client",
+        code: "code",
+        codeVerifier: "verifier",
+        redirectURI: "http://localhost:1455/auth/callback"
+    )
+
+    #expect((refresh["body"] as? [String: Any])?["grant_type"] as? String == "refresh_token")
+    #expect(authorizationURL.absoluteString.contains("code_challenge=challenge"))
+    #expect(token["path"] as? String == "/oauth/token")
+    #expect(token["body"] as? String == "grant_type=authorization_code&code=code&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&client_id=client&code_verifier=verifier")
+}
+
+@Test
+func jsonSchemaBuilderProducesToolInputSchema() {
+    let schema = CodexJSONSchema.object(
+        properties: [
+            "path": .string(description: "File path"),
+            "mode": .stringEnum(["read", "write"]),
+            "recursive": .boolean(),
+        ],
+        required: ["path"]
+    )
+    let properties = schema.inputSchema["properties"] as? [String: any Sendable]
+    let path = properties?["path"] as? [String: any Sendable]
+    let mode = properties?["mode"] as? [String: any Sendable]
+
+    #expect(schema.inputSchema["type"] as? String == "object")
+    #expect(path?["description"] as? String == "File path")
+    #expect(mode?["enum"] as? [String] == ["read", "write"])
+}
+
+@Test
+func workspaceStoreRoundTripsSecurityScopedWorkspaceRecord() throws {
+    let suiteName = "CodexWorkspaceStoreTests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    let workspace = CodexWorkspace(rootURL: root, bookmarkData: Data([1, 2, 3]), readOnly: true)
+    let store = CodexWorkspaceStore(defaults: defaults)
+
+    let record = try store.save(workspace, displayName: "Demo")
+    let resolved = try store.resolve(record)
+
+    #expect(try store.list() == [record])
+    #expect(resolved.rootURL.path == root.path)
+    #expect(resolved.bookmarkData == Data([1, 2, 3]))
+    #expect(resolved.readOnly == true)
 }
 
 @Test

@@ -75,9 +75,27 @@ let custom = CodexProvider.custom(
 )
 ```
 
-`CodexProvider.openAI` targets the ChatGPT Codex backend and requires device-code
+`CodexProvider.openAI` targets the ChatGPT Codex backend and requires ChatGPT
 sign-in. OpenAI-compatible local providers such as LM Studio should expose a
 Responses-compatible `/responses` route under their base URL.
+
+For a provider that uses a bearer API key instead of ChatGPT auth, opt into API
+key mode and pass a `CodexAPIKeyStore` to the session configuration:
+
+```swift
+let provider = CodexProvider.custom(
+    id: "responses-proxy",
+    name: "Responses Proxy",
+    baseURL: URL(string: "https://example.com/v1")!,
+    authMode: .apiKey
+)
+
+let apiKeyStore = CodexKeychainAPIKeyStore(service: "MyApp Codex API Key")
+try apiKeyStore.saveAPIKey("sk-...")
+```
+
+`CodexKit` injects `Authorization: Bearer ...` from the key store and never
+writes API keys into process environment.
 
 For a physical iPhone talking to a Mac-hosted LM Studio server, use the Mac's LAN
 URL instead of `127.0.0.1`, and configure local-network permission plus any
@@ -85,9 +103,11 @@ development ATS exceptions in the app target.
 
 ## Sign In With ChatGPT
 
-ChatGPT login currently uses device code auth. The app should request a code,
-show the verification URL and user code, poll for tokens, then store them in
-Keychain.
+ChatGPT login can use device code auth or browser PKCE auth. Both flows return
+`CodexAuthTokens`, including account metadata derived through the Rust mobile
+core token-claim parser.
+
+Device code auth is useful when you want to own every screen:
 
 ```swift
 let authStore = CodexKeychainAuthStore(
@@ -106,9 +126,22 @@ let tokens = try await authenticator.pollForTokens(deviceCode: code)
 try authStore.saveTokens(tokens)
 ```
 
+Browser PKCE auth uses `ASWebAuthenticationSession` and a loopback callback:
+
+```swift
+let browserAuth = CodexBrowserAuthenticator()
+let tokens = try await browserAuth.authenticate()
+try authStore.saveTokens(tokens)
+```
+
 `CodexSession` loads tokens from the configured `CodexAuthStore` whenever the
-selected provider requires ChatGPT auth. It sends both the bearer token and the
-resolved `ChatGPT-Account-ID` header when available.
+selected provider requires ChatGPT auth. If the access token is expired or close
+to expiring, it refreshes tokens through `CodexDeviceCodeAuthenticator`, saves
+the refreshed bundle, then sends both the bearer token and the resolved
+`ChatGPT-Account-ID` header when available.
+
+Use `tokens.resolvedAccountMetadata` when your app needs the account id, user id,
+email, plan type, or FedRAMP account flag for account pickers or diagnostics.
 
 Apps can implement their own `CodexAuthStore` if they need a different secure
 storage policy.
@@ -127,6 +160,17 @@ For a folder selected from Files or an open panel, wrap the selected URL:
 ```swift
 let workspace = try CodexWorkspace.securityScopedFolder(url: selectedURL)
 ```
+
+Persist recent workspaces with `CodexWorkspaceStore`:
+
+```swift
+let workspaceStore = CodexWorkspaceStore()
+let record = try workspaceStore.save(workspace, displayName: "Project")
+let restored = try workspaceStore.resolve(record)
+```
+
+The store records bookmark data, root path, read-only mode, display name, and
+last-used time. Apps still decide how to present or prune recents.
 
 When tools run, `CodexKit` calls `withSecurityScope` around workspace access:
 
@@ -148,7 +192,6 @@ continues the tool loop until the model finishes.
 ```swift
 let session = CodexSession(configuration: CodexSessionConfiguration(
     provider: .openAI,
-    model: "gpt-5.4",
     authStore: authStore,
     workspace: workspace,
     baseInstructionsOverride: """
@@ -164,16 +207,46 @@ Use a new session when provider, model, auth context, workspace, or registered
 tools change. Call `clearHistory()` if the user wants a fresh conversation with
 the same configuration.
 
+The default model is `gpt-5.4`. Override it in `CodexSessionConfiguration` for a
+long-lived session default or per turn with `CodexTurnOptions`.
+
 ## Stream A Turn
 
 `submit(userText:)` returns an `AsyncThrowingStream<CodexStreamEvent, Error>`.
+Use `submit(userText:options:)` for per-turn model or reasoning overrides, and
+`submit(inputs:options:)` for multipart input:
+
+```swift
+let options = CodexTurnOptions(
+    model: "gpt-5.4",
+    reasoningEffort: "low",
+    serviceTier: "flex",
+    toolChoice: "auto",
+    parallelToolCalls: true
+)
+
+let stream = await session.submit(
+    inputs: [
+        .text("Explain this screenshot."),
+        .imageData(pngData, mimeType: "image/png"),
+    ],
+    options: options
+)
+```
+
 Update your UI as events arrive:
 
 ```swift
-for try await event in await session.submit(userText: prompt) {
+for try await event in stream {
     switch event {
     case .outputTextDelta(let delta):
         assistantMessage += delta
+
+    case .reasoningSummaryDelta(let delta):
+        reasoningSummary += delta
+
+    case .toolCallInputDelta(_, _, let delta):
+        updateToolArgumentsPreview(delta)
 
     case .toolCall(let call):
         showToolStarted(name: call.name, arguments: call.arguments)
@@ -211,12 +284,15 @@ the stream when the user stops a turn or leaves the screen.
 The iOS shell emulator is intended for coding workflows, not POSIX shell parity.
 It supports common read and edit commands such as `pwd`, `ls`, `find`, `cat`,
 `head`, `tail`, `wc`, `grep`, `rg`, `sort`, `uniq`, common `sed` forms,
-`printf`, `mkdir`, `touch`, `cp`, `mv`, and `rm`, with workspace jail checks.
+`printf`, `mkdir`, `touch`, `cp`, `mv`, and `rm`, with workspace jail checks. It
+also answers command lookup probes such as `command -v`, `command -V`, `which`,
+and `type` for the supported emulator commands.
 
 Unsupported iOS shell features fail with normal command-style stderr and exit
 status. Examples include arbitrary binaries, interpreters, package managers,
 network commands, background jobs, command substitution, subshells, PTYs, and
-long-running interactive sessions.
+long-running interactive sessions. Command input is capped at 32 KiB, and long
+outputs are truncated on UTF-8 character boundaries.
 
 ## Add A Custom Swift Tool
 
@@ -243,9 +319,27 @@ struct BuildNumberTool: CodexTool {
 }
 ```
 
+For a typed schema builder, use `CodexJSONSchema` and hand its `inputSchema`
+dictionary to `CodexTool`:
+
+```swift
+let inputSchema = CodexJSONSchema.object(
+    properties: [
+        "path": .string(description: "Workspace-relative path"),
+        "recursive": .boolean(),
+    ],
+    required: ["path"]
+).inputSchema
+```
+
 Register custom tools in `CodexSessionConfiguration.tools`. Tool implementations
 receive a `CodexToolContext` containing the active workspace, if one was
 configured.
+
+`CodexToolCall.kind` preserves whether the backend sent a function tool call or
+custom tool call. `CodexKit` uses that kind when appending tool output so the
+next Responses request uses the correct `function_call_output` or
+`custom_tool_call_output` item shape.
 
 Return `CodexToolResult(output: ..., success: false)` when a tool fails in a way
 the model can recover from. Throw an error for unexpected app/runtime failures.

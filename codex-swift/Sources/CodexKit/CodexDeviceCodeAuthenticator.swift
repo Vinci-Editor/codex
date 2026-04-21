@@ -80,6 +80,26 @@ public final class CodexDeviceCodeAuthenticator: @unchecked Sendable {
         throw CodexDeviceCodeAuthError.timedOut
     }
 
+    public func refreshTokens(_ tokens: CodexAuthTokens) async throws -> CodexAuthTokens {
+        let descriptor = try CodexMobileCoreBridge.refreshTokenRequest(
+            clientID: clientID,
+            refreshToken: tokens.refreshToken
+        )
+        let refreshed = try await performTokenRequest(descriptor)
+        let refreshToken = refreshed.refreshToken ?? tokens.refreshToken
+        let metadata = CodexAuthTokens.accountMetadata(
+            idToken: refreshed.idToken,
+            accessToken: refreshed.accessToken
+        )
+        return CodexAuthTokens(
+            idToken: refreshed.idToken,
+            accessToken: refreshed.accessToken,
+            refreshToken: refreshToken,
+            accountID: metadata.accountID ?? tokens.resolvedChatGPTAccountID,
+            planType: metadata.planType ?? tokens.resolvedAccountMetadata.planType
+        )
+    }
+
     private func exchangeCodeForTokens(_ code: CodeSuccessResponse) async throws -> CodexAuthTokens {
         let url = issuer.appending(path: "oauth").appending(path: "token")
         var components = URLComponents()
@@ -99,12 +119,41 @@ public final class CodexDeviceCodeAuthenticator: @unchecked Sendable {
         let (data, response) = try await session.data(for: request)
         try Self.validate(response: response, data: data)
         let tokens = try JSONDecoder().decode(TokenExchangeResponse.self, from: data)
+        guard let refreshToken = tokens.refreshToken else {
+            throw CodexDeviceCodeAuthError.missingRefreshToken
+        }
+        let metadata = CodexAuthTokens.accountMetadata(
+            idToken: tokens.idToken,
+            accessToken: tokens.accessToken
+        )
         return CodexAuthTokens(
             idToken: tokens.idToken,
             accessToken: tokens.accessToken,
-            refreshToken: tokens.refreshToken,
-            accountID: CodexAuthTokens.chatGPTAccountID(from: tokens.idToken)
+            refreshToken: refreshToken,
+            accountID: metadata.accountID,
+            planType: metadata.planType
         )
+    }
+
+    private func performTokenRequest(_ descriptor: [String: Any]) async throws -> TokenExchangeResponse {
+        let path = descriptor["path"] as? String ?? "/oauth/token"
+        let url = issuer.appending(path: path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+        var request = URLRequest(url: url)
+        request.httpMethod = descriptor["method"] as? String ?? "POST"
+        if let headers = descriptor["headers"] as? [String: String] {
+            for (key, value) in headers {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+        }
+        if let body = descriptor["body"] as? String {
+            request.httpBody = Data(body.utf8)
+        } else if let body = descriptor["body"] as? [String: Any] {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+
+        let (data, response) = try await session.data(for: request)
+        try Self.validate(response: response, data: data)
+        return try JSONDecoder().decode(TokenExchangeResponse.self, from: data)
     }
 
     private static func validate(response: URLResponse, data: Data) throws {
@@ -181,7 +230,7 @@ private struct CodeSuccessResponse: Decodable {
 private struct TokenExchangeResponse: Decodable {
     let idToken: String
     let accessToken: String
-    let refreshToken: String
+    let refreshToken: String?
 
     enum CodingKeys: String, CodingKey {
         case idToken = "id_token"
@@ -194,4 +243,5 @@ public enum CodexDeviceCodeAuthError: Error, Equatable {
     case invalidResponse
     case httpStatus(Int, String)
     case timedOut
+    case missingRefreshToken
 }

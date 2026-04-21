@@ -8,12 +8,15 @@
 
 mod auth;
 mod ffi;
+mod output;
 mod patch;
 mod providers;
 mod responses;
 mod shell;
 mod tools;
 
+pub use auth::authorization_code_token_request_json;
+pub use auth::authorization_url_json;
 pub use auth::device_code_request_json;
 pub use auth::parse_chatgpt_token_claims_json;
 pub use auth::refresh_token_request_json;

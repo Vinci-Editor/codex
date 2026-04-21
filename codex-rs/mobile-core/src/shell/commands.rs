@@ -3,6 +3,12 @@ use super::workspace::Workspace;
 use std::fs;
 use std::path::Path;
 
+const SUPPORTED_COMMANDS: &[&str] = &[
+    "cat", "command", "cp", "echo", "egrep", "fgrep", "find", "git", "grep", "head", "ls", "mkdir",
+    "mv", "printf", "pwd", "rg", "rm", "sed", "sort", "tail", "touch", "type", "uniq", "wc",
+    "which",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
     pub exit_code: i32,
@@ -80,6 +86,9 @@ impl CommandRunner {
                 "{}\n",
                 self.workspace.display_path(self.workspace.cwd())
             )),
+            "command" => self.command_lookup(&command.argv[1..]),
+            "which" => self.which(&command.argv[1..]),
+            "type" => self.type_command(&command.argv[1..]),
             "echo" => CommandResult::success(format!("{}\n", command.argv[1..].join(" "))),
             "printf" => self.printf(&command.argv[1..]),
             "ls" => self.ls(&command.argv[1..]),
@@ -102,6 +111,74 @@ impl CommandRunner {
                 127,
                 &format!("{other}: unsupported command in Codex iOS shell emulator\n"),
             ),
+        }
+    }
+
+    fn command_lookup(&self, args: &[String]) -> CommandResult {
+        match args.first().map(String::as_str) {
+            Some("-v") => self.which(&args[1..]),
+            Some("-V") => self.type_command(&args[1..]),
+            _ => CommandResult::failure(
+                2,
+                "command: unsupported option in Codex iOS shell emulator\n",
+            ),
+        }
+    }
+
+    fn which(&self, args: &[String]) -> CommandResult {
+        let names = args
+            .iter()
+            .filter(|arg| !arg.starts_with('-'))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return CommandResult::failure(1, "which: missing command name\n");
+        }
+
+        let mut output = String::new();
+        let mut missing = false;
+        for name in names {
+            if let Some(path) = supported_command_path(name) {
+                output.push_str(&path);
+                output.push('\n');
+            } else {
+                missing = true;
+            }
+        }
+
+        CommandResult {
+            exit_code: if missing { 1 } else { 0 },
+            stdout: output,
+            stderr: String::new(),
+        }
+    }
+
+    fn type_command(&self, args: &[String]) -> CommandResult {
+        let names = args
+            .iter()
+            .filter(|arg| !arg.starts_with('-'))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return CommandResult::failure(1, "type: missing command name\n");
+        }
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut missing = false;
+        for name in names {
+            if let Some(path) = supported_command_path(name) {
+                stdout.push_str(&format!("{name} is {path}\n"));
+            } else {
+                missing = true;
+                stderr.push_str(&format!("type: {name}: not found\n"));
+            }
+        }
+
+        CommandResult {
+            exit_code: if missing { 1 } else { 0 },
+            stdout,
+            stderr,
         }
     }
 
@@ -536,5 +613,36 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     match pattern.split_once('*') {
         Some((prefix, suffix)) => value.starts_with(prefix) && value.ends_with(suffix),
         None => pattern == value,
+    }
+}
+
+fn supported_command_path(name: &str) -> Option<String> {
+    SUPPORTED_COMMANDS
+        .binary_search(&name)
+        .is_ok()
+        .then(|| format!("/usr/bin/{name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    use super::super::parser::parse_script;
+    use super::super::workspace::Workspace;
+    use super::*;
+
+    #[test]
+    fn command_lookup_reports_supported_command_path() {
+        let dir = tempdir().expect("tempdir");
+        let workspace = Workspace::new(&dir.path().display().to_string(), None).expect("workspace");
+        let runner = CommandRunner::new(workspace);
+        let parsed = parse_script("command -v rg && command -V rg").expect("parse");
+
+        let first = runner.run_pipeline(&parsed[0].commands);
+        let second = runner.run_pipeline(&parsed[1].commands);
+
+        assert_eq!(first.stdout, "/usr/bin/rg\n");
+        assert_eq!(second.stdout, "rg is /usr/bin/rg\n");
     }
 }

@@ -5,33 +5,44 @@ public struct CodexSessionConfiguration: Sendable {
     public let provider: CodexProvider
     public let model: String
     public let authStore: (any CodexAuthStore)?
+    public let apiKeyStore: (any CodexAPIKeyStore)?
+    public let chatGPTAuthenticator: CodexDeviceCodeAuthenticator?
     public let workspace: CodexWorkspace?
     public let baseInstructionsOverride: String?
     public let additionalDeveloperInstructions: String?
     public let tools: [any CodexTool]
+    public let urlSession: URLSession
 
     public init(
         provider: CodexProvider = .openAI,
-        model: String,
+        model: String = "gpt-5.4",
         authStore: (any CodexAuthStore)? = nil,
+        apiKeyStore: (any CodexAPIKeyStore)? = nil,
+        chatGPTAuthenticator: CodexDeviceCodeAuthenticator? = nil,
         workspace: CodexWorkspace? = nil,
         baseInstructionsOverride: String? = nil,
         additionalDeveloperInstructions: String? = nil,
-        tools: [any CodexTool] = []
+        tools: [any CodexTool] = [],
+        urlSession: URLSession = .shared
     ) {
         self.provider = provider
         self.model = model
         self.authStore = authStore
+        self.apiKeyStore = apiKeyStore
+        self.chatGPTAuthenticator = chatGPTAuthenticator
         self.workspace = workspace
         self.baseInstructionsOverride = baseInstructionsOverride
         self.additionalDeveloperInstructions = additionalDeveloperInstructions
         self.tools = tools
+        self.urlSession = urlSession
     }
 }
 
 public enum CodexStreamEvent: Sendable, Equatable {
     case created
     case outputTextDelta(String)
+    case reasoningSummaryDelta(String)
+    case toolCallInputDelta(itemID: String?, outputIndex: Int?, delta: String)
     case outputItemAdded(Data)
     case outputItemDone(Data)
     case completed(Data)
@@ -64,7 +75,7 @@ public actor CodexSession {
                 callID: call.callID,
                 output: result.output,
                 success: result.success,
-                custom: false,
+                custom: call.kind == .custom,
                 name: call.name
             ),
             options: [.sortedKeys]
@@ -72,10 +83,18 @@ public actor CodexSession {
     }
 
     public func submit(userText: String) -> AsyncThrowingStream<CodexStreamEvent, Error> {
+        submit(userText: userText, options: nil)
+    }
+
+    public func submit(userText: String, options: CodexTurnOptions?) -> AsyncThrowingStream<CodexStreamEvent, Error> {
+        submit(inputs: [.text(userText)], options: options)
+    }
+
+    public func submit(inputs: [CodexInput], options: CodexTurnOptions? = nil) -> AsyncThrowingStream<CodexStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await self.runTurn(userText: userText, continuation: continuation)
+                    try await self.runTurn(inputs: inputs, options: options, continuation: continuation)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -86,17 +105,18 @@ public actor CodexSession {
     }
 
     private func runTurn(
-        userText: String,
+        inputs: [CodexInput],
+        options: CodexTurnOptions?,
         continuation: AsyncThrowingStream<CodexStreamEvent, Error>.Continuation
     ) async throws {
         history.append([
             "type": "message",
             "role": "user",
-            "content": [["type": "input_text", "text": userText]],
+            "content": inputs.map(\.responsesContentPart),
         ])
 
         for _ in 0..<8 {
-            let result = try await streamOneRequest(continuation: continuation)
+            let result = try await streamOneRequest(options: options, continuation: continuation)
             if !result.assistantText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 history.append([
                     "type": "message",
@@ -118,20 +138,31 @@ public actor CodexSession {
     }
 
     private func streamOneRequest(
+        options: CodexTurnOptions?,
         continuation: AsyncThrowingStream<CodexStreamEvent, Error>.Continuation
     ) async throws -> TurnStreamResult {
+        let reasoning: Any
+        if let reasoningEffort = options?.reasoningEffort {
+            reasoning = ["effort": reasoningEffort]
+        } else {
+            reasoning = NSNull()
+        }
         var input: [String: Any] = [
-            "model": configuration.model,
+            "model": options?.model ?? configuration.model,
             "instructions": buildInstructions(),
             "input": history,
             "tools": buildToolDefinitions(),
             "stream": true,
             "store": false,
-            "reasoning": NSNull(),
-            "parallelToolCalls": true,
+            "reasoning": reasoning,
+            "toolChoice": options?.toolChoice ?? "auto",
+            "parallelToolCalls": options?.parallelToolCalls ?? true,
             "promptCacheKey": conversationID,
             "metadata": ["codex_client": "CodexKit"],
         ]
+        if let serviceTier = options?.serviceTier {
+            input["serviceTier"] = serviceTier
+        }
         let body = try CodexMobileCoreBridge.buildResponsesRequest(input)
         input.removeAll(keepingCapacity: false)
 
@@ -142,20 +173,26 @@ public actor CodexSession {
         for (key, value) in configuration.provider.defaultHeaders {
             request.setValue(value, forHTTPHeaderField: key)
         }
-        if configuration.provider.requiresChatGPTAuth {
-            guard let tokens = try configuration.authStore?.loadTokens() else {
-                throw CodexSessionError.missingAuthentication
-            }
+        switch configuration.provider.authMode {
+        case .none:
+            break
+        case .chatGPT:
+            let tokens = try await chatGPTTokensForRequest()
             request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
             if let accountID = tokens.resolvedChatGPTAccountID {
                 request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-ID")
             }
+        case .apiKey:
+            guard let apiKey = try configuration.apiKeyStore?.loadAPIKey(), !apiKey.isEmpty else {
+                throw CodexSessionError.missingAuthentication
+            }
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
         request.httpBody = body
 
         var assistantText = ""
         var toolCalls: [CodexToolCall] = []
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        let (bytes, response) = try await configuration.urlSession.bytes(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             let body = try await Self.errorBody(from: bytes)
             throw CodexSessionError.httpStatus(http.statusCode, body)
@@ -202,6 +239,18 @@ public actor CodexSession {
         CodexMobileCoreBridge.builtinTools() + configuration.tools.map { $0.responsesToolDefinition() }
     }
 
+    private func chatGPTTokensForRequest() async throws -> CodexAuthTokens {
+        guard let authStore = configuration.authStore, var tokens = try authStore.loadTokens() else {
+            throw CodexSessionError.missingAuthentication
+        }
+        if tokens.shouldRefresh() {
+            let authenticator = configuration.chatGPTAuthenticator ?? CodexDeviceCodeAuthenticator()
+            tokens = try await authenticator.refreshTokens(tokens)
+            try authStore.saveTokens(tokens)
+        }
+        return tokens
+    }
+
     private static func errorBody(from bytes: URLSession.AsyncBytes) async throws -> String {
         var data = Data()
         for try await byte in bytes {
@@ -223,7 +272,7 @@ public actor CodexSession {
         """
     }
 
-    private static func decodeStreamEvent(_ normalized: [String: Any]) throws -> CodexStreamEvent {
+    static func decodeStreamEvent(_ normalized: [String: Any]) throws -> CodexStreamEvent {
         let normalizedData = try JSONSerialization.data(withJSONObject: normalized, options: [.sortedKeys])
         let type = normalized["type"] as? String
         switch type {
@@ -231,6 +280,14 @@ public actor CodexSession {
             return .created
         case "outputTextDelta":
             return .outputTextDelta(normalized["delta"] as? String ?? "")
+        case "reasoningSummaryDelta":
+            return .reasoningSummaryDelta(normalized["delta"] as? String ?? "")
+        case "toolCallInputDelta":
+            return .toolCallInputDelta(
+                itemID: normalized["itemId"] as? String,
+                outputIndex: intValue(normalized["outputIndex"]),
+                delta: normalized["delta"] as? String ?? ""
+            )
         case "outputItemAdded":
             return .outputItemAdded(normalizedData)
         case "outputItemDone":
@@ -258,7 +315,8 @@ public actor CodexSession {
             return nil
         }
         let arguments = item["arguments"] as? String ?? item["input"] as? String ?? "{}"
-        return CodexToolCall(callID: callID, name: name, arguments: arguments)
+        let kind: CodexToolCall.Kind = type == "custom_tool_call" ? .custom : .function
+        return CodexToolCall(callID: callID, name: name, arguments: arguments, kind: kind)
     }
 
     private func executeTool(_ call: CodexToolCall) async throws -> CodexToolResult {
@@ -363,7 +421,7 @@ public actor CodexSession {
             callID: call.callID,
             output: result.output,
             success: result.success,
-            custom: false,
+            custom: call.kind == .custom,
             name: call.name
         ))
     }

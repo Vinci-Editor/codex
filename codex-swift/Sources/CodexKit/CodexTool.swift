@@ -1,14 +1,21 @@
 import Foundation
 
 public struct CodexToolCall: Sendable, Equatable {
+    public enum Kind: String, Sendable, Equatable, Codable {
+        case function
+        case custom
+    }
+
     public let callID: String
     public let name: String
     public let arguments: String
+    public let kind: Kind
 
-    public init(callID: String, name: String, arguments: String) {
+    public init(callID: String, name: String, arguments: String, kind: Kind = .function) {
         self.callID = callID
         self.name = name
         self.arguments = arguments
+        self.kind = kind
     }
 }
 

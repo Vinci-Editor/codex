@@ -149,3 +149,24 @@ fn normalize_tool_output(output: Value, success: bool) -> String {
         format!("Tool failed:\n{text}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn builds_custom_tool_call_output() {
+        let json = tool_output_json(
+            r#"{"callId":"call-1","name":"custom","output":"done","success":true,"custom":true}"#,
+        )
+        .expect("tool output");
+        let value: Value = serde_json::from_str(&json).expect("json");
+
+        assert_eq!(value["type"], "custom_tool_call_output");
+        assert_eq!(value["call_id"], "call-1");
+        assert_eq!(value["name"], "custom");
+        assert_eq!(value["output"], "done");
+    }
+}

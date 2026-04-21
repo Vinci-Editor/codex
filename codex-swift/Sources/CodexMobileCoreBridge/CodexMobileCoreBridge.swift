@@ -89,6 +89,63 @@ public enum CodexMobileCoreBridge {
         #endif
     }
 
+    public static func refreshTokenRequest(clientID: String, refreshToken: String) throws -> [String: Any] {
+        let input = ["clientId": clientID, "refreshToken": refreshToken]
+        #if canImport(CodexMobileCore)
+        let data = try rustData(input: input, codex_mobile_refresh_token_request_json)
+        return try decodeObject(data)
+        #else
+        return fallbackRefreshTokenRequest(clientID: clientID, refreshToken: refreshToken)
+        #endif
+    }
+
+    public static func authorizationURL(
+        issuer: URL,
+        clientID: String,
+        redirectURI: String,
+        state: String,
+        codeChallenge: String
+    ) throws -> URL {
+        let input: [String: Any] = [
+            "issuer": issuer.absoluteString,
+            "clientId": clientID,
+            "redirectUri": redirectURI,
+            "state": state,
+            "codeChallenge": codeChallenge,
+        ]
+        let object: [String: Any]
+        #if canImport(CodexMobileCore)
+        let data = try rustData(input: input, codex_mobile_authorization_url_json)
+        object = try decodeObject(data)
+        #else
+        object = fallbackAuthorizationURL(input)
+        #endif
+        guard let value = object["url"] as? String, let url = URL(string: value) else {
+            throw CodexMobileCoreBridgeError.invalidURL
+        }
+        return url
+    }
+
+    public static func authorizationCodeTokenRequest(
+        clientID: String,
+        code: String,
+        codeVerifier: String,
+        redirectURI: String
+    ) throws -> [String: Any] {
+        let input: [String: Any] = [
+            "clientId": clientID,
+            "code": code,
+            "codeVerifier": codeVerifier,
+            "redirectUri": redirectURI,
+        ]
+        #if canImport(CodexMobileCore)
+        let data = try rustData(input: input, codex_mobile_authorization_code_token_request_json)
+        return try decodeObject(data)
+        #else
+        return fallbackAuthorizationCodeTokenRequest(input)
+        #endif
+    }
+
     public static func parseChatGPTTokenClaims(token: String) throws -> [String: Any] {
         #if canImport(CodexMobileCore)
         let data = try rustData(input: ["token": token], codex_mobile_parse_chatgpt_token_claims_json)
@@ -222,6 +279,16 @@ public enum CodexMobileCoreBridge {
         switch eventType {
         case "response.output_text.delta":
             return ["type": "outputTextDelta", "delta": raw["delta"] as? String ?? "", "raw": raw]
+        case "response.reasoning_summary_text.delta":
+            return ["type": "reasoningSummaryDelta", "delta": raw["delta"] as? String ?? "", "raw": raw]
+        case "response.function_call_arguments.delta":
+            return [
+                "type": "toolCallInputDelta",
+                "delta": raw["delta"] as? String ?? "",
+                "itemId": raw["item_id"] ?? NSNull(),
+                "outputIndex": raw["output_index"] ?? NSNull(),
+                "raw": raw,
+            ]
         case "response.output_item.added":
             return ["type": "outputItemAdded", "item": raw["item"] ?? NSNull(), "raw": raw]
         case "response.output_item.done":
@@ -297,6 +364,53 @@ public enum CodexMobileCoreBridge {
         ]
     }
 
+    private static func fallbackRefreshTokenRequest(clientID: String, refreshToken: String) -> [String: Any] {
+        [
+            "path": "/oauth/token",
+            "method": "POST",
+            "headers": ["Content-Type": "application/json"],
+            "body": [
+                "client_id": clientID,
+                "grant_type": "refresh_token",
+                "refresh_token": refreshToken,
+            ],
+        ]
+    }
+
+    private static func fallbackAuthorizationURL(_ input: [String: Any]) -> [String: Any] {
+        let issuer = (input["issuer"] as? String ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var components = URLComponents(string: "\(issuer)/oauth/authorize")
+        components?.queryItems = [
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "client_id", value: input["clientId"] as? String),
+            URLQueryItem(name: "redirect_uri", value: input["redirectUri"] as? String),
+            URLQueryItem(name: "scope", value: "openid profile email offline_access"),
+            URLQueryItem(name: "code_challenge", value: input["codeChallenge"] as? String),
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "state", value: input["state"] as? String),
+            URLQueryItem(name: "id_token_add_organizations", value: "true"),
+            URLQueryItem(name: "codex_cli_simplified_flow", value: "true"),
+        ]
+        return ["url": components?.url?.absoluteString ?? ""]
+    }
+
+    private static func fallbackAuthorizationCodeTokenRequest(_ input: [String: Any]) -> [String: Any] {
+        var components = URLComponents()
+        components.queryItems = [
+            URLQueryItem(name: "grant_type", value: "authorization_code"),
+            URLQueryItem(name: "code", value: input["code"] as? String),
+            URLQueryItem(name: "redirect_uri", value: input["redirectUri"] as? String),
+            URLQueryItem(name: "client_id", value: input["clientId"] as? String),
+            URLQueryItem(name: "code_verifier", value: input["codeVerifier"] as? String),
+        ]
+        return [
+            "path": "/oauth/token",
+            "method": "POST",
+            "headers": ["Content-Type": "application/x-www-form-urlencoded"],
+            "body": components.percentEncodedQuery ?? "",
+        ]
+    }
+
     private static func fallbackParseChatGPTTokenClaims(token: String) throws -> [String: Any] {
         let parts = token.split(separator: ".")
         guard parts.count >= 2 else {
@@ -315,15 +429,16 @@ public enum CodexMobileCoreBridge {
         let auth = value["https://api.openai.com/auth"] as? [String: Any]
         let profile = value["https://api.openai.com/profile"] as? [String: Any]
         let email = value["email"] as? String ?? profile?["email"] as? String
-        let planType = auth?["chatgpt_plan_type"] as? String
-        let userID = auth?["chatgpt_user_id"] as? String ?? auth?["user_id"] as? String
-        let accountID = auth?["chatgpt_account_id"] as? String
+        let planType = auth?["chatgpt_plan_type"] as? String ?? value["chatgpt_plan_type"] as? String
+        let userID = auth?["chatgpt_user_id"] as? String ?? auth?["user_id"] as? String ?? value["chatgpt_user_id"] as? String ?? value["user_id"] as? String
+        let accountID = auth?["chatgpt_account_id"] as? String ?? value["chatgpt_account_id"] as? String ?? value["organization_id"] as? String
         return [
             "email": email ?? NSNull(),
             "chatgptPlanType": planType ?? NSNull(),
             "chatgptUserId": userID ?? NSNull(),
             "chatgptAccountId": accountID ?? NSNull(),
-            "chatgptAccountIsFedramp": auth?["chatgpt_account_is_fedramp"] as? Bool ?? false,
+            "chatgptAccountIsFedramp": auth?["chatgpt_account_is_fedramp"] as? Bool ?? value["chatgpt_account_is_fedramp"] as? Bool ?? false,
+            "expiresAt": value["exp"] ?? NSNull(),
         ]
     }
 
@@ -408,4 +523,5 @@ public enum CodexMobileCoreBridgeError: Error, Equatable {
     case rustError(String)
     case invalidJSON
     case invalidJWT
+    case invalidURL
 }

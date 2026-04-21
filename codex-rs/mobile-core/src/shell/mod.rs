@@ -6,10 +6,13 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::time::Instant;
 
+use crate::output::truncate_output;
 use commands::CommandRunner;
 use parser::SequenceOp;
 use parser::parse_script;
 use workspace::Workspace;
+
+const MAX_COMMAND_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,11 +48,18 @@ pub fn emulate_shell_json(input: &str) -> Result<String, serde_json::Error> {
 fn emulate_shell(request: ShellEmulationRequest, started: Instant) -> ShellEmulationResponse {
     let command = request.command.or(request.cmd).unwrap_or_default();
     let max_output_bytes = request.max_output_bytes.unwrap_or(64 * 1024);
-    let result = run_script(
-        &request.workspace_root,
-        request.workdir.as_deref(),
-        &command,
-    );
+    let result = if command.len() > MAX_COMMAND_BYTES {
+        Ok(commands::CommandResult::failure(
+            64,
+            "command exceeds Codex iOS shell emulator limit of 32768 bytes\n",
+        ))
+    } else {
+        run_script(
+            &request.workspace_root,
+            request.workdir.as_deref(),
+            &command,
+        )
+    };
     let (exit_code, stdout, stderr) = match result {
         Ok(result) => (result.exit_code, result.stdout, result.stderr),
         Err(error) => (2, String::new(), format!("{error}\n")),
@@ -61,11 +71,7 @@ fn emulate_shell(request: ShellEmulationRequest, started: Instant) -> ShellEmula
     } else {
         format!("{stdout}{stderr}")
     };
-    let truncated = output.len() > max_output_bytes;
-    if truncated {
-        output.truncate(max_output_bytes);
-        output.push_str("\n[output truncated]\n");
-    }
+    let truncated = truncate_output(&mut output, max_output_bytes);
 
     ShellEmulationResponse {
         exit_code,
@@ -144,5 +150,36 @@ mod tests {
         assert_eq!(value["exit_code"], 0);
         assert_eq!(value["stdout"], "new_file.txt\n");
         assert_eq!(contents, "hello\n");
+    }
+
+    #[test]
+    fn rejects_oversized_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = serde_json::json!({
+            "workspaceRoot": dir.path(),
+            "command": "x".repeat(32 * 1024 + 1),
+        });
+
+        let json = emulate_shell_json(&input.to_string()).expect("shell json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+
+        assert_eq!(value["exit_code"], 64);
+        assert_eq!(value["truncated"], false);
+    }
+
+    #[test]
+    fn truncates_shell_output_at_char_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = serde_json::json!({
+            "workspaceRoot": dir.path(),
+            "command": "printf 'éabc'",
+            "maxOutputBytes": 1,
+        });
+
+        let json = emulate_shell_json(&input.to_string()).expect("shell json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+
+        assert_eq!(value["output"], "\n[output truncated]\n");
+        assert_eq!(value["truncated"], true);
     }
 }

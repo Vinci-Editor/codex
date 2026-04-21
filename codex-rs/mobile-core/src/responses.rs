@@ -156,15 +156,18 @@ mod tests {
     #[test]
     fn builds_request_with_tools() {
         let json = build_responses_request_json(
-            r#"{"model":"gpt-5","instructions":"hi","input":[],"tools":[{"type":"function","name":"x"}],"stream":true}"#,
+            r#"{"model":"gpt-5","instructions":"hi","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"},{"type":"input_image","image_url":"data:image/png;base64,AA=="}]}],"tools":[{"type":"function","name":"x"}],"stream":true,"toolChoice":"required","parallelToolCalls":false,"serviceTier":"flex","reasoning":{"effort":"low"}}"#,
         )
         .expect("request");
         let value: Value = serde_json::from_str(&json).expect("json");
         assert_eq!(value["model"], "gpt-5");
+        assert_eq!(value["input"][0]["content"][1]["type"], "input_image");
         assert_eq!(value["tools"][0]["name"], "x");
-        assert_eq!(value["tool_choice"], "auto");
+        assert_eq!(value["tool_choice"], "required");
+        assert_eq!(value["parallel_tool_calls"], false);
+        assert_eq!(value["service_tier"], "flex");
+        assert_eq!(value["reasoning"]["effort"], "low");
         assert_eq!(value["store"], false);
-        assert_eq!(value["reasoning"], Value::Null);
     }
 
     #[test]
@@ -174,5 +177,26 @@ mod tests {
         let value: Value = serde_json::from_str(&json).expect("json");
         assert_eq!(value["type"], "outputTextDelta");
         assert_eq!(value["delta"], "hi");
+    }
+
+    #[test]
+    fn normalizes_reasoning_and_tool_argument_deltas() {
+        let reasoning = parse_sse_event_json(
+            r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
+        )
+        .expect("event");
+        let reasoning: Value = serde_json::from_str(&reasoning).expect("json");
+
+        let tool = parse_sse_event_json(
+            r#"{"type":"response.function_call_arguments.delta","item_id":"item-1","output_index":0,"delta":"{\""}"#,
+        )
+        .expect("event");
+        let tool: Value = serde_json::from_str(&tool).expect("json");
+
+        assert_eq!(reasoning["type"], "reasoningSummaryDelta");
+        assert_eq!(reasoning["delta"], "thinking");
+        assert_eq!(tool["type"], "toolCallInputDelta");
+        assert_eq!(tool["itemId"], "item-1");
+        assert_eq!(tool["outputIndex"], 0);
     }
 }

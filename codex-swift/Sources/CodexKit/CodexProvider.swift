@@ -1,12 +1,22 @@
 import Foundation
 import CodexMobileCoreBridge
 
+public enum CodexProviderAuthMode: String, Codable, Sendable, Equatable, Hashable {
+    case none
+    case chatGPT
+    case apiKey
+}
+
 public struct CodexProvider: Sendable, Equatable, Hashable, Identifiable {
     public let id: String
     public let name: String
     public let baseURL: URL
-    public let requiresChatGPTAuth: Bool
+    public let authMode: CodexProviderAuthMode
     public let defaultHeaders: [String: String]
+
+    public var requiresChatGPTAuth: Bool {
+        authMode == .chatGPT
+    }
 
     public init(
         id: String,
@@ -18,7 +28,21 @@ public struct CodexProvider: Sendable, Equatable, Hashable, Identifiable {
         self.id = id
         self.name = name
         self.baseURL = baseURL
-        self.requiresChatGPTAuth = requiresChatGPTAuth
+        self.authMode = requiresChatGPTAuth ? .chatGPT : .none
+        self.defaultHeaders = defaultHeaders
+    }
+
+    public init(
+        id: String,
+        name: String,
+        baseURL: URL,
+        authMode: CodexProviderAuthMode,
+        defaultHeaders: [String: String] = [:]
+    ) {
+        self.id = id
+        self.name = name
+        self.baseURL = baseURL
+        self.authMode = authMode
         self.defaultHeaders = defaultHeaders
     }
 
@@ -48,6 +72,16 @@ public struct CodexProvider: Sendable, Equatable, Hashable, Identifiable {
         CodexProvider(id: id, name: name, baseURL: baseURL, requiresChatGPTAuth: requiresChatGPTAuth, defaultHeaders: headers)
     }
 
+    public static func custom(
+        id: String,
+        name: String,
+        baseURL: URL,
+        authMode: CodexProviderAuthMode,
+        headers: [String: String] = [:]
+    ) -> CodexProvider {
+        CodexProvider(id: id, name: name, baseURL: baseURL, authMode: authMode, defaultHeaders: headers)
+    }
+
     public static func defaults() -> [CodexProvider] {
         CodexMobileCoreBridge.providerDefaults().compactMap { value in
             guard
@@ -60,11 +94,11 @@ public struct CodexProvider: Sendable, Equatable, Hashable, Identifiable {
             }
             return CodexProvider(
                 id: id,
-                name: name,
-                baseURL: url,
-                requiresChatGPTAuth: value["requiresChatgptAuth"] as? Bool ?? false
-            )
-        }
+            name: name,
+            baseURL: url,
+            requiresChatGPTAuth: value["requiresChatgptAuth"] as? Bool ?? false
+        )
+    }
     }
 
     func responsesURL() -> URL {
