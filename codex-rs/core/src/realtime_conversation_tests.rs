@@ -43,6 +43,7 @@ fn extracts_text_from_handoff_request_active_transcript_if_input_missing() {
             role: "user".to_string(),
             text: "hello".to_string(),
         }],
+        server: None,
     };
     assert_eq!(
         realtime_text_from_handoff_request(&handoff),
@@ -66,6 +67,7 @@ fn wraps_handoff_with_transcript_delta() {
                 text: "hi there".to_string(),
             },
         ],
+        server: None,
     };
     assert_eq!(
         realtime_delegation_from_handoff(&handoff),

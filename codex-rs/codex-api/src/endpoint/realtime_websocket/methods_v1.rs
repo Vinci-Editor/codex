@@ -54,7 +54,6 @@ pub(super) fn session_update_session(
                     r#type: AudioFormatType::AudioPcm,
                     rate: REALTIME_AUDIO_SAMPLE_RATE,
                 },
-                transcription: None,
                 noise_reduction: None,
                 transcription: None,
                 turn_detection: None,

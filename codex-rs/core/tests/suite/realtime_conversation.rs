@@ -2241,6 +2241,8 @@ async fn realtime_v2_noop_tool_call_returns_empty_function_output_without_respon
             session_id: None,
             transport: None,
             voice: None,
+            client_controlled_handoff: false,
+            dynamic_tools: None,
         }))
         .await?;
 
