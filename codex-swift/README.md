@@ -236,6 +236,22 @@ the same configuration.
 The default model is `gpt-5.4`. Override it in `CodexSessionConfiguration` for a
 long-lived session default or per turn with `CodexTurnOptions`.
 
+## Persist A Session
+
+Apps that own their own chat history can snapshot the session's canonical
+Responses history and restore it later:
+
+```swift
+let snapshot = try await session.snapshot()
+let restored = CodexSession(configuration: configuration, snapshot: snapshot)
+```
+
+`CodexSessionSnapshot` is `Codable`, so apps can store it alongside their own
+conversation metadata and rendered transcript. A restored session continues
+with the same prior user, assistant, tool-call, and tool-output items. Apps
+still own resumability policy for in-flight turns; do not assume an interrupted
+stream can be reconnected after app relaunch.
+
 ## Stream A Turn
 
 `submit(userText:)` returns an `AsyncThrowingStream<CodexStreamEvent, Error>`.

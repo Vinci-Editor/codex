@@ -52,6 +52,14 @@ public enum CodexStreamEvent: Sendable, Equatable {
     case raw(Data)
 }
 
+public struct CodexSessionSnapshot: Codable, Sendable, Equatable, Hashable {
+    public let historyJSON: Data
+
+    public init(historyJSON: Data) {
+        self.historyJSON = historyJSON
+    }
+}
+
 public actor CodexSession {
     private let configuration: CodexSessionConfiguration
     private let conversationID = UUID().uuidString
@@ -63,8 +71,22 @@ public actor CodexSession {
         self.toolsByName = Dictionary(uniqueKeysWithValues: configuration.tools.map { ($0.name, $0) })
     }
 
+    public init(configuration: CodexSessionConfiguration, snapshot: CodexSessionSnapshot?) {
+        self.configuration = configuration
+        self.toolsByName = Dictionary(uniqueKeysWithValues: configuration.tools.map { ($0.name, $0) })
+        if let snapshot,
+           let object = try? JSONSerialization.jsonObject(with: snapshot.historyJSON) as? [[String: Any]] {
+            self.history = object
+        }
+    }
+
     public func clearHistory() {
         history.removeAll()
+    }
+
+    public func snapshot() throws -> CodexSessionSnapshot {
+        let data = try JSONSerialization.data(withJSONObject: history, options: [.sortedKeys])
+        return CodexSessionSnapshot(historyJSON: data)
     }
 
     public func executeToolCall(_ call: CodexToolCall) async throws -> Data {
