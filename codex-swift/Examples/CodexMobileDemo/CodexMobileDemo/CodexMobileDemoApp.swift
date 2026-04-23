@@ -190,25 +190,65 @@ struct DemoChatView: View {
 
         Task {
             var toolMessageIDs: [String: UUID] = [:]
-            var assistantID: UUID?
+            var assistantMessageIDs: [String: UUID] = [:]
+            var activeAssistantItemID: String?
+            var fallbackAssistantItemID: String?
+
+            func assistantKey(for itemID: String?) -> String {
+                if let itemID, !itemID.isEmpty {
+                    return itemID
+                }
+                if let activeAssistantItemID {
+                    return activeAssistantItemID
+                }
+                if let fallbackAssistantItemID {
+                    return fallbackAssistantItemID
+                }
+                let key = "assistant-\(assistantMessageIDs.count + 1)"
+                fallbackAssistantItemID = key
+                return key
+            }
+
             do {
                 for try await event in await activeSession.submit(userText: text) {
                     switch event {
-                    case .outputTextDelta(let delta):
-                        if assistantID == nil {
-                            assistantID = appendMessage(role: .assistant, text: "", isStreaming: true)
+                    case .outputItemStarted(let item) where item.kind == .assistantMessage:
+                        activeAssistantItemID = item.id
+                        fallbackAssistantItemID = item.id
+                        if assistantMessageIDs[item.id] == nil {
+                            assistantMessageIDs[item.id] = appendMessage(role: .assistant, text: "", isStreaming: true)
                         }
-                        if let assistantID {
+                    case .outputTextDelta(let itemID, let delta):
+                        let key = assistantKey(for: itemID)
+                        activeAssistantItemID = key
+                        if assistantMessageIDs[key] == nil {
+                            assistantMessageIDs[key] = appendMessage(role: .assistant, text: "", isStreaming: true)
+                        }
+                        if let assistantID = assistantMessageIDs[key] {
                             appendDelta(delta, to: assistantID)
                         }
+                    case .outputItemCompleted(let item) where item.kind == .assistantMessage:
+                        if let assistantID = assistantMessageIDs[item.id] {
+                            finishStreamingMessage(assistantID)
+                        }
+                        if activeAssistantItemID == item.id {
+                            activeAssistantItemID = nil
+                        }
                     case .toolCall(let call):
-                        toolMessageIDs[call.callID] = appendMessage(
+                        toolMessageIDs[call.itemID ?? call.callID] = appendMessage(
                             role: .tool,
                             text: "Running \(call.name)\n\(call.arguments)"
                         )
+                    case .toolOutputDelta(let call, let delta):
+                        let key = call.itemID ?? call.callID
+                        if let id = toolMessageIDs[key] {
+                            appendDelta(delta, to: id)
+                        } else {
+                            toolMessageIDs[key] = appendMessage(role: .tool, text: "Running \(call.name)\n\(delta)", isStreaming: true)
+                        }
                     case .toolResult(let call, let output, let success):
                         let text = "\(success ? "Completed" : "Failed") \(call.name)\n\(trimToolOutput(output))"
-                        if let id = toolMessageIDs[call.callID] {
+                        if let id = toolMessageIDs[call.itemID ?? call.callID] {
                             replaceMessage(id, role: .tool, text: text, isStreaming: false)
                         } else {
                             appendMessage(role: .tool, text: text)
@@ -216,7 +256,7 @@ struct DemoChatView: View {
                     case .completed:
                         break
                     case .error(let message):
-                        if let assistantID {
+                        if let assistantID = activeAssistantItemID.flatMap({ assistantMessageIDs[$0] }) {
                             replaceMessage(assistantID, role: .error, text: message, isStreaming: false)
                         } else {
                             appendMessage(role: .error, text: message)
@@ -225,11 +265,11 @@ struct DemoChatView: View {
                         break
                     }
                 }
-                if let assistantID {
+                for assistantID in assistantMessageIDs.values {
                     finishStreamingMessage(assistantID)
                 }
             } catch {
-                if let assistantID {
+                if let assistantID = activeAssistantItemID.flatMap({ assistantMessageIDs[$0] }) {
                     replaceMessage(assistantID, role: .error, text: displayError(error), isStreaming: false)
                 } else {
                     appendMessage(role: .error, text: displayError(error))

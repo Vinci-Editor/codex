@@ -75,14 +75,29 @@ public enum CodexMobileCoreBridge {
     }
 
     public static func emulateShell(_ input: [String: Any]) throws -> [String: Any] {
+        try emulateShell(input, outputHandler: nil)
+    }
+
+    public static func emulateShell(
+        _ input: [String: Any],
+        outputHandler: (@Sendable (String) -> Void)?
+    ) throws -> [String: Any] {
         #if os(macOS)
-        return runNativeShell(input)
+        return runNativeShell(input, outputHandler: outputHandler)
         #else
         #if canImport(CodexMobileCore)
         let data = try rustData(input: input, codex_mobile_emulate_shell_json)
-        return try decodeObject(data)
+        let object = try decodeObject(data)
+        if let output = object["output"] as? String, !output.isEmpty {
+            outputHandler?(output)
+        }
+        return object
         #else
-        return fallbackEmulateShell(input)
+        let object = fallbackEmulateShell(input)
+        if let output = object["output"] as? String, !output.isEmpty {
+            outputHandler?(output)
+        }
+        return object
         #endif
         #endif
     }
@@ -351,14 +366,25 @@ public enum CodexMobileCoreBridge {
         let eventType = raw["type"] as? String
         switch eventType {
         case "response.output_text.delta":
-            return ["type": "outputTextDelta", "delta": raw["delta"] as? String ?? "", "raw": raw]
+            return [
+                "type": "outputTextDelta",
+                "delta": raw["delta"] as? String ?? "",
+                "itemId": raw["item_id"] ?? raw["itemId"] ?? NSNull(),
+                "raw": raw,
+            ]
         case "response.reasoning_summary_text.delta":
-            return ["type": "reasoningSummaryDelta", "delta": raw["delta"] as? String ?? "", "raw": raw]
-        case "response.function_call_arguments.delta":
+            return [
+                "type": "reasoningSummaryDelta",
+                "delta": raw["delta"] as? String ?? "",
+                "itemId": raw["item_id"] ?? raw["itemId"] ?? NSNull(),
+                "raw": raw,
+            ]
+        case "response.function_call_arguments.delta", "response.tool_call_input.delta":
             return [
                 "type": "toolCallInputDelta",
                 "delta": raw["delta"] as? String ?? "",
                 "itemId": raw["item_id"] ?? NSNull(),
+                "callId": raw["call_id"] ?? raw["callId"] ?? NSNull(),
                 "outputIndex": raw["output_index"] ?? NSNull(),
                 "raw": raw,
             ]
@@ -427,7 +453,10 @@ public enum CodexMobileCoreBridge {
     }
 
     #if os(macOS)
-    private static func runNativeShell(_ input: [String: Any]) -> [String: Any] {
+    private static func runNativeShell(
+        _ input: [String: Any],
+        outputHandler: (@Sendable (String) -> Void)?
+    ) -> [String: Any] {
         let started = Date()
         let command = input["command"] as? String ?? input["cmd"] as? String ?? ""
         guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -464,10 +493,18 @@ public enum CodexMobileCoreBridge {
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            stdout.append(handle.availableData)
+            let data = handle.availableData
+            stdout.append(data)
+            if !data.isEmpty {
+                outputHandler?(String(decoding: data, as: UTF8.self))
+            }
         }
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            stderr.append(handle.availableData)
+            let data = handle.availableData
+            stderr.append(data)
+            if !data.isEmpty {
+                outputHandler?(String(decoding: data, as: UTF8.self))
+            }
         }
 
         let process = Process()
@@ -509,11 +546,21 @@ public enum CodexMobileCoreBridge {
 
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
-        stdout.append(stdoutPipe.fileHandleForReading.readDataToEndOfFile())
-        stderr.append(stderrPipe.fileHandleForReading.readDataToEndOfFile())
+        let remainingStdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        stdout.append(remainingStdout)
+        if !remainingStdout.isEmpty {
+            outputHandler?(String(decoding: remainingStdout, as: UTF8.self))
+        }
+        let remainingStderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        stderr.append(remainingStderr)
+        if !remainingStderr.isEmpty {
+            outputHandler?(String(decoding: remainingStderr, as: UTF8.self))
+        }
 
         if timedOut {
-            stderr.append(Data("Command timed out after \(timeoutMilliseconds) ms.\n".utf8))
+            let timeoutData = Data("Command timed out after \(timeoutMilliseconds) ms.\n".utf8)
+            stderr.append(timeoutData)
+            outputHandler?(String(decoding: timeoutData, as: UTF8.self))
         }
 
         return shellResponse(

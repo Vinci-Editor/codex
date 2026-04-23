@@ -6,12 +6,14 @@ public struct CodexToolCall: Sendable, Equatable {
         case custom
     }
 
+    public let itemID: String?
     public let callID: String
     public let name: String
     public let arguments: String
     public let kind: Kind
 
-    public init(callID: String, name: String, arguments: String, kind: Kind = .function) {
+    public init(itemID: String? = nil, callID: String, name: String, arguments: String, kind: Kind = .function) {
+        self.itemID = itemID
         self.callID = callID
         self.name = name
         self.arguments = arguments
@@ -36,6 +38,34 @@ public protocol CodexTool: Sendable {
     var supportsParallelCalls: Bool { get }
 
     func execute(call: CodexToolCall, context: CodexToolContext) async throws -> CodexToolResult
+}
+
+public struct CodexToolProgress: Sendable, Equatable {
+    public let status: String?
+    public let outputDelta: String?
+
+    public init(status: String? = nil, outputDelta: String? = nil) {
+        self.status = status
+        self.outputDelta = outputDelta
+    }
+
+    public static func status(_ value: String) -> CodexToolProgress {
+        CodexToolProgress(status: value)
+    }
+
+    public static func outputDelta(_ value: String) -> CodexToolProgress {
+        CodexToolProgress(outputDelta: value)
+    }
+}
+
+public typealias CodexToolProgressHandler = @Sendable (CodexToolProgress) -> Void
+
+public protocol CodexStreamingTool: CodexTool {
+    func execute(
+        call: CodexToolCall,
+        context: CodexToolContext,
+        progress: CodexToolProgressHandler?
+    ) async throws -> CodexToolResult
 }
 
 public extension CodexTool {

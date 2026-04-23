@@ -152,28 +152,71 @@ func mobileBridgeBuildsTurnOptionsAndMultipartInput() throws {
 @Test
 func mobileBridgeNormalizesTextDelta() throws {
     let event = try CodexMobileCoreBridge.parseSSEEvent(
-        Data(#"{"type":"response.output_text.delta","delta":"hello"}"#.utf8)
+        Data(#"{"type":"response.output_text.delta","item_id":"msg-1","delta":"hello"}"#.utf8)
     )
 
     #expect(event["type"] as? String == "outputTextDelta")
+    #expect(event["itemId"] as? String == "msg-1")
     #expect(event["delta"] as? String == "hello")
 }
 
 @Test
 func sessionDecodesReasoningAndToolArgumentDeltas() throws {
     let reasoning = try CodexMobileCoreBridge.parseSSEEvent(
-        Data(#"{"type":"response.reasoning_summary_text.delta","delta":"working"}"#.utf8)
+        Data(#"{"type":"response.reasoning_summary_text.delta","item_id":"rs-1","delta":"working"}"#.utf8)
     )
     let arguments = try CodexMobileCoreBridge.parseSSEEvent(
-        Data(#"{"type":"response.function_call_arguments.delta","item_id":"item-1","output_index":0,"delta":"{\"path\""}"#.utf8)
+        Data(#"{"type":"response.function_call_arguments.delta","item_id":"item-1","call_id":"call-1","output_index":0,"delta":"{\"path\""}"#.utf8)
     )
 
-    #expect(try CodexSession.decodeStreamEvent(reasoning) == .reasoningSummaryDelta("working"))
+    #expect(try CodexSession.decodeStreamEvent(reasoning) == .reasoningSummaryDelta(itemID: "rs-1", delta: "working"))
     #expect(try CodexSession.decodeStreamEvent(arguments) == .toolCallInputDelta(
         itemID: "item-1",
-        outputIndex: 0,
+        callID: "call-1",
         delta: #"{"path""#
     ))
+}
+
+@Test
+func mobileBridgeNormalizesBothToolInputDeltaNames() throws {
+    let functionArguments = try CodexMobileCoreBridge.parseSSEEvent(
+        Data(#"{"type":"response.function_call_arguments.delta","item_id":"item-1","call_id":"call-1","delta":"{\""}"#.utf8)
+    )
+    let toolInput = try CodexMobileCoreBridge.parseSSEEvent(
+        Data(#"{"type":"response.tool_call_input.delta","item_id":"item-2","call_id":"call-2","delta":"path"}"#.utf8)
+    )
+
+    #expect(functionArguments["type"] as? String == "toolCallInputDelta")
+    #expect(functionArguments["callId"] as? String == "call-1")
+    #expect(toolInput["type"] as? String == "toolCallInputDelta")
+    #expect(toolInput["itemId"] as? String == "item-2")
+    #expect(toolInput["callId"] as? String == "call-2")
+}
+
+@Test
+func sessionDecodesAssistantItemLifecycle() throws {
+    let started = try CodexSession.decodeStreamEvent([
+        "type": "outputItemAdded",
+        "item": [
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+        ],
+    ])
+    let completed = try CodexSession.decodeStreamEvent([
+        "type": "outputItemDone",
+        "item": [
+            "id": "msg-1",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                ["type": "output_text", "text": "Hello"],
+            ],
+        ],
+    ])
+
+    #expect(started == .outputItemStarted(CodexOutputItem(id: "msg-1", kind: .assistantMessage, role: "assistant")))
+    #expect(completed == .outputItemCompleted(CodexOutputItem(id: "msg-1", kind: .assistantMessage, role: "assistant", text: "Hello")))
 }
 
 @Test
@@ -181,6 +224,7 @@ func sessionPreservesCustomToolCallKind() throws {
     let event = try CodexSession.decodeStreamEvent([
         "type": "outputItemDone",
         "item": [
+            "id": "item-1",
             "type": "custom_tool_call",
             "call_id": "call-1",
             "name": "custom",
@@ -188,10 +232,11 @@ func sessionPreservesCustomToolCallKind() throws {
         ],
     ])
 
-    guard case .toolCall(let call) = event else {
-        Issue.record("Expected tool call")
+    guard case .outputItemCompleted(let item) = event, let call = item.toolCall else {
+        Issue.record("Expected completed custom tool item")
         return
     }
+    #expect(call.itemID == "item-1")
     #expect(call.kind == .custom)
     #expect(call.arguments == #"{"value":1}"#)
 }

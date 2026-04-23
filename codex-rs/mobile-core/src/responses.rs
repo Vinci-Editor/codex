@@ -105,17 +105,20 @@ pub fn parse_sse_event_json(data: &str) -> Result<String, serde_json::Error> {
         "response.output_text.delta" => serde_json::json!({
             "type": "outputTextDelta",
             "delta": value.get("delta").and_then(Value::as_str).unwrap_or_default(),
+            "itemId": value.get("item_id").and_then(Value::as_str),
             "raw": value,
         }),
         "response.reasoning_summary_text.delta" => serde_json::json!({
             "type": "reasoningSummaryDelta",
             "delta": value.get("delta").and_then(Value::as_str).unwrap_or_default(),
+            "itemId": value.get("item_id").and_then(Value::as_str),
             "raw": value,
         }),
-        "response.function_call_arguments.delta" => serde_json::json!({
+        "response.function_call_arguments.delta" | "response.tool_call_input.delta" => serde_json::json!({
             "type": "toolCallInputDelta",
             "delta": value.get("delta").and_then(Value::as_str).unwrap_or_default(),
             "itemId": value.get("item_id").and_then(Value::as_str),
+            "callId": value.get("call_id").and_then(Value::as_str),
             "outputIndex": value.get("output_index").and_then(Value::as_i64),
             "raw": value,
         }),
@@ -172,31 +175,43 @@ mod tests {
 
     #[test]
     fn normalizes_text_delta() {
-        let json = parse_sse_event_json(r#"{"type":"response.output_text.delta","delta":"hi"}"#)
+        let json =
+            parse_sse_event_json(r#"{"type":"response.output_text.delta","item_id":"msg-1","delta":"hi"}"#)
             .expect("event");
         let value: Value = serde_json::from_str(&json).expect("json");
         assert_eq!(value["type"], "outputTextDelta");
+        assert_eq!(value["itemId"], "msg-1");
         assert_eq!(value["delta"], "hi");
     }
 
     #[test]
     fn normalizes_reasoning_and_tool_argument_deltas() {
         let reasoning = parse_sse_event_json(
-            r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs-1","delta":"thinking"}"#,
         )
         .expect("event");
         let reasoning: Value = serde_json::from_str(&reasoning).expect("json");
 
         let tool = parse_sse_event_json(
-            r#"{"type":"response.function_call_arguments.delta","item_id":"item-1","output_index":0,"delta":"{\""}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"item-1","call_id":"call-1","output_index":0,"delta":"{\""}"#,
         )
         .expect("event");
         let tool: Value = serde_json::from_str(&tool).expect("json");
 
+        let custom_tool = parse_sse_event_json(
+            r#"{"type":"response.tool_call_input.delta","item_id":"item-2","call_id":"call-2","delta":"input"}"#,
+        )
+        .expect("event");
+        let custom_tool: Value = serde_json::from_str(&custom_tool).expect("json");
+
         assert_eq!(reasoning["type"], "reasoningSummaryDelta");
+        assert_eq!(reasoning["itemId"], "rs-1");
         assert_eq!(reasoning["delta"], "thinking");
         assert_eq!(tool["type"], "toolCallInputDelta");
         assert_eq!(tool["itemId"], "item-1");
+        assert_eq!(tool["callId"], "call-1");
         assert_eq!(tool["outputIndex"], 0);
+        assert_eq!(custom_tool["type"], "toolCallInputDelta");
+        assert_eq!(custom_tool["callId"], "call-2");
     }
 }

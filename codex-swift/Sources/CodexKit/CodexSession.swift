@@ -38,11 +38,67 @@ public struct CodexSessionConfiguration: Sendable {
     }
 }
 
+public struct CodexOutputItem: Sendable, Equatable {
+    public enum Kind: String, Sendable, Equatable, Codable {
+        case assistantMessage
+        case reasoning
+        case functionCall
+        case customToolCall
+        case unknown
+    }
+
+    public let id: String
+    public let kind: Kind
+    public let role: String?
+    public let callID: String?
+    public let name: String?
+    public let arguments: String?
+    public let text: String?
+
+    public init(
+        id: String,
+        kind: Kind,
+        role: String? = nil,
+        callID: String? = nil,
+        name: String? = nil,
+        arguments: String? = nil,
+        text: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.role = role
+        self.callID = callID
+        self.name = name
+        self.arguments = arguments
+        self.text = text
+    }
+
+    public var toolCall: CodexToolCall? {
+        guard
+            let callID,
+            let name,
+            kind == .functionCall || kind == .customToolCall
+        else {
+            return nil
+        }
+        return CodexToolCall(
+            itemID: id,
+            callID: callID,
+            name: name,
+            arguments: arguments ?? "{}",
+            kind: kind == .customToolCall ? .custom : .function
+        )
+    }
+}
+
 public enum CodexStreamEvent: Sendable, Equatable {
     case created
-    case outputTextDelta(String)
-    case reasoningSummaryDelta(String)
-    case toolCallInputDelta(itemID: String?, outputIndex: Int?, delta: String)
+    case outputItemStarted(CodexOutputItem)
+    case outputItemCompleted(CodexOutputItem)
+    case outputTextDelta(itemID: String?, delta: String)
+    case reasoningSummaryDelta(itemID: String?, delta: String)
+    case toolCallInputDelta(itemID: String?, callID: String?, delta: String)
+    case toolOutputDelta(CodexToolCall, String)
     case outputItemAdded(Data)
     case outputItemDone(Data)
     case completed(Data)
@@ -139,18 +195,23 @@ public actor CodexSession {
 
         for _ in 0..<8 {
             let result = try await streamOneRequest(options: options, continuation: continuation)
-            if !result.assistantText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            for item in result.assistantTextItems where !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 history.append([
                     "type": "message",
                     "role": "assistant",
-                    "content": [["type": "output_text", "text": result.assistantText]],
+                    "content": [["type": "output_text", "text": item.text]],
                 ])
             }
             guard !result.toolCalls.isEmpty else {
                 return
             }
             for call in result.toolCalls {
-                let toolResult = try await executeTool(call)
+                let toolResult = try await executeTool(call) { progress in
+                    guard let delta = progress.outputDelta, !delta.isEmpty else {
+                        return
+                    }
+                    continuation.yield(.toolOutputDelta(call, delta))
+                }
                 appendToolOutput(call: call, result: toolResult)
                 continuation.yield(.toolResult(call, toolResult.output, toolResult.success))
             }
@@ -212,12 +273,52 @@ public actor CodexSession {
         }
         request.httpBody = body
 
-        var assistantText = ""
+        var activeAssistantItemID: String?
+        var fallbackAssistantItemID: String?
+        var assistantItemOrder: [String] = []
+        var assistantTextsByItemID: [String: String] = [:]
+        var toolArgumentDeltasByKey: [String: String] = [:]
         var toolCalls: [CodexToolCall] = []
         let (bytes, response) = try await configuration.urlSession.bytes(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             let body = try await Self.errorBody(from: bytes)
             throw CodexSessionError.httpStatus(http.statusCode, body)
+        }
+
+        func assistantItemID(for itemID: String?) -> String {
+            if let itemID, !itemID.isEmpty {
+                return itemID
+            }
+            if let activeAssistantItemID {
+                return activeAssistantItemID
+            }
+            if let fallbackAssistantItemID {
+                return fallbackAssistantItemID
+            }
+            let id = "assistant-\(assistantItemOrder.count + 1)"
+            fallbackAssistantItemID = id
+            return id
+        }
+
+        func appendAssistantText(itemID: String, delta: String) {
+            guard !delta.isEmpty else {
+                return
+            }
+            if assistantTextsByItemID[itemID] == nil {
+                assistantItemOrder.append(itemID)
+                assistantTextsByItemID[itemID] = ""
+            }
+            assistantTextsByItemID[itemID, default: ""] += delta
+        }
+
+        func toolArgumentKey(itemID: String?, callID: String?) -> String? {
+            if let callID, !callID.isEmpty {
+                return callID
+            }
+            if let itemID, !itemID.isEmpty {
+                return itemID
+            }
+            return nil
         }
 
         for try await line in bytes.lines {
@@ -227,15 +328,49 @@ public actor CodexSession {
             }
             let payload = String(line.dropFirst("data: ".count))
             let normalized = try CodexMobileCoreBridge.parseSSEEvent(Data(payload.utf8))
-            let event = try Self.decodeStreamEvent(normalized)
-            if case .outputTextDelta(let delta) = event {
-                assistantText += delta
-            }
-            if case .toolCall(let call) = event {
+            var event = try Self.decodeStreamEvent(normalized)
+            switch event {
+            case .outputItemStarted(let item):
+                if item.kind == .assistantMessage {
+                    activeAssistantItemID = item.id
+                    fallbackAssistantItemID = item.id
+                }
+            case .outputTextDelta(let itemID, let delta):
+                let resolvedItemID = assistantItemID(for: itemID)
+                appendAssistantText(itemID: resolvedItemID, delta: delta)
+                event = .outputTextDelta(itemID: resolvedItemID, delta: delta)
+            case .reasoningSummaryDelta(let itemID, let delta):
+                let resolvedItemID = itemID ?? activeAssistantItemID
+                event = .reasoningSummaryDelta(itemID: resolvedItemID, delta: delta)
+            case .toolCallInputDelta(let itemID, let callID, let delta):
+                if let key = toolArgumentKey(itemID: itemID, callID: callID) {
+                    toolArgumentDeltasByKey[key, default: ""] += delta
+                }
+            case .outputItemCompleted(let item):
+                if item.kind == .assistantMessage {
+                    if let text = item.text, !text.isEmpty, assistantTextsByItemID[item.id, default: ""].isEmpty {
+                        appendAssistantText(itemID: item.id, delta: text)
+                    }
+                    if activeAssistantItemID == item.id {
+                        activeAssistantItemID = nil
+                    }
+                    if fallbackAssistantItemID == item.id {
+                        fallbackAssistantItemID = nil
+                    }
+                }
+                if let call = CodexSession.toolCall(from: item, argumentDeltas: toolArgumentDeltasByKey) {
+                    toolCalls.append(call)
+                    if let rawItem = normalized["item"] as? [String: Any] {
+                        history.append(rawItem)
+                    }
+                }
+            case .toolCall(let call):
                 toolCalls.append(call)
                 if let item = normalized["item"] as? [String: Any] {
                     history.append(item)
                 }
+            default:
+                break
             }
             continuation.yield(event)
             if case .completed = event {
@@ -243,7 +378,13 @@ public actor CodexSession {
             }
         }
 
-        return TurnStreamResult(assistantText: assistantText, toolCalls: toolCalls)
+        let assistantTextItems = assistantItemOrder.compactMap { itemID -> AssistantTextItem? in
+            guard let text = assistantTextsByItemID[itemID] else {
+                return nil
+            }
+            return AssistantTextItem(itemID: itemID, text: text)
+        }
+        return TurnStreamResult(assistantTextItems: assistantTextItems, toolCalls: toolCalls)
     }
 
     private func buildInstructions() -> String {
@@ -301,20 +442,29 @@ public actor CodexSession {
         case "created":
             return .created
         case "outputTextDelta":
-            return .outputTextDelta(normalized["delta"] as? String ?? "")
+            return .outputTextDelta(
+                itemID: normalized["itemId"] as? String,
+                delta: normalized["delta"] as? String ?? ""
+            )
         case "reasoningSummaryDelta":
-            return .reasoningSummaryDelta(normalized["delta"] as? String ?? "")
+            return .reasoningSummaryDelta(
+                itemID: normalized["itemId"] as? String,
+                delta: normalized["delta"] as? String ?? ""
+            )
         case "toolCallInputDelta":
             return .toolCallInputDelta(
                 itemID: normalized["itemId"] as? String,
-                outputIndex: intValue(normalized["outputIndex"]),
+                callID: normalized["callId"] as? String,
                 delta: normalized["delta"] as? String ?? ""
             )
         case "outputItemAdded":
+            if let item = outputItem(from: normalized["item"]) {
+                return .outputItemStarted(item)
+            }
             return .outputItemAdded(normalizedData)
         case "outputItemDone":
-            if let call = toolCall(from: normalized["item"]) {
-                return .toolCall(call)
+            if let item = outputItem(from: normalized["item"]) {
+                return .outputItemCompleted(item)
             }
             return .outputItemDone(normalizedData)
         case "completed":
@@ -326,23 +476,108 @@ public actor CodexSession {
         }
     }
 
-    private static func toolCall(from item: Any?) -> CodexToolCall? {
+    private static func outputItem(from item: Any?) -> CodexOutputItem? {
         guard
             let item = item as? [String: Any],
-            let type = item["type"] as? String,
-            type == "function_call" || type == "custom_tool_call",
-            let callID = item["call_id"] as? String,
-            let name = item["name"] as? String
+            let type = item["type"] as? String
         else {
             return nil
         }
-        let arguments = item["arguments"] as? String ?? item["input"] as? String ?? "{}"
-        let kind: CodexToolCall.Kind = type == "custom_tool_call" ? .custom : .function
-        return CodexToolCall(callID: callID, name: name, arguments: arguments, kind: kind)
+        let role = item["role"] as? String
+        let callID = item["call_id"] as? String
+        let id = item["id"] as? String ?? callID ?? ""
+        guard !id.isEmpty else {
+            return nil
+        }
+
+        let kind: CodexOutputItem.Kind
+        switch type {
+        case "message" where role == "assistant":
+            kind = .assistantMessage
+        case "reasoning":
+            kind = .reasoning
+        case "function_call":
+            kind = .functionCall
+        case "custom_tool_call":
+            kind = .customToolCall
+        default:
+            kind = .unknown
+        }
+
+        return CodexOutputItem(
+            id: id,
+            kind: kind,
+            role: role,
+            callID: callID,
+            name: item["name"] as? String,
+            arguments: item["arguments"] as? String ?? item["input"] as? String,
+            text: outputText(from: item)
+        )
     }
 
-    private func executeTool(_ call: CodexToolCall) async throws -> CodexToolResult {
+    private static func outputText(from item: [String: Any]) -> String? {
+        if let text = item["text"] as? String {
+            return text
+        }
+        guard let content = item["content"] as? [Any] else {
+            return nil
+        }
+        let text = content.compactMap { rawPart -> String? in
+            guard let part = rawPart as? [String: Any] else {
+                return nil
+            }
+            let type = part["type"] as? String
+            guard type == "output_text" || type == "text" else {
+                return nil
+            }
+            return part["text"] as? String
+        }.joined()
+        return text.isEmpty ? nil : text
+    }
+
+    private static func toolCall(from item: Any?) -> CodexToolCall? {
+        guard let outputItem = outputItem(from: item) else {
+            return nil
+        }
+        return outputItem.toolCall
+    }
+
+    private static func toolCall(
+        from item: CodexOutputItem,
+        argumentDeltas: [String: String]
+    ) -> CodexToolCall? {
+        guard
+            let callID = item.callID,
+            let name = item.name,
+            item.kind == .functionCall || item.kind == .customToolCall
+        else {
+            return nil
+        }
+        let arguments = item.arguments
+            ?? argumentDeltas[callID]
+            ?? argumentDeltas[item.id]
+            ?? "{}"
+        return CodexToolCall(
+            itemID: item.id,
+            callID: callID,
+            name: name,
+            arguments: arguments,
+            kind: item.kind == .customToolCall ? .custom : .function
+        )
+    }
+
+    private func executeTool(
+        _ call: CodexToolCall,
+        progress: CodexToolProgressHandler? = nil
+    ) async throws -> CodexToolResult {
         if let tool = toolsByName[call.name] {
+            if let streamingTool = tool as? any CodexStreamingTool {
+                return try await streamingTool.execute(
+                    call: call,
+                    context: CodexToolContext(workspace: configuration.workspace),
+                    progress: progress
+                )
+            }
             return try await tool.execute(
                 call: call,
                 context: CodexToolContext(workspace: configuration.workspace)
@@ -357,7 +592,7 @@ public actor CodexSession {
         case "search_files":
             return try executeSearchFiles(call)
         case "shell_command", "exec_command":
-            return try executeShell(call)
+            return try executeShell(call, progress: progress)
         case "apply_patch":
             return try executeApplyPatch(call)
         case "write_file":
@@ -454,7 +689,10 @@ public actor CodexSession {
         }
     }
 
-    private func executeShell(_ call: CodexToolCall) throws -> CodexToolResult {
+    private func executeShell(
+        _ call: CodexToolCall,
+        progress: CodexToolProgressHandler? = nil
+    ) throws -> CodexToolResult {
         let arguments = try Self.decodeArguments(call.arguments)
         let command = arguments["command"] as? String ?? arguments["cmd"] as? String ?? ""
         guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -479,7 +717,9 @@ public actor CodexSession {
             if let timeoutMilliseconds = Self.intValue(arguments["timeout_ms"]) {
                 input["timeout_ms"] = timeoutMilliseconds
             }
-            let response = try CodexMobileCoreBridge.emulateShell(input)
+            let response = try CodexMobileCoreBridge.emulateShell(input) { delta in
+                progress?(.outputDelta(delta))
+            }
             let exitCode = Self.intValue(response["exit_code"]) ?? 1
             let output = response["output"] as? String ?? ""
             return CodexToolResult(
@@ -721,8 +961,13 @@ public actor CodexSession {
 }
 
 private struct TurnStreamResult {
-    let assistantText: String
+    let assistantTextItems: [AssistantTextItem]
     let toolCalls: [CodexToolCall]
+}
+
+private struct AssistantTextItem {
+    let itemID: String
+    let text: String
 }
 
 public enum CodexSessionError: Error, Equatable {
