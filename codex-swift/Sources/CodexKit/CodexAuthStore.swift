@@ -233,16 +233,33 @@ public final class CodexKeychainAuthStore: CodexAuthStore, @unchecked Sendable {
 
     #if canImport(Security)
     private func baseQuery() -> [String: Any] {
-        [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
+        query[kSecUseDataProtectionKeychain as String] = true
+        return query
     }
     #endif
 }
 
-public enum CodexAuthStoreError: Error, Equatable {
+public enum CodexAuthStoreError: Error, Equatable, LocalizedError {
     case keychainStatus(OSStatus)
     case invalidStoredData
+
+    public var errorDescription: String? {
+        switch self {
+        case .keychainStatus(let status):
+            #if canImport(Security)
+            let message = SecCopyErrorMessageString(status, nil) as String?
+            return message.map { "Keychain operation failed with status \(status): \($0)" }
+                ?? "Keychain operation failed with status \(status)."
+            #else
+            return "Keychain operation failed with status \(status)."
+            #endif
+        case .invalidStoredData:
+            return "Stored Codex authentication data is invalid."
+        }
+    }
 }
