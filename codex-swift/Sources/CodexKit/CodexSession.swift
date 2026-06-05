@@ -37,7 +37,7 @@ public struct CodexSessionConfiguration: Sendable {
 
     public init(
         provider: CodexProvider = .openAI,
-        model: String = "gpt-5.4",
+        model: String = "gpt-5.5",
         authStore: (any CodexAuthStore)? = nil,
         apiKeyStore: (any CodexAPIKeyStore)? = nil,
         chatGPTAuthenticator: CodexDeviceCodeAuthenticator? = nil,
@@ -411,6 +411,7 @@ public actor CodexSession {
         let compactionInput = requestInputHistory(from: baseHistory) + [
             Self.message(role: "user", textType: "input_text", text: Self.compactionSummaryPrompt)
         ]
+        let reasoning = Self.reasoningParameter(options: options)
         var input: [String: Any] = [
             "model": options?.model ?? configuration.model,
             "instructions": buildInstructions(),
@@ -418,9 +419,10 @@ public actor CodexSession {
             "tools": [],
             "stream": true,
             "store": false,
-            "reasoning": Self.reasoningParameter(options: options),
+            "reasoning": reasoning,
             "toolChoice": "none",
             "parallelToolCalls": false,
+            "include": Self.includeParameter(reasoning: reasoning),
             "promptCacheKey": "\(conversationID)-compact",
             "metadata": [
                 "codex_client": "CodexKit",
@@ -429,6 +431,9 @@ public actor CodexSession {
         ]
         if let serviceTier = options?.serviceTier {
             input["serviceTier"] = serviceTier
+        }
+        if let text = Self.textParameter(options: options) {
+            input["text"] = text
         }
         let body = try CodexMobileCoreBridge.buildResponsesRequest(input)
         input.removeAll(keepingCapacity: false)
@@ -504,14 +509,32 @@ public actor CodexSession {
     }
 
     static func reasoningParameter(options: CodexTurnOptions?) -> Any {
+        if options?.supportsReasoningSummaries == false {
+            return NSNull()
+        }
         var reasoning: [String: Any] = [:]
         if let reasoningEffort = options?.reasoningEffort {
             reasoning["effort"] = reasoningEffort
+        }
+        if let reasoningSummary = options?.reasoningSummary,
+           reasoningSummary != .none {
+            reasoning["summary"] = reasoningSummary.rawValue
         }
         if options?.usesResponsesLite == true {
             reasoning["context"] = "all_turns"
         }
         return reasoning.isEmpty ? NSNull() : reasoning
+    }
+
+    static func includeParameter(reasoning: Any) -> [String] {
+        reasoning is NSNull ? [] : ["reasoning.encrypted_content"]
+    }
+
+    static func textParameter(options: CodexTurnOptions?) -> [String: Any]? {
+        guard let verbosity = options?.verbosity else {
+            return nil
+        }
+        return ["verbosity": verbosity.rawValue]
     }
 
     static func parallelToolCallsParameter(options: CodexTurnOptions?) -> Bool {
@@ -527,11 +550,14 @@ public actor CodexSession {
         return CodexTurnOptions(
             model: modelOverride ?? parentOptions?.model,
             reasoningEffort: arguments["reasoning_effort"] as? String ?? parentOptions?.reasoningEffort,
-            serviceTier: arguments["service_tier"] as? String ?? parentOptions?.serviceTier,
+            reasoningSummary: inheritsParentModelMetadata ? parentOptions?.reasoningSummary : nil,
+            supportsReasoningSummaries: inheritsParentModelMetadata ? parentOptions?.supportsReasoningSummaries : nil,
+            serviceTier: arguments["service_tier"] as? String ?? (inheritsParentModelMetadata ? parentOptions?.serviceTier : nil),
             toolChoice: parentOptions?.toolChoice,
             parallelToolCalls: parentOptions?.parallelToolCalls,
             usesResponsesLite: inheritsParentModelMetadata ? parentOptions?.usesResponsesLite ?? false : false,
-            inputModalities: parentOptions?.inputModalities,
+            inputModalities: inheritsParentModelMetadata ? parentOptions?.inputModalities : nil,
+            verbosity: inheritsParentModelMetadata ? parentOptions?.verbosity : nil,
             webSearch: parentOptions?.webSearch
         )
     }
@@ -540,6 +566,7 @@ public actor CodexSession {
         options: CodexTurnOptions?,
         continuation: AsyncThrowingStream<CodexStreamEvent, Error>.Continuation
     ) async throws -> TurnStreamResult {
+        let reasoning = Self.reasoningParameter(options: options)
         var input: [String: Any] = [
             "model": options?.model ?? configuration.model,
             "instructions": buildInstructions(),
@@ -547,14 +574,18 @@ public actor CodexSession {
             "tools": buildToolDefinitions(options: options),
             "stream": true,
             "store": false,
-            "reasoning": Self.reasoningParameter(options: options),
+            "reasoning": reasoning,
             "toolChoice": options?.toolChoice ?? "auto",
             "parallelToolCalls": Self.parallelToolCallsParameter(options: options),
+            "include": Self.includeParameter(reasoning: reasoning),
             "promptCacheKey": conversationID,
             "metadata": ["codex_client": "CodexKit"],
         ]
         if let serviceTier = options?.serviceTier {
             input["serviceTier"] = serviceTier
+        }
+        if let text = Self.textParameter(options: options) {
+            input["text"] = text
         }
         let body = try CodexMobileCoreBridge.buildResponsesRequest(input)
         input.removeAll(keepingCapacity: false)

@@ -15,7 +15,7 @@ struct DemoChatView: View {
     @State private var prompt = ""
     @State private var messages: [ChatMessage] = []
     @State private var provider = CodexProvider.openAI
-    @State private var model = "gpt-5.4"
+    @State private var model = "gpt-5.5"
     @State private var session: CodexSession?
     @State private var isSending = false
     @State private var isSigningIn = false
@@ -451,6 +451,7 @@ struct DemoChatView: View {
         switch provider.id {
         case "openai":
             return [
+                ModelOption(id: "gpt-5.5", title: "GPT-5.5"),
                 ModelOption(id: "gpt-5.4", title: "GPT-5.4"),
                 ModelOption(id: "gpt-5.4-mini", title: "GPT-5.4 Mini"),
                 ModelOption(id: "gpt-5.2-codex", title: "GPT-5.2 Codex"),
@@ -474,7 +475,7 @@ struct DemoChatView: View {
     private func defaultModel(for provider: CodexProvider) -> String {
         switch provider.id {
         case "openai":
-            return "gpt-5.4"
+            return "gpt-5.5"
         case "lmstudio":
             return "local-model"
         default:

@@ -38,6 +38,10 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
     public let supportsPersonality: Bool
     public let usesResponsesLite: Bool
     public let inputModalities: [String]
+    public let supportsReasoningSummaries: Bool?
+    public let defaultReasoningSummary: CodexReasoningSummary?
+    public let supportsVerbosity: Bool?
+    public let defaultVerbosity: CodexVerbosity?
     public let serviceTiers: [CodexServiceTierOption]
     public let defaultServiceTier: String?
 
@@ -53,6 +57,10 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         supportsPersonality: Bool = false,
         usesResponsesLite: Bool = false,
         inputModalities: [String] = ["text"],
+        supportsReasoningSummaries: Bool? = nil,
+        defaultReasoningSummary: CodexReasoningSummary? = nil,
+        supportsVerbosity: Bool? = nil,
+        defaultVerbosity: CodexVerbosity? = nil,
         serviceTiers: [CodexServiceTierOption] = [],
         defaultServiceTier: String? = nil
     ) {
@@ -67,6 +75,10 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         self.supportsPersonality = supportsPersonality
         self.usesResponsesLite = usesResponsesLite
         self.inputModalities = inputModalities
+        self.supportsReasoningSummaries = supportsReasoningSummaries
+        self.defaultReasoningSummary = defaultReasoningSummary
+        self.supportsVerbosity = supportsVerbosity
+        self.defaultVerbosity = defaultVerbosity
         self.serviceTiers = serviceTiers
         self.defaultServiceTier = defaultServiceTier
     }
@@ -83,6 +95,10 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         case supportsPersonality
         case usesResponsesLite
         case inputModalities
+        case supportsReasoningSummaries
+        case defaultReasoningSummary
+        case supportsVerbosity
+        case defaultVerbosity
         case serviceTiers
         case defaultServiceTier
     }
@@ -103,6 +119,13 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         self.supportsPersonality = try container.decodeIfPresent(Bool.self, forKey: .supportsPersonality) ?? false
         self.usesResponsesLite = try container.decodeIfPresent(Bool.self, forKey: .usesResponsesLite) ?? false
         self.inputModalities = try container.decodeIfPresent([String].self, forKey: .inputModalities) ?? ["text"]
+        self.supportsReasoningSummaries = try container.decodeIfPresent(Bool.self, forKey: .supportsReasoningSummaries)
+        self.defaultReasoningSummary = try container.decodeIfPresent(
+            CodexReasoningSummary.self,
+            forKey: .defaultReasoningSummary
+        )
+        self.supportsVerbosity = try container.decodeIfPresent(Bool.self, forKey: .supportsVerbosity)
+        self.defaultVerbosity = try container.decodeIfPresent(CodexVerbosity.self, forKey: .defaultVerbosity)
         self.serviceTiers = try container.decodeIfPresent([CodexServiceTierOption].self, forKey: .serviceTiers) ?? []
         self.defaultServiceTier = try container.decodeIfPresent(String.self, forKey: .defaultServiceTier)
     }
@@ -120,6 +143,10 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         try container.encode(supportsPersonality, forKey: .supportsPersonality)
         try container.encode(usesResponsesLite, forKey: .usesResponsesLite)
         try container.encode(inputModalities, forKey: .inputModalities)
+        try container.encodeIfPresent(supportsReasoningSummaries, forKey: .supportsReasoningSummaries)
+        try container.encodeIfPresent(defaultReasoningSummary, forKey: .defaultReasoningSummary)
+        try container.encodeIfPresent(supportsVerbosity, forKey: .supportsVerbosity)
+        try container.encodeIfPresent(defaultVerbosity, forKey: .defaultVerbosity)
         try container.encode(serviceTiers, forKey: .serviceTiers)
         try container.encodeIfPresent(defaultServiceTier, forKey: .defaultServiceTier)
     }
@@ -184,39 +211,70 @@ public final class CodexModelCatalog: @unchecked Sendable {
         case "openai":
             return [
                 CodexModelOption(
-                    id: "gpt-5.4",
-                    model: "gpt-5.4",
-                    displayName: "GPT-5.4",
-                    description: "Latest frontier agentic coding model.",
+                    id: "gpt-5.5",
+                    model: "gpt-5.5",
+                    displayName: "GPT-5.5",
+                    description: "Frontier model for complex coding, research, and real-world work.",
                     defaultReasoningEffort: "medium",
                     supportedReasoningEfforts: codexReasoningEfforts,
                     isDefault: true,
-                    inputModalities: ["text", "image"]
+                    inputModalities: ["text", "image"],
+                    supportsReasoningSummaries: true,
+                    defaultReasoningSummary: CodexReasoningSummary.none,
+                    supportsVerbosity: true,
+                    defaultVerbosity: .low
+                ),
+                CodexModelOption(
+                    id: "gpt-5.4",
+                    model: "gpt-5.4",
+                    displayName: "GPT-5.4",
+                    description: "Strong model for everyday coding.",
+                    defaultReasoningEffort: "medium",
+                    supportedReasoningEfforts: codexReasoningEfforts,
+                    inputModalities: ["text", "image"],
+                    supportsReasoningSummaries: true,
+                    defaultReasoningSummary: CodexReasoningSummary.none,
+                    supportsVerbosity: true,
+                    defaultVerbosity: .low
                 ),
                 CodexModelOption(
                     id: "gpt-5.4-mini",
                     model: "gpt-5.4-mini",
                     displayName: "GPT-5.4 Mini",
-                    description: "Smaller frontier agentic coding model.",
+                    description: "Small, fast, and cost-efficient model for simpler coding tasks.",
                     defaultReasoningEffort: "medium",
                     supportedReasoningEfforts: codexReasoningEfforts,
-                    inputModalities: ["text", "image"]
+                    inputModalities: ["text", "image"],
+                    supportsReasoningSummaries: true,
+                    defaultReasoningSummary: CodexReasoningSummary.none,
+                    supportsVerbosity: true,
+                    defaultVerbosity: .medium
                 ),
                 CodexModelOption(
                     id: "gpt-5.3-codex",
                     model: "gpt-5.3-codex",
                     displayName: "GPT-5.3 Codex",
+                    description: "Coding-optimized model.",
                     defaultReasoningEffort: "medium",
                     supportedReasoningEfforts: codexReasoningEfforts,
-                    inputModalities: ["text", "image"]
+                    inputModalities: ["text", "image"],
+                    supportsReasoningSummaries: true,
+                    defaultReasoningSummary: CodexReasoningSummary.none,
+                    supportsVerbosity: true,
+                    defaultVerbosity: .low
                 ),
                 CodexModelOption(
                     id: "gpt-5.2",
                     model: "gpt-5.2",
                     displayName: "GPT-5.2",
+                    description: "Optimized for professional work and long-running agents.",
                     defaultReasoningEffort: "medium",
                     supportedReasoningEfforts: codexReasoningEfforts,
-                    inputModalities: ["text", "image"]
+                    inputModalities: ["text", "image"],
+                    supportsReasoningSummaries: true,
+                    defaultReasoningSummary: .auto,
+                    supportsVerbosity: true,
+                    defaultVerbosity: .low
                 ),
             ]
         case "lmstudio":
@@ -292,6 +350,10 @@ public final class CodexModelCatalog: @unchecked Sendable {
                     supportsPersonality: bool(model["supports_personality"]),
                     usesResponsesLite: bool(model["use_responses_lite"]),
                     inputModalities: stringArray(model["input_modalities"], fallback: ["text"]),
+                    supportsReasoningSummaries: optionalBool(model["supports_reasoning_summaries"]),
+                    defaultReasoningSummary: normalizedReasoningSummary(string(model["default_reasoning_summary"])),
+                    supportsVerbosity: optionalBool(model["support_verbosity"]),
+                    defaultVerbosity: normalizedVerbosity(string(model["default_verbosity"])),
                     serviceTiers: serviceTiers(
                         model["service_tiers"],
                         additionalSpeedTiers: stringArray(model["additional_speed_tiers"], fallback: [])
@@ -336,6 +398,18 @@ public final class CodexModelCatalog: @unchecked Sendable {
                 || bool(model["useResponsesLite"])
                 || bool(model["use_responses_lite"]),
             inputModalities: stringArray(model["inputModalities"], fallback: ["text"]),
+            supportsReasoningSummaries: optionalBool(
+                model["supportsReasoningSummaries"] ?? model["supports_reasoning_summaries"]
+            ),
+            defaultReasoningSummary: normalizedReasoningSummary(
+                string(model["defaultReasoningSummary"]) ?? string(model["default_reasoning_summary"])
+            ),
+            supportsVerbosity: optionalBool(
+                model["supportsVerbosity"] ?? model["supportVerbosity"] ?? model["support_verbosity"]
+            ),
+            defaultVerbosity: normalizedVerbosity(
+                string(model["defaultVerbosity"]) ?? string(model["default_verbosity"])
+            ),
             serviceTiers: serviceTiers(
                 model["serviceTiers"] ?? model["service_tiers"],
                 additionalSpeedTiers: stringArray(
@@ -383,6 +457,10 @@ public final class CodexModelCatalog: @unchecked Sendable {
                 supportsPersonality: option.supportsPersonality,
                 usesResponsesLite: option.usesResponsesLite,
                 inputModalities: option.inputModalities,
+                supportsReasoningSummaries: option.supportsReasoningSummaries,
+                defaultReasoningSummary: option.defaultReasoningSummary,
+                supportsVerbosity: option.supportsVerbosity,
+                defaultVerbosity: option.defaultVerbosity,
                 serviceTiers: option.serviceTiers,
                 defaultServiceTier: option.defaultServiceTier
             )
@@ -448,6 +526,20 @@ public final class CodexModelCatalog: @unchecked Sendable {
         }
     }
 
+    private static func normalizedReasoningSummary(_ value: String?) -> CodexReasoningSummary? {
+        guard let value, !value.isEmpty else {
+            return nil
+        }
+        return CodexReasoningSummary(rawValue: value.lowercased())
+    }
+
+    private static func normalizedVerbosity(_ value: String?) -> CodexVerbosity? {
+        guard let value, !value.isEmpty else {
+            return nil
+        }
+        return CodexVerbosity(rawValue: value.lowercased())
+    }
+
     private static func defaultServiceTierName(_ id: String) -> String {
         switch id {
         case "priority":
@@ -511,6 +603,26 @@ public final class CodexModelCatalog: @unchecked Sendable {
             return value != 0
         default:
             return false
+        }
+    }
+
+    private static func optionalBool(_ value: Any?) -> Bool? {
+        switch value {
+        case let value as Bool:
+            return value
+        case let value as String:
+            switch value.lowercased() {
+            case "true", "yes", "1":
+                return true
+            case "false", "no", "0":
+                return false
+            default:
+                return nil
+            }
+        case let value as NSNumber:
+            return value.boolValue
+        default:
+            return nil
         }
     }
 

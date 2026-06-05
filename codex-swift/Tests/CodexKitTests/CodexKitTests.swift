@@ -40,6 +40,10 @@ func modelCatalogDecodesCodexBackendModels() throws {
           "visibility": "list",
           "supported_in_api": true,
           "use_responses_lite": true,
+          "supports_reasoning_summaries": true,
+          "default_reasoning_summary": "detailed",
+          "support_verbosity": true,
+          "default_verbosity": "low",
           "service_tiers": [
             {"id": "priority", "name": "Priority", "description": "Faster"}
           ],
@@ -59,6 +63,10 @@ func modelCatalogDecodesCodexBackendModels() throws {
     #expect(models[0].supportedReasoningEfforts.map(\.reasoningEffort) == ["low", "xhigh"])
     #expect(models[0].usesResponsesLite)
     #expect(models[0].inputModalities == ["text", "image"])
+    #expect(models[0].supportsReasoningSummaries == true)
+    #expect(models[0].defaultReasoningSummary == .detailed)
+    #expect(models[0].supportsVerbosity == true)
+    #expect(models[0].defaultVerbosity == .low)
     #expect(models[0].serviceTiers.map(\.id) == ["priority"])
     #expect(models[0].defaultServiceTier == "priority")
 }
@@ -79,6 +87,10 @@ func modelCatalogDecodesAppServerResponsesLiteModels() throws {
             {"id": "flex", "name": "Flex", "description": "Flexible throughput"}
           ],
           "defaultServiceTier": "flex",
+          "supportsReasoningSummaries": true,
+          "defaultReasoningSummary": "concise",
+          "supportsVerbosity": true,
+          "defaultVerbosity": "high",
           "inputModalities": ["text", "image"]
         }
       ]
@@ -90,6 +102,10 @@ func modelCatalogDecodesAppServerResponsesLiteModels() throws {
     #expect(models.map(\.id) == ["gpt-5.4"])
     #expect(models[0].usesResponsesLite)
     #expect(models[0].inputModalities == ["text", "image"])
+    #expect(models[0].supportsReasoningSummaries == true)
+    #expect(models[0].defaultReasoningSummary == .concise)
+    #expect(models[0].supportsVerbosity == true)
+    #expect(models[0].defaultVerbosity == .high)
     #expect(models[0].serviceTiers.map(\.id) == ["flex"])
     #expect(models[0].defaultServiceTier == "flex")
 }
@@ -137,6 +153,10 @@ func modelOptionDecodesOlderPersistedValuesWithoutResponsesLiteFlag() throws {
 
     #expect(option.usesResponsesLite == false)
     #expect(option.inputModalities == ["text"])
+    #expect(option.supportsReasoningSummaries == nil)
+    #expect(option.defaultReasoningSummary == nil)
+    #expect(option.supportsVerbosity == nil)
+    #expect(option.defaultVerbosity == nil)
     #expect(option.serviceTiers.isEmpty)
     #expect(option.defaultServiceTier == nil)
 }
@@ -164,9 +184,13 @@ func modelCatalogFallbacksTrackBundledCodexDefaults() {
     let openAI = CodexModelCatalog.fallbackModels(for: .openAI)
     let local = CodexModelCatalog.fallbackModels(for: .ollama())
 
+    #expect(openAI.first?.id == "gpt-5.5")
     #expect(openAI.map(\.id).contains("gpt-5.3-codex"))
-    #expect(openAI.first?.id == "gpt-5.4")
     #expect(openAI.first?.supportedReasoningEfforts.map(\.reasoningEffort) == ["low", "medium", "high", "xhigh"])
+    #expect(openAI.first?.supportsReasoningSummaries == true)
+    #expect(openAI.first?.defaultReasoningSummary == CodexReasoningSummary.none)
+    #expect(openAI.first?.supportsVerbosity == true)
+    #expect(openAI.first?.defaultVerbosity == .low)
     #expect(local.first?.id == "local-model")
     #expect(local.first?.supportedReasoningEfforts.isEmpty == true)
 }
@@ -602,6 +626,7 @@ func mobileBridgeBuildsTurnOptionsAndMultipartInput() throws {
         "stream": true,
         "store": false,
         "reasoning": ["effort": "low"],
+        "text": ["verbosity": "high"],
         "serviceTier": "flex",
         "toolChoice": "required",
         "parallelToolCalls": false,
@@ -615,6 +640,7 @@ func mobileBridgeBuildsTurnOptionsAndMultipartInput() throws {
     #expect(value?["tool_choice"] as? String == "required")
     #expect(value?["parallel_tool_calls"] as? Bool == false)
     #expect((value?["reasoning"] as? [String: Any])?["effort"] as? String == "low")
+    #expect((value?["text"] as? [String: Any])?["verbosity"] as? String == "high")
     #expect(content?[0]["text"] as? String == "look")
     #expect(content?[1]["image_url"] as? String == "data:image/png;base64,AAEC")
 }
@@ -623,13 +649,17 @@ func mobileBridgeBuildsTurnOptionsAndMultipartInput() throws {
 func sessionResponsesLiteTurnOptionsUsePersistentReasoningAndSerialTools() throws {
     let options = CodexTurnOptions(
         reasoningEffort: "medium",
+        reasoningSummary: .detailed,
+        supportsReasoningSummaries: true,
         parallelToolCalls: true,
         usesResponsesLite: true
     )
     let reasoning = try #require(CodexSession.reasoningParameter(options: options) as? [String: Any])
 
     #expect(reasoning["effort"] as? String == "medium")
+    #expect(reasoning["summary"] as? String == "detailed")
     #expect(reasoning["context"] as? String == "all_turns")
+    #expect(CodexSession.includeParameter(reasoning: reasoning) == ["reasoning.encrypted_content"])
     #expect(CodexSession.parallelToolCallsParameter(options: options) == false)
 }
 
@@ -640,13 +670,30 @@ func sessionDefaultTurnOptionsOmitResponsesLiteContext() throws {
 }
 
 @Test
+func sessionTurnOptionsHonorModelReasoningAndVerbositySupport() throws {
+    let unsupported = CodexTurnOptions(
+        reasoningEffort: "medium",
+        reasoningSummary: .auto,
+        supportsReasoningSummaries: false
+    )
+    let verbose = CodexTurnOptions(verbosity: .low)
+
+    #expect(CodexSession.reasoningParameter(options: unsupported) is NSNull)
+    #expect(CodexSession.includeParameter(reasoning: NSNull()).isEmpty)
+    #expect(CodexSession.textParameter(options: verbose)?["verbosity"] as? String == "low")
+}
+
+@Test
 func subagentTurnOptionsInheritResponsesLiteMetadataWithoutModelOverride() {
     let parent = CodexTurnOptions(
         model: "gpt-5.4",
         reasoningEffort: "medium",
+        reasoningSummary: .concise,
+        supportsReasoningSummaries: true,
         parallelToolCalls: true,
         usesResponsesLite: true,
-        inputModalities: ["text", "image"]
+        inputModalities: ["text", "image"],
+        verbosity: .high
     )
 
     let inherited = CodexSession.subagentTurnOptions(arguments: [:], parentOptions: parent)
@@ -655,8 +702,15 @@ func subagentTurnOptionsInheritResponsesLiteMetadataWithoutModelOverride() {
     #expect(inherited.model == "gpt-5.4")
     #expect(inherited.usesResponsesLite)
     #expect(inherited.inputModalities == ["text", "image"])
+    #expect(inherited.reasoningSummary == .concise)
+    #expect(inherited.supportsReasoningSummaries == true)
+    #expect(inherited.verbosity == .high)
     #expect(overridden.model == "local-model")
     #expect(overridden.usesResponsesLite == false)
+    #expect(overridden.inputModalities == nil)
+    #expect(overridden.supportsReasoningSummaries == nil)
+    #expect(overridden.reasoningSummary == nil)
+    #expect(overridden.verbosity == nil)
 }
 
 @Test
