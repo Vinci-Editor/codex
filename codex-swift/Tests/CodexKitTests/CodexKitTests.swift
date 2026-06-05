@@ -618,6 +618,24 @@ func subagentTurnOptionsInheritResponsesLiteMetadataWithoutModelOverride() {
 }
 
 @Test
+func subagentInputTextRendersStructuredTextItems() {
+    let message = CodexSession.subagentInputText(from: [
+        "items": [
+            ["type": "input_text", "text": "First"],
+            [
+                "type": "message",
+                "content": [
+                    ["type": "text", "text": "Second"],
+                    ["type": "input_image", "image_url": "data:image/png;base64,AAEC"],
+                ],
+            ],
+        ],
+    ])
+
+    #expect(message == "First\n\nSecond")
+}
+
+@Test
 func mobileBridgeNormalizesTextDelta() throws {
     let event = try CodexMobileCoreBridge.parseSSEEvent(
         Data(#"{"type":"response.output_text.delta","item_id":"msg-1","delta":"hello"}"#.utf8)

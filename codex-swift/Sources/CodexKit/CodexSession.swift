@@ -786,13 +786,13 @@ public actor CodexSession {
             return """
             You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
-            You can use `spawn_agent` to create a child agent, `followup_task` to give an existing child agent a new task and trigger a turn, `send_message` to pass a message to an existing child without triggering a turn, `wait_agent` to wait for child output, `list_agents` to inspect live child agents, and `close_agent` to close agents that are no longer needed. Use subagents only when delegation or parallel work materially helps the user request.
+            You can use `spawn_agent` to create a child agent, `send_input` to send reusable agent input, `resume_agent` to reopen a closed agent, `followup_task` to give an existing child agent a new task and trigger a turn, `send_message` to pass a message to an existing child without triggering a turn, `wait_agent` to wait for child output, `list_agents` to inspect live child agents, and `close_agent` to close agents that are no longer needed. Use subagents only when delegation or parallel work materially helps the user request.
             """
         }
         return """
         You are `\(agentPath)`, a child agent in a team of agents collaborating to complete a task.
 
-        You can use `spawn_agent` to create a child agent, `followup_task` to give an existing child agent a new task and trigger a turn, `send_message` to pass a message to an existing child without triggering a turn, `wait_agent` to wait for child output, `list_agents` to inspect live child agents, and `close_agent` to close agents that are no longer needed. When you provide a final answer, that content is delivered back to your parent agent.
+        You can use `spawn_agent` to create a child agent, `send_input` to send reusable agent input, `resume_agent` to reopen a closed agent, `followup_task` to give an existing child agent a new task and trigger a turn, `send_message` to pass a message to an existing child without triggering a turn, `wait_agent` to wait for child output, `list_agents` to inspect live child agents, and `close_agent` to close agents that are no longer needed. When you provide a final answer, that content is delivered back to your parent agent.
         """
     }
 
@@ -863,10 +863,45 @@ public actor CodexSession {
                 required: ["task_name", "message"]
             ),
             tool(
+                "send_input",
+                "Send input to an existing agent. Use interrupt=true to redirect a running agent immediately; otherwise input is queued or starts a new turn when the agent is idle.",
+                [
+                    "target": targetProperty,
+                    "message": [
+                        "type": "string",
+                        "description": "Plain-text message to send. Use either message or items.",
+                    ],
+                    "items": [
+                        "type": "array",
+                        "description": "Optional structured input items. Text items are rendered into the message sent to the agent.",
+                        "items": [
+                            "type": "object",
+                            "additionalProperties": true,
+                        ],
+                    ],
+                    "interrupt": [
+                        "type": "boolean",
+                        "description": "True cancels the current task and handles this input immediately; false or omitted queues it.",
+                    ],
+                ],
+                required: ["target"]
+            ),
+            tool(
                 "send_message",
                 "Send a message to an existing agent without triggering a new turn.",
                 ["target": targetProperty, "message": messageProperty],
                 required: ["target", "message"]
+            ),
+            tool(
+                "resume_agent",
+                "Resume a previously closed in-memory agent by id or task name so it can receive send_input and wait_agent calls.",
+                [
+                    "id": [
+                        "type": "string",
+                        "description": "Agent id or canonical task name to resume.",
+                    ],
+                ],
+                required: ["id"]
             ),
             tool(
                 "followup_task",
@@ -1136,8 +1171,12 @@ public actor CodexSession {
             return try executeUpdatePlan(call)
         case "spawn_agent":
             return try await executeSpawnAgent(call)
+        case "send_input":
+            return try executeSendInput(call)
         case "send_message":
             return try executeSendMessage(call)
+        case "resume_agent":
+            return try executeResumeAgent(call)
         case "followup_task":
             return try await executeFollowupTask(call)
         case "wait_agent":
@@ -1565,6 +1604,83 @@ public actor CodexSession {
         ]))
     }
 
+    private func executeSendInput(_ call: CodexToolCall) throws -> CodexToolResult {
+        guard configuration.subagentOptions.isEnabled else {
+            return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
+        }
+        let arguments = try Self.decodeArguments(call.arguments)
+        let target = arguments["target"] as? String ?? ""
+        let message = Self.subagentInputText(from: arguments).trimmingCharacters(in: .whitespacesAndNewlines)
+        let interrupt = Self.boolValue(arguments["interrupt"])
+        guard !message.isEmpty else {
+            return CodexToolResult(output: "Missing message or text input items.", success: false)
+        }
+        guard let id = subagentID(for: target), var record = subagents[id] else {
+            return CodexToolResult(output: "\(target): agent not found.", success: false)
+        }
+        guard !record.status.isClosed else {
+            return CodexToolResult(output: "\(record.path): agent is closed; call resume_agent before send_input.", success: false)
+        }
+
+        if record.status == .running, !interrupt {
+            record.queuedMessages.append(message)
+            subagents[id] = record
+            return CodexToolResult(output: try Self.jsonString([
+                "target": record.path,
+                "status": "queued",
+                "submission_id": UUID().uuidString,
+            ]))
+        }
+
+        if record.status == .running, interrupt {
+            record.queuedFollowups.insert(message, at: 0)
+            record.task?.cancel()
+            subagents[id] = record
+            return CodexToolResult(output: try Self.jsonString([
+                "target": record.path,
+                "status": "interrupt_queued",
+                "submission_id": UUID().uuidString,
+            ]))
+        }
+        record.status = .running
+        record.finalAnswer = nil
+        record.errorMessage = nil
+        subagents[id] = record
+        startSubagentTurn(id: id, message: message, options: record.turnOptions)
+        return CodexToolResult(output: try Self.jsonString([
+            "target": record.path,
+            "status": "running",
+            "submission_id": UUID().uuidString,
+        ]))
+    }
+
+    private func executeResumeAgent(_ call: CodexToolCall) throws -> CodexToolResult {
+        guard configuration.subagentOptions.isEnabled else {
+            return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
+        }
+        let arguments = try Self.decodeArguments(call.arguments)
+        let target = arguments["id"] as? String ?? arguments["target"] as? String ?? ""
+        guard let id = subagentID(for: target), var record = subagents[id] else {
+            return CodexToolResult(output: "\(target): agent not found.", success: false)
+        }
+        if record.status.isClosed {
+            let openAgents = subagents.values.filter { !$0.status.isClosed }.count
+            guard openAgents < configuration.subagentOptions.maxOpenAgents else {
+                return CodexToolResult(
+                    output: "Subagent limit reached (\(configuration.subagentOptions.maxOpenAgents) open agents).",
+                    success: false
+                )
+            }
+            record.status = record.statusBeforeClose ?? .completed
+            record.statusBeforeClose = nil
+            subagents[id] = record
+        }
+        guard let latest = subagents[id] else {
+            return CodexToolResult(output: "\(target): agent not found.", success: false)
+        }
+        return CodexToolResult(output: try Self.jsonString(Self.subagentStatusPayload(latest)))
+    }
+
     private func executeFollowupTask(_ call: CodexToolCall) async throws -> CodexToolResult {
         guard configuration.subagentOptions.isEnabled else {
             return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
@@ -1667,6 +1783,7 @@ public actor CodexSession {
         let previousStatus = record.status
         record.task?.cancel()
         record.task = nil
+        record.statusBeforeClose = previousStatus
         record.status = .closed
         subagents[id] = record
         return CodexToolResult(output: try Self.jsonString([
@@ -1702,6 +1819,19 @@ public actor CodexSession {
             return Int(value)
         default:
             return nil
+        }
+    }
+
+    private static func boolValue(_ value: Any?) -> Bool {
+        switch value {
+        case let value as Bool:
+            return value
+        case let value as String:
+            return ["1", "true", "yes"].contains(value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        case let value as Int:
+            return value != 0
+        default:
+            return false
         }
     }
 
@@ -1884,6 +2014,40 @@ public actor CodexSession {
         ]
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
+    }
+
+    static func subagentInputText(from arguments: [String: Any]) -> String {
+        if let message = arguments["message"] as? String, !message.isEmpty {
+            return message
+        }
+        guard let items = arguments["items"] as? [[String: Any]] else {
+            return ""
+        }
+        return items.compactMap { item in
+            switch item["type"] as? String {
+            case "text", "input_text":
+                return item["text"] as? String
+            case "message":
+                if let content = item["content"] as? String {
+                    return content
+                }
+                if let content = item["content"] as? [[String: Any]] {
+                    return content.compactMap { part in
+                        switch part["type"] as? String {
+                        case "text", "input_text":
+                            return part["text"] as? String
+                        default:
+                            return nil
+                        }
+                    }.joined(separator: "\n")
+                }
+                return nil
+            default:
+                return nil
+            }
+        }
+        .filter { !$0.isEmpty }
+        .joined(separator: "\n\n")
     }
 
     private static func subagentStatusPayload(_ record: SubagentRecord) -> [String: Any] {
@@ -2230,6 +2394,7 @@ private struct SubagentRecord {
     var queuedMessages: [String] = []
     var queuedFollowups: [String] = []
     var turnOptions: CodexTurnOptions?
+    var statusBeforeClose: SubagentStatus?
     let createdOrder: Int
 }
 
