@@ -355,11 +355,12 @@ public actor CodexSession {
         }
     }
 
-    public func cancelSubagents() {
+    public func cancelSubagents() async {
         for id in Array(subagents.keys) {
             guard var record = subagents[id] else {
                 continue
             }
+            await record.session.cancelSubagents()
             record.task?.cancel()
             record.task = nil
             if record.status == .running {
@@ -2472,6 +2473,7 @@ public actor CodexSession {
             return CodexToolResult(output: "\(target): agent not found.", success: false)
         }
         let previousStatus = record.status
+        await record.session.cancelSubagents()
         record.task?.cancel()
         record.task = nil
         record.statusBeforeClose = previousStatus
