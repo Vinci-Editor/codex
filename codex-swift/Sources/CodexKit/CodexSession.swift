@@ -11,6 +11,7 @@ public struct CodexSessionConfiguration: Sendable {
     public let baseInstructionsOverride: String?
     public let additionalDeveloperInstructions: String?
     public let tools: [any CodexTool]
+    public let subagentOptions: CodexSubagentOptions
     public let urlSession: URLSession
     public let toolApprovalHandler: CodexToolApprovalHandler?
 
@@ -24,6 +25,7 @@ public struct CodexSessionConfiguration: Sendable {
         baseInstructionsOverride: String? = nil,
         additionalDeveloperInstructions: String? = nil,
         tools: [any CodexTool] = [],
+        subagentOptions: CodexSubagentOptions = .disabled,
         urlSession: URLSession = .shared,
         toolApprovalHandler: CodexToolApprovalHandler? = nil
     ) {
@@ -36,6 +38,7 @@ public struct CodexSessionConfiguration: Sendable {
         self.baseInstructionsOverride = baseInstructionsOverride
         self.additionalDeveloperInstructions = additionalDeveloperInstructions
         self.tools = tools
+        self.subagentOptions = subagentOptions
         self.urlSession = urlSession
         self.toolApprovalHandler = toolApprovalHandler
     }
@@ -51,6 +54,7 @@ public struct CodexSessionConfiguration: Sendable {
             baseInstructionsOverride: baseInstructionsOverride,
             additionalDeveloperInstructions: additionalDeveloperInstructions,
             tools: tools,
+            subagentOptions: subagentOptions,
             urlSession: urlSession,
             toolApprovalHandler: handler
         )
@@ -138,16 +142,31 @@ public struct CodexSessionSnapshot: Codable, Sendable, Equatable, Hashable {
 public actor CodexSession {
     private let configuration: CodexSessionConfiguration
     private let conversationID = UUID().uuidString
+    private let agentPath: String
     private var history: [[String: Any]] = []
     private let toolsByName: [String: any CodexTool]
+    private var subagents: [String: SubagentRecord] = [:]
+    private var subagentSequence = 0
 
     public init(configuration: CodexSessionConfiguration) {
         self.configuration = configuration
+        self.agentPath = "/root"
         self.toolsByName = Dictionary(uniqueKeysWithValues: configuration.tools.map { ($0.name, $0) })
     }
 
     public init(configuration: CodexSessionConfiguration, snapshot: CodexSessionSnapshot?) {
         self.configuration = configuration
+        self.agentPath = "/root"
+        self.toolsByName = Dictionary(uniqueKeysWithValues: configuration.tools.map { ($0.name, $0) })
+        if let snapshot,
+           let object = try? JSONSerialization.jsonObject(with: snapshot.historyJSON) as? [[String: Any]] {
+            self.history = object
+        }
+    }
+
+    private init(configuration: CodexSessionConfiguration, snapshot: CodexSessionSnapshot?, agentPath: String) {
+        self.configuration = configuration
+        self.agentPath = agentPath
         self.toolsByName = Dictionary(uniqueKeysWithValues: configuration.tools.map { ($0.name, $0) })
         if let snapshot,
            let object = try? JSONSerialization.jsonObject(with: snapshot.historyJSON) as? [[String: Any]] {
@@ -402,6 +421,7 @@ public actor CodexSession {
     private func buildInstructions() -> String {
         [
             configuration.baseInstructionsOverride,
+            multiAgentInstructions(),
             workspaceInstructions(),
             configuration.additionalDeveloperInstructions,
         ]
@@ -411,7 +431,9 @@ public actor CodexSession {
     }
 
     private func buildToolDefinitions() -> [[String: Any]] {
-        CodexMobileCoreBridge.builtinTools() + configuration.tools.map { $0.responsesToolDefinition() }
+        CodexMobileCoreBridge.builtinTools()
+            + subagentToolDefinitions()
+            + configuration.tools.map { $0.responsesToolDefinition() }
     }
 
     private static func errorBody(from bytes: URLSession.AsyncBytes) async throws -> String {
@@ -433,6 +455,132 @@ public actor CodexSession {
         Current workspace: \(workspace.rootURL.path)
         Use list_dir, read_file, and search_files to inspect files before answering questions about the workspace. Prefer apply_patch for focused edits and write_file for complete-file writes. Use shell_command or exec_command only when a real shell is needed. Do not claim you have read files unless a tool result has provided their contents.
         """
+    }
+
+    private func multiAgentInstructions() -> String? {
+        guard configuration.subagentOptions.isEnabled else {
+            return nil
+        }
+        if agentPath == "/root" {
+            return """
+            You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
+
+            You can use `spawn_agent` to create a child agent, `followup_task` to give an existing child agent a new task and trigger a turn, `send_message` to pass a message to an existing child without triggering a turn, `wait_agent` to wait for child output, `list_agents` to inspect live child agents, and `close_agent` to close agents that are no longer needed. Use subagents only when delegation or parallel work materially helps the user request.
+            """
+        }
+        return """
+        You are `\(agentPath)`, a child agent in a team of agents collaborating to complete a task.
+
+        You can use `spawn_agent` to create a child agent, `followup_task` to give an existing child agent a new task and trigger a turn, `send_message` to pass a message to an existing child without triggering a turn, `wait_agent` to wait for child output, `list_agents` to inspect live child agents, and `close_agent` to close agents that are no longer needed. When you provide a final answer, that content is delivered back to your parent agent.
+        """
+    }
+
+    private func subagentToolDefinitions() -> [[String: Any]] {
+        guard configuration.subagentOptions.isEnabled else {
+            return []
+        }
+
+        func tool(
+            _ name: String,
+            _ description: String,
+            _ properties: [String: [String: Any]],
+            required: [String] = []
+        ) -> [String: Any] {
+            [
+                "type": "function",
+                "name": name,
+                "description": description,
+                "strict": false,
+                "parameters": [
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": false,
+                ],
+            ]
+        }
+
+        let targetProperty: [String: Any] = [
+            "type": "string",
+            "description": "Agent id or canonical task name returned by spawn_agent.",
+        ]
+        let messageProperty: [String: Any] = [
+            "type": "string",
+            "description": "Plain-text message for the target agent.",
+        ]
+
+        return [
+            tool(
+                "spawn_agent",
+                "Spawn a child agent to work on the specified task. The child inherits the same workspace and tools and runs in the background.",
+                [
+                    "task_name": [
+                        "type": "string",
+                        "description": "Task name for the new agent. Use lowercase letters, digits, and underscores.",
+                    ],
+                    "message": [
+                        "type": "string",
+                        "description": "Initial plain-text task for the new agent.",
+                    ],
+                    "fork_turns": [
+                        "type": "string",
+                        "description": "Optional history fork depth. Use none, all, or a positive integer string.",
+                    ],
+                    "model": [
+                        "type": "string",
+                        "description": "Optional model override. Omit to inherit the parent session model.",
+                    ],
+                    "reasoning_effort": [
+                        "type": "string",
+                        "description": "Optional reasoning effort override. Omit to inherit the parent turn default.",
+                    ],
+                    "service_tier": [
+                        "type": "string",
+                        "description": "Optional service tier override.",
+                    ],
+                ],
+                required: ["task_name", "message"]
+            ),
+            tool(
+                "send_message",
+                "Send a message to an existing agent without triggering a new turn.",
+                ["target": targetProperty, "message": messageProperty],
+                required: ["target", "message"]
+            ),
+            tool(
+                "followup_task",
+                "Send a follow-up task to an existing child agent and trigger a turn in that target.",
+                ["target": targetProperty, "message": messageProperty],
+                required: ["target", "message"]
+            ),
+            tool(
+                "wait_agent",
+                "Wait for an agent to finish or for any running child agent to produce a final status.",
+                [
+                    "target": targetProperty,
+                    "timeout_ms": [
+                        "type": "number",
+                        "description": "Optional timeout in milliseconds.",
+                    ],
+                ]
+            ),
+            tool(
+                "list_agents",
+                "List live child agents in this session.",
+                [
+                    "path_prefix": [
+                        "type": "string",
+                        "description": "Optional canonical task-name prefix filter.",
+                    ],
+                ]
+            ),
+            tool(
+                "close_agent",
+                "Close an agent and cancel any running child turn.",
+                ["target": targetProperty],
+                required: ["target"]
+            ),
+        ]
     }
 
     static func decodeStreamEvent(_ normalized: [String: Any]) throws -> CodexStreamEvent {
@@ -601,6 +749,18 @@ public actor CodexSession {
             return try executeApplyPatch(call)
         case "write_file":
             return try executeWriteFile(call)
+        case "spawn_agent":
+            return try await executeSpawnAgent(call)
+        case "send_message":
+            return try executeSendMessage(call)
+        case "followup_task":
+            return try await executeFollowupTask(call)
+        case "wait_agent":
+            return try await executeWaitAgent(call)
+        case "list_agents":
+            return try executeListAgents(call)
+        case "close_agent":
+            return try executeCloseAgent(call)
         default:
             throw CodexSessionError.unknownTool(call.name)
         }
@@ -862,6 +1022,200 @@ public actor CodexSession {
         }
     }
 
+    private func executeSpawnAgent(_ call: CodexToolCall) async throws -> CodexToolResult {
+        guard configuration.subagentOptions.isEnabled else {
+            return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
+        }
+        let arguments = try Self.decodeArguments(call.arguments)
+        let taskName = (arguments["task_name"] as? String ?? arguments["name"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = (arguments["message"] as? String ?? arguments["task"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.isValidSubagentTaskName(taskName) else {
+            return CodexToolResult(
+                output: "Invalid task_name. Use lowercase letters, digits, and underscores.",
+                success: false
+            )
+        }
+        guard !message.isEmpty else {
+            return CodexToolResult(output: "Missing message.", success: false)
+        }
+
+        let childPath = Self.subagentPath(parent: agentPath, taskName: taskName)
+        guard !subagents.values.contains(where: { $0.path == childPath }) else {
+            return CodexToolResult(output: "\(childPath): agent already exists.", success: false)
+        }
+        let openAgents = subagents.values.filter { !$0.status.isClosed }.count
+        guard openAgents < configuration.subagentOptions.maxOpenAgents else {
+            return CodexToolResult(
+                output: "Subagent limit reached (\(configuration.subagentOptions.maxOpenAgents) open agents).",
+                success: false
+            )
+        }
+
+        subagentSequence += 1
+        let id = "agent-\(subagentSequence)"
+        let snapshot = try forkedSnapshot(forkTurns: arguments["fork_turns"] as? String)
+        let child = CodexSession(configuration: configuration, snapshot: snapshot, agentPath: childPath)
+        let options = CodexTurnOptions(
+            model: arguments["model"] as? String,
+            reasoningEffort: arguments["reasoning_effort"] as? String,
+            serviceTier: arguments["service_tier"] as? String
+        )
+
+        subagents[id] = SubagentRecord(
+            id: id,
+            taskName: taskName,
+            path: childPath,
+            session: child,
+            status: .running,
+            turnOptions: options,
+            createdOrder: subagentSequence
+        )
+        startSubagentTurn(id: id, message: message, options: options)
+
+        return CodexToolResult(output: try Self.jsonString([
+            "agent_id": id,
+            "task_name": childPath,
+        ]))
+    }
+
+    private func executeSendMessage(_ call: CodexToolCall) throws -> CodexToolResult {
+        guard configuration.subagentOptions.isEnabled else {
+            return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
+        }
+        let arguments = try Self.decodeArguments(call.arguments)
+        let target = arguments["target"] as? String ?? ""
+        let message = (arguments["message"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else {
+            return CodexToolResult(output: "Missing message.", success: false)
+        }
+        guard let id = subagentID(for: target), var record = subagents[id] else {
+            return CodexToolResult(output: "\(target): agent not found.", success: false)
+        }
+        guard !record.status.isClosed else {
+            return CodexToolResult(output: "\(record.path): agent is closed.", success: false)
+        }
+
+        record.queuedMessages.append(message)
+        subagents[id] = record
+        return CodexToolResult(output: try Self.jsonString([
+            "target": record.path,
+            "status": "queued",
+        ]))
+    }
+
+    private func executeFollowupTask(_ call: CodexToolCall) async throws -> CodexToolResult {
+        guard configuration.subagentOptions.isEnabled else {
+            return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
+        }
+        let arguments = try Self.decodeArguments(call.arguments)
+        let target = arguments["target"] as? String ?? ""
+        let message = (arguments["message"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else {
+            return CodexToolResult(output: "Missing message.", success: false)
+        }
+        guard let id = subagentID(for: target), var record = subagents[id] else {
+            return CodexToolResult(output: "\(target): agent not found.", success: false)
+        }
+        guard !record.status.isClosed else {
+            return CodexToolResult(output: "\(record.path): agent is closed.", success: false)
+        }
+
+        if record.status == .running {
+            record.queuedFollowups.append(message)
+            subagents[id] = record
+            return CodexToolResult(output: try Self.jsonString([
+                "target": record.path,
+                "status": "queued",
+            ]))
+        }
+
+        subagents[id] = record
+        startSubagentTurn(id: id, message: message, options: record.turnOptions)
+        return CodexToolResult(output: try Self.jsonString([
+            "target": record.path,
+            "status": "running",
+        ]))
+    }
+
+    private func executeWaitAgent(_ call: CodexToolCall) async throws -> CodexToolResult {
+        guard configuration.subagentOptions.isEnabled else {
+            return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
+        }
+        let arguments = try Self.decodeArguments(call.arguments)
+        let target = arguments["target"] as? String
+        let timeout = waitTimeoutMilliseconds(from: arguments)
+
+        let id: String?
+        if let target, !target.isEmpty {
+            id = subagentID(for: target)
+        } else {
+            id = subagents.values
+                .sorted { $0.createdOrder < $1.createdOrder }
+                .first(where: { $0.status == .running || $0.status.isFinal })?
+                .id
+        }
+        guard let id, let record = subagents[id] else {
+            return CodexToolResult(output: "No matching agent.", success: false)
+        }
+
+        if record.status == .running, let task = record.task {
+            let completed = await Self.waitForSubagentTask(task, timeoutMilliseconds: timeout)
+            if !completed, let latest = subagents[id] {
+                return CodexToolResult(output: try Self.jsonString([
+                    "target": latest.path,
+                    "status": "timeout",
+                    "timeout_ms": timeout,
+                ]))
+            }
+        }
+
+        guard let latest = subagents[id] else {
+            return CodexToolResult(output: "\(record.path): agent not found.", success: false)
+        }
+        return CodexToolResult(output: try Self.jsonString(Self.subagentStatusPayload(latest)))
+    }
+
+    private func executeListAgents(_ call: CodexToolCall) throws -> CodexToolResult {
+        guard configuration.subagentOptions.isEnabled else {
+            return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
+        }
+        let arguments = try Self.decodeArguments(call.arguments)
+        let prefix = (arguments["path_prefix"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let agents = subagents.values
+            .filter { record in
+                guard let prefix, !prefix.isEmpty else {
+                    return true
+                }
+                return record.path.hasPrefix(prefix)
+            }
+            .sorted { $0.createdOrder < $1.createdOrder }
+            .map(Self.subagentStatusPayload)
+        return CodexToolResult(output: try Self.jsonString(["agents": agents]))
+    }
+
+    private func executeCloseAgent(_ call: CodexToolCall) throws -> CodexToolResult {
+        guard configuration.subagentOptions.isEnabled else {
+            return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
+        }
+        let arguments = try Self.decodeArguments(call.arguments)
+        let target = arguments["target"] as? String ?? ""
+        guard let id = subagentID(for: target), var record = subagents[id] else {
+            return CodexToolResult(output: "\(target): agent not found.", success: false)
+        }
+        let previousStatus = record.status
+        record.task?.cancel()
+        record.task = nil
+        record.status = .closed
+        subagents[id] = record
+        return CodexToolResult(output: try Self.jsonString([
+            "target": record.path,
+            "previous_status": previousStatus.rawValue,
+            "status": record.status.rawValue,
+        ]))
+    }
+
     private func appendToolOutput(call: CodexToolCall, result: CodexToolResult) {
         history.append(CodexMobileCoreBridge.toolOutput(
             callID: call.callID,
@@ -889,6 +1243,226 @@ public actor CodexSession {
         default:
             return nil
         }
+    }
+
+    private func forkedSnapshot(forkTurns: String?) throws -> CodexSessionSnapshot {
+        let normalized = forkTurns?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let forkedHistory: [[String: Any]]
+        switch normalized {
+        case nil, "", "all":
+            forkedHistory = history
+        case "none":
+            forkedHistory = []
+        default:
+            if let normalized, let turnCount = Int(normalized), turnCount > 0 {
+                let userMessageIndices = history.indices.filter { index in
+                    history[index]["type"] as? String == "message"
+                        && history[index]["role"] as? String == "user"
+                }
+                if let startIndex = userMessageIndices.dropLast(max(turnCount - 1, 0)).last {
+                    forkedHistory = Array(history[startIndex...])
+                } else {
+                    forkedHistory = history
+                }
+            } else {
+                forkedHistory = history
+            }
+        }
+
+        let data = try JSONSerialization.data(withJSONObject: forkedHistory, options: [.sortedKeys])
+        return CodexSessionSnapshot(historyJSON: data)
+    }
+
+    private func startSubagentTurn(id: String, message: String, options: CodexTurnOptions?) {
+        guard var record = subagents[id], !record.status.isClosed else {
+            return
+        }
+        let queuedMessages = record.queuedMessages
+        record.queuedMessages.removeAll()
+        record.status = .running
+        record.finalAnswer = nil
+        record.errorMessage = nil
+
+        let child = record.session
+        let prompt = Self.subagentPrompt(
+            path: record.path,
+            parentPath: agentPath,
+            queuedMessages: queuedMessages,
+            message: message
+        )
+        let task = Task.detached { [child, options] in
+            do {
+                let output = try await Self.collectFinalText(from: child.submit(userText: prompt, options: options))
+                await self.finishSubagentTurn(id: id, finalAnswer: output, errorMessage: nil)
+            } catch is CancellationError {
+                await self.finishSubagentTurn(id: id, finalAnswer: nil, errorMessage: "cancelled")
+            } catch {
+                await self.finishSubagentTurn(id: id, finalAnswer: nil, errorMessage: error.localizedDescription)
+            }
+        }
+        record.task = task
+        subagents[id] = record
+    }
+
+    private func finishSubagentTurn(id: String, finalAnswer: String?, errorMessage: String?) {
+        guard var record = subagents[id], record.status == .running else {
+            return
+        }
+        record.task = nil
+        if let errorMessage {
+            record.status = .failed
+            record.errorMessage = errorMessage
+        } else {
+            record.status = .completed
+            record.finalAnswer = finalAnswer ?? ""
+        }
+
+        if !record.status.isClosed, !record.queuedFollowups.isEmpty {
+            let next = record.queuedFollowups.removeFirst()
+            let options = record.turnOptions
+            subagents[id] = record
+            startSubagentTurn(id: id, message: next, options: options)
+            return
+        }
+
+        subagents[id] = record
+    }
+
+    private func subagentID(for rawTarget: String) -> String? {
+        let target = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else {
+            return nil
+        }
+        if subagents[target] != nil {
+            return target
+        }
+        if let exact = subagents.values.first(where: { $0.path == target || $0.taskName == target }) {
+            return exact.id
+        }
+        let canonical = target.hasPrefix("/") ? target : Self.subagentPath(parent: agentPath, taskName: target)
+        return subagents.values.first(where: { $0.path == canonical })?.id
+    }
+
+    private func waitTimeoutMilliseconds(from arguments: [String: Any]) -> Int {
+        let options = configuration.subagentOptions
+        let requested = Self.intValue(arguments["timeout_ms"]) ?? options.defaultWaitTimeoutMilliseconds
+        return min(max(requested, options.minWaitTimeoutMilliseconds), options.maxWaitTimeoutMilliseconds)
+    }
+
+    private static func waitForSubagentTask(
+        _ task: Task<Void, Never>,
+        timeoutMilliseconds: Int
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let race = SubagentWaitRace(continuation)
+            let waiter = Task {
+                await task.value
+                race.finish(true)
+            }
+            let sleeper = Task {
+                let timeout = UInt64(max(timeoutMilliseconds, 1)) * 1_000_000
+                try? await Task.sleep(nanoseconds: timeout)
+                race.finish(false)
+            }
+            race.setTasks(waiter: waiter, sleeper: sleeper)
+        }
+    }
+
+    private static func collectFinalText(
+        from stream: AsyncThrowingStream<CodexStreamEvent, Error>
+    ) async throws -> String {
+        var outputTextByItemID: [String: String] = [:]
+        var order: [String] = []
+        var fallbackText = ""
+
+        for try await event in stream {
+            switch event {
+            case .outputTextDelta(let itemID, let delta):
+                guard !delta.isEmpty else {
+                    continue
+                }
+                if let itemID {
+                    if outputTextByItemID[itemID] == nil {
+                        order.append(itemID)
+                    }
+                    outputTextByItemID[itemID, default: ""] += delta
+                } else {
+                    fallbackText += delta
+                }
+            case .outputItemCompleted(let item):
+                guard item.kind == .assistantMessage, let text = item.text, !text.isEmpty else {
+                    continue
+                }
+                if outputTextByItemID[item.id] == nil {
+                    order.append(item.id)
+                    outputTextByItemID[item.id] = text
+                }
+            default:
+                break
+            }
+        }
+
+        let joined = order.compactMap { outputTextByItemID[$0] }.joined(separator: "\n")
+        let output = joined.isEmpty ? fallbackText : joined
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func subagentPrompt(
+        path: String,
+        parentPath: String,
+        queuedMessages: [String],
+        message: String
+    ) -> String {
+        let queued = queuedMessages.isEmpty
+            ? ""
+            : "\n\nQueued messages from \(parentPath):\n" + queuedMessages.map { "- \($0)" }.joined(separator: "\n")
+        return [
+            "You are \(path), a child agent spawned by \(parentPath).",
+            queued,
+            "Task:\n\(message)",
+            "When finished, provide the result for \(parentPath).",
+        ]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+    }
+
+    private static func subagentStatusPayload(_ record: SubagentRecord) -> [String: Any] {
+        var payload: [String: Any] = [
+            "agent_id": record.id,
+            "task_name": record.path,
+            "status": record.status.rawValue,
+        ]
+        switch record.status {
+        case .completed:
+            payload["final_answer"] = record.finalAnswer ?? ""
+        case .failed:
+            payload["error"] = record.errorMessage ?? "Subagent failed."
+        default:
+            break
+        }
+        if !record.queuedMessages.isEmpty {
+            payload["queued_messages"] = record.queuedMessages.count
+        }
+        if !record.queuedFollowups.isEmpty {
+            payload["queued_followups"] = record.queuedFollowups.count
+        }
+        return payload
+    }
+
+    private static func subagentPath(parent: String, taskName: String) -> String {
+        parent == "/" ? "/\(taskName)" : "\(parent)/\(taskName)"
+    }
+
+    private static func isValidSubagentTaskName(_ value: String) -> Bool {
+        guard !value.isEmpty else {
+            return false
+        }
+        return value.range(of: #"^[a-z0-9_]+$"#, options: .regularExpression) != nil
+    }
+
+    private static func jsonString(_ object: Any) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
     }
 
     private static func resolveExistingWorkspaceURL(root: URL, rawPath: String) throws -> URL {
@@ -1034,6 +1608,82 @@ private struct TurnStreamResult {
 private struct AssistantTextItem {
     let itemID: String
     let text: String
+}
+
+private struct SubagentRecord {
+    let id: String
+    let taskName: String
+    let path: String
+    let session: CodexSession
+    var status: SubagentStatus
+    var task: Task<Void, Never>?
+    var finalAnswer: String?
+    var errorMessage: String?
+    var queuedMessages: [String] = []
+    var queuedFollowups: [String] = []
+    var turnOptions: CodexTurnOptions?
+    let createdOrder: Int
+}
+
+private enum SubagentStatus: String {
+    case running
+    case completed
+    case failed
+    case closed
+
+    var isFinal: Bool {
+        self == .completed || self == .failed
+    }
+
+    var isClosed: Bool {
+        self == .closed
+    }
+}
+
+private final class SubagentWaitRace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool, Never>?
+    private var waiter: Task<Void, Never>?
+    private var sleeper: Task<Void, Never>?
+
+    init(_ continuation: CheckedContinuation<Bool, Never>) {
+        self.continuation = continuation
+    }
+
+    func setTasks(waiter: Task<Void, Never>, sleeper: Task<Void, Never>) {
+        var shouldCancel = false
+        lock.lock()
+        if continuation == nil {
+            shouldCancel = true
+        } else {
+            self.waiter = waiter
+            self.sleeper = sleeper
+        }
+        lock.unlock()
+
+        if shouldCancel {
+            waiter.cancel()
+            sleeper.cancel()
+        }
+    }
+
+    func finish(_ completed: Bool) {
+        let continuationToResume: CheckedContinuation<Bool, Never>?
+        let waiterToCancel: Task<Void, Never>?
+        let sleeperToCancel: Task<Void, Never>?
+        lock.lock()
+        continuationToResume = continuation
+        continuation = nil
+        waiterToCancel = waiter
+        sleeperToCancel = sleeper
+        waiter = nil
+        sleeper = nil
+        lock.unlock()
+
+        waiterToCancel?.cancel()
+        sleeperToCancel?.cancel()
+        continuationToResume?.resume(returning: completed)
+    }
 }
 
 public enum CodexSessionError: Error, Equatable {

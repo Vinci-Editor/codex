@@ -271,6 +271,23 @@ the same configuration.
 The default model is `gpt-5.4`. Override it in `CodexSessionConfiguration` for a
 long-lived session default or per turn with `CodexTurnOptions`.
 
+Enable background child agents with `subagentOptions`:
+
+```swift
+let configuration = CodexSessionConfiguration(
+    provider: provider,
+    model: model,
+    workspace: workspace,
+    subagentOptions: .enabled
+)
+```
+
+When enabled, `CodexKit` exposes `spawn_agent`, `send_message`,
+`followup_task`, `wait_agent`, `list_agents`, and `close_agent`. Spawned agents
+inherit the same configuration, workspace, registered tools, approval handler,
+and auth context. `fork_turns` can be `none`, `all`, or a positive integer
+string to control how much parent history is copied into the child session.
+
 ## Approve Mutating Tools
 
 `CodexKit` asks the host app for approval before running built-in tools that can
