@@ -685,6 +685,22 @@ func sessionTurnOptionsHonorModelReasoningAndVerbositySupport() throws {
 
 @Test
 func subagentTurnOptionsInheritResponsesLiteMetadataWithoutModelOverride() {
+    let availableModels = [
+        CodexModelOption(
+            id: "gpt-5.5",
+            model: "gpt-5.5",
+            displayName: "GPT-5.5",
+            description: "Frontier model",
+            defaultReasoningEffort: "medium",
+            supportedReasoningEfforts: [
+                CodexReasoningEffortOption(reasoningEffort: "low"),
+                CodexReasoningEffortOption(reasoningEffort: "medium"),
+            ],
+            serviceTiers: [
+                CodexServiceTierOption(id: "priority", name: "Priority"),
+            ]
+        ),
+    ]
     let parent = CodexTurnOptions(
         model: "gpt-5.4",
         reasoningEffort: "medium",
@@ -693,7 +709,8 @@ func subagentTurnOptionsInheritResponsesLiteMetadataWithoutModelOverride() {
         parallelToolCalls: true,
         usesResponsesLite: true,
         inputModalities: ["text", "image"],
-        verbosity: .high
+        verbosity: .high,
+        availableModelOptions: availableModels
     )
 
     let inherited = CodexSession.subagentTurnOptions(arguments: [:], parentOptions: parent)
@@ -705,12 +722,57 @@ func subagentTurnOptionsInheritResponsesLiteMetadataWithoutModelOverride() {
     #expect(inherited.reasoningSummary == .concise)
     #expect(inherited.supportsReasoningSummaries == true)
     #expect(inherited.verbosity == .high)
+    #expect(inherited.availableModelOptions.map(\.model) == ["gpt-5.5"])
     #expect(overridden.model == "local-model")
     #expect(overridden.usesResponsesLite == false)
     #expect(overridden.inputModalities == nil)
     #expect(overridden.supportsReasoningSummaries == nil)
     #expect(overridden.reasoningSummary == nil)
     #expect(overridden.verbosity == nil)
+    #expect(overridden.availableModelOptions.map(\.model) == ["gpt-5.5"])
+}
+
+@Test
+func subagentModelOverrideDescriptionIncludesPickerVisibleModelMetadata() {
+    let options = CodexTurnOptions(
+        model: "gpt-5.4",
+        reasoningEffort: "medium",
+        serviceTier: "priority",
+        availableModelOptions: [
+            CodexModelOption(
+                id: "gpt-5.5",
+                model: "gpt-5.5",
+                displayName: "GPT-5.5",
+                description: "Frontier model",
+                defaultReasoningEffort: "medium",
+                supportedReasoningEfforts: [
+                    CodexReasoningEffortOption(reasoningEffort: "low"),
+                    CodexReasoningEffortOption(reasoningEffort: "medium"),
+                ],
+                serviceTiers: [
+                    CodexServiceTierOption(id: "priority", name: "Priority"),
+                ]
+            ),
+            CodexModelOption(
+                id: "hidden",
+                model: "hidden",
+                displayName: "Hidden",
+                isHidden: true
+            ),
+        ]
+    )
+
+    let description = CodexSession.subagentModelOverrideDescription(options: options)
+    let guidance = CodexSession.subagentInheritedModelGuidance(options: options)
+
+    #expect(description.contains("Available model overrides"))
+    #expect(description.contains("`gpt-5.5`"))
+    #expect(description.contains("medium (default)"))
+    #expect(description.contains("Service tiers: priority"))
+    #expect(!description.contains("hidden"))
+    #expect(guidance.contains("inherit `gpt-5.4`"))
+    #expect(guidance.contains("inherit `medium`"))
+    #expect(guidance.contains("inherit `priority`"))
 }
 
 @Test

@@ -82,6 +82,7 @@ public struct CodexTurnOptions: Sendable, Equatable {
     public let usesResponsesLite: Bool
     public let inputModalities: [String]?
     public let verbosity: CodexVerbosity?
+    public let availableModelOptions: [CodexModelOption]
     public let webSearch: CodexWebSearchOptions?
 
     public init(
@@ -95,6 +96,7 @@ public struct CodexTurnOptions: Sendable, Equatable {
         usesResponsesLite: Bool = false,
         inputModalities: [String]? = nil,
         verbosity: CodexVerbosity? = nil,
+        availableModelOptions: [CodexModelOption] = [],
         webSearch: CodexWebSearchOptions? = nil
     ) {
         self.model = model
@@ -107,6 +109,7 @@ public struct CodexTurnOptions: Sendable, Equatable {
         self.usesResponsesLite = usesResponsesLite
         self.inputModalities = inputModalities
         self.verbosity = verbosity
+        self.availableModelOptions = availableModelOptions
         self.webSearch = webSearch
     }
 }

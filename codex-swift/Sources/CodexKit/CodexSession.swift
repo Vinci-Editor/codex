@@ -4,6 +4,8 @@ import CodexMobileCoreBridge
 import ImageIO
 import UniformTypeIdentifiers
 
+private let maxSubagentModelOverrideDescriptions = 8
+
 public struct CodexCompactionOptions: Codable, Sendable, Equatable, Hashable {
     public let automaticTriggerApproxTokens: Int?
 
@@ -558,6 +560,7 @@ public actor CodexSession {
             usesResponsesLite: inheritsParentModelMetadata ? parentOptions?.usesResponsesLite ?? false : false,
             inputModalities: inheritsParentModelMetadata ? parentOptions?.inputModalities : nil,
             verbosity: inheritsParentModelMetadata ? parentOptions?.verbosity : nil,
+            availableModelOptions: parentOptions?.availableModelOptions ?? [],
             webSearch: parentOptions?.webSearch
         )
     }
@@ -768,7 +771,7 @@ public actor CodexSession {
         }
         return hostedToolDefinitions(options: options)
             + builtinTools
-            + subagentToolDefinitions()
+            + subagentToolDefinitions(options: options)
             + configuration.tools.map { $0.responsesToolDefinition() }
     }
 
@@ -786,6 +789,100 @@ public actor CodexSession {
             return true
         }
         return inputModalities.contains { $0.lowercased() == "image" }
+    }
+
+    static func subagentModelOverrideDescription(options: CodexTurnOptions?) -> String {
+        let models = Array(subagentVisibleModelOptions(options: options).prefix(maxSubagentModelOverrideDescriptions))
+        guard !models.isEmpty else {
+            return "No picker-visible model overrides are currently loaded."
+        }
+
+        let lines = models.map { model in
+            let efforts = model.supportedReasoningEfforts
+                .map { effort in
+                    if effort.reasoningEffort == model.defaultReasoningEffort {
+                        return "\(effort.reasoningEffort) (default)"
+                    }
+                    return effort.reasoningEffort
+                }
+                .joined(separator: ", ")
+            let effortsSuffix = efforts.isEmpty ? "" : " Reasoning efforts: \(efforts)."
+            let serviceTiers = model.serviceTiers
+                .filter { $0.id != "default" }
+                .map(\.id)
+                .joined(separator: ", ")
+            let serviceTierSuffix = serviceTiers.isEmpty ? "" : " Service tiers: \(serviceTiers)."
+            let description = model.description.isEmpty ? model.displayName : model.description
+            return "- `\(model.model)`: \(description)\(effortsSuffix)\(serviceTierSuffix)"
+        }
+        return "Available model overrides (optional; inherited parent model is preferred):\n\(lines.joined(separator: "\n"))"
+    }
+
+    static func subagentInheritedModelGuidance(options: CodexTurnOptions?) -> String {
+        var parts: [String] = []
+        if let model = options?.model, !model.isEmpty {
+            parts.append("Omit `model` to inherit `\(model)`.")
+        }
+        if let effort = options?.reasoningEffort, !effort.isEmpty {
+            parts.append("Omit `reasoning_effort` to inherit `\(effort)`.")
+        }
+        if let serviceTier = options?.serviceTier, !serviceTier.isEmpty {
+            parts.append("Omit `service_tier` to inherit `\(serviceTier)`.")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private static func subagentVisibleModelOptions(options: CodexTurnOptions?) -> [CodexModelOption] {
+        let models = options?.availableModelOptions ?? []
+        var seen: Set<String> = []
+        return models.compactMap { model in
+            guard !model.isHidden, seen.insert(model.model).inserted else {
+                return nil
+            }
+            return model
+        }
+    }
+
+    private static func subagentModelOverrideValues(options: CodexTurnOptions?) -> [String] {
+        Array(subagentVisibleModelOptions(options: options)
+            .map(\.model)
+            .prefix(maxSubagentModelOverrideDescriptions))
+    }
+
+    private static func subagentReasoningEffortValues(options: CodexTurnOptions?) -> [String] {
+        let values = subagentVisibleModelOptions(options: options)
+            .flatMap { $0.supportedReasoningEfforts.map(\.reasoningEffort) }
+            + [options?.reasoningEffort].compactMap { $0 }
+        return orderedUnique(values)
+    }
+
+    private static func subagentServiceTierValues(options: CodexTurnOptions?) -> [String] {
+        let values = subagentVisibleModelOptions(options: options)
+            .flatMap { $0.serviceTiers.map(\.id) }
+            .filter { $0 != "default" }
+            + [options?.serviceTier].compactMap { $0 }
+        return orderedUnique(values)
+    }
+
+    private static func schemaStringProperty(description: String, enumValues: [String]) -> [String: Any] {
+        var property: [String: Any] = [
+            "type": "string",
+            "description": description,
+        ]
+        if !enumValues.isEmpty {
+            property["enum"] = enumValues
+        }
+        return property
+    }
+
+    private static func orderedUnique(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        return values.filter { value in
+            guard !value.isEmpty else {
+                return false
+            }
+            return seen.insert(value).inserted
+        }
     }
 
     private static func errorBody(from bytes: URLSession.AsyncBytes) async throws -> String {
@@ -827,7 +924,7 @@ public actor CodexSession {
         """
     }
 
-    private func subagentToolDefinitions() -> [[String: Any]] {
+    private func subagentToolDefinitions(options: CodexTurnOptions?) -> [[String: Any]] {
         guard configuration.subagentOptions.isEnabled else {
             return []
         }
@@ -860,11 +957,22 @@ public actor CodexSession {
             "type": "string",
             "description": "Plain-text message for the target agent.",
         ]
+        let modelValues = Self.subagentModelOverrideValues(options: options)
+        let reasoningEffortValues = Self.subagentReasoningEffortValues(options: options)
+        let serviceTierValues = Self.subagentServiceTierValues(options: options)
+        let spawnAgentDescription = [
+            "Spawn a child agent to work on the specified task. The child inherits the same workspace and tools and runs in the background.",
+            Self.subagentModelOverrideDescription(options: options),
+            Self.subagentInheritedModelGuidance(options: options),
+            "This session allows up to \(configuration.subagentOptions.maxOpenAgents) open subagents.",
+        ]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
 
         return [
             tool(
                 "spawn_agent",
-                "Spawn a child agent to work on the specified task. The child inherits the same workspace and tools and runs in the background.",
+                spawnAgentDescription,
                 [
                     "task_name": [
                         "type": "string",
@@ -878,18 +986,18 @@ public actor CodexSession {
                         "type": "string",
                         "description": "Optional history fork depth. Use none, all, or a positive integer string.",
                     ],
-                    "model": [
-                        "type": "string",
-                        "description": "Optional model override. Omit to inherit the parent session model.",
-                    ],
-                    "reasoning_effort": [
-                        "type": "string",
-                        "description": "Optional reasoning effort override. Omit to inherit the parent turn default.",
-                    ],
-                    "service_tier": [
-                        "type": "string",
-                        "description": "Optional service tier override.",
-                    ],
+                    "model": Self.schemaStringProperty(
+                        description: "Optional model override. Omit to inherit the parent turn model.",
+                        enumValues: modelValues
+                    ),
+                    "reasoning_effort": Self.schemaStringProperty(
+                        description: "Optional reasoning effort override. Omit to inherit the parent turn default.",
+                        enumValues: reasoningEffortValues
+                    ),
+                    "service_tier": Self.schemaStringProperty(
+                        description: "Optional service tier override.",
+                        enumValues: serviceTierValues
+                    ),
                 ],
                 required: ["task_name", "message"]
             ),
@@ -1604,10 +1712,15 @@ public actor CodexSession {
         )
         startSubagentTurn(id: id, message: message, options: options)
 
-        return CodexToolResult(output: try Self.jsonString([
+        var payload: [String: Any] = [
             "agent_id": id,
             "task_name": childPath,
-        ]))
+        ]
+        let modelSettings = Self.subagentModelSettingsPayload(options)
+        if !modelSettings.isEmpty {
+            payload["model_settings"] = modelSettings
+        }
+        return CodexToolResult(output: try Self.jsonString(payload))
     }
 
     private func executeSendMessage(_ call: CodexToolCall) throws -> CodexToolResult {
@@ -2087,6 +2200,10 @@ public actor CodexSession {
             "task_name": record.path,
             "status": record.status.rawValue,
         ]
+        let modelSettings = subagentModelSettingsPayload(record.turnOptions)
+        if !modelSettings.isEmpty {
+            payload["model_settings"] = modelSettings
+        }
         switch record.status {
         case .completed:
             payload["final_answer"] = record.finalAnswer ?? ""
@@ -2100,6 +2217,26 @@ public actor CodexSession {
         }
         if !record.queuedFollowups.isEmpty {
             payload["queued_followups"] = record.queuedFollowups.count
+        }
+        return payload
+    }
+
+    private static func subagentModelSettingsPayload(_ options: CodexTurnOptions?) -> [String: Any] {
+        var payload: [String: Any] = [:]
+        if let model = options?.model, !model.isEmpty {
+            payload["model"] = model
+        }
+        if let reasoningEffort = options?.reasoningEffort, !reasoningEffort.isEmpty {
+            payload["reasoning_effort"] = reasoningEffort
+        }
+        if let reasoningSummary = options?.reasoningSummary {
+            payload["reasoning_summary"] = reasoningSummary.rawValue
+        }
+        if let serviceTier = options?.serviceTier, !serviceTier.isEmpty {
+            payload["service_tier"] = serviceTier
+        }
+        if let verbosity = options?.verbosity {
+            payload["verbosity"] = verbosity.rawValue
         }
         return payload
     }
