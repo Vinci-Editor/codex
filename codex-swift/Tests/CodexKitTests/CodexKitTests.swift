@@ -312,6 +312,60 @@ func sessionRequestInputPrependsContextualUserInstructionsWithoutMutatingHistory
 }
 
 @Test
+func subagentEnvironmentContextSummarizesOpenSubagents() {
+    let context = CodexSession.subagentEnvironmentContext(statuses: [
+        CodexSubagentStatus(
+            agentID: "agent-1",
+            taskName: "research",
+            path: "/root/research",
+            status: "completed",
+            finalAnswer: "Found <three> options.\nUse \"fast\" mode.",
+            queuedMessages: 1,
+            modelSettings: ["model": "gpt-5.5"]
+        ),
+        CodexSubagentStatus(
+            agentID: "agent-2",
+            taskName: "closed",
+            path: "/root/closed",
+            status: "closed"
+        ),
+    ])
+
+    #expect(context?.contains("<environment_context>") == true)
+    #expect(context?.contains("<subagents>") == true)
+    #expect(context?.contains("- agent-1: research") == true)
+    #expect(context?.contains("path=/root/research") == true)
+    #expect(context?.contains("status=completed") == true)
+    #expect(context?.contains("queued_messages=1") == true)
+    #expect(context?.contains("model_settings={model=gpt-5.5}") == true)
+    #expect(context?.contains("Found &lt;three&gt; options. Use &quot;fast&quot; mode.") == true)
+    #expect(context?.contains("agent-2") == false)
+}
+
+@Test
+func subagentEnvironmentContextCapsAgentListAndFinalAnswerPreviews() {
+    let longAnswer = String(repeating: "a", count: 700)
+    let statuses = (1...10).map { index in
+        CodexSubagentStatus(
+            agentID: "agent-\(index)",
+            taskName: "task_\(index)",
+            path: "/root/task_\(index)",
+            status: index == 1 ? "completed" : "running",
+            finalAnswer: index == 1 ? longAnswer : nil
+        )
+    }
+
+    let context = CodexSession.subagentEnvironmentContext(statuses: statuses)
+
+    #expect(context?.contains("agent-1") == true)
+    #expect(context?.contains("agent-8") == true)
+    #expect(context?.contains("agent-9") == false)
+    #expect(context?.contains("- 2 more subagents available via list_agents") == true)
+    #expect(context?.contains(String(repeating: "a", count: 600) + "...") == true)
+    #expect(context?.contains(String(repeating: "a", count: 650)) == false)
+}
+
+@Test
 func projectInstructionsLoadRootToCurrentDirectoryAndPreferOverride() throws {
     let root = FileManager.default.temporaryDirectory
         .appending(path: UUID().uuidString, directoryHint: .isDirectory)

@@ -5,6 +5,8 @@ import ImageIO
 import UniformTypeIdentifiers
 
 private let maxSubagentModelOverrideDescriptions = 8
+private let maxSubagentEnvironmentContextAgents = 8
+private let maxSubagentEnvironmentContextPreviewCharacters = 600
 private typealias CodexSubagentStatusHandler = @Sendable (CodexSubagentStatus) async -> Void
 private typealias CodexSubagentEventHandler = @Sendable (CodexSubagentEvent) async -> Void
 
@@ -541,7 +543,7 @@ public actor CodexSession {
         from baseHistory: [[String: Any]],
         options: CodexTurnOptions?
     ) async throws -> String {
-        let compactionInput = requestInputHistory(from: baseHistory) + [
+        let compactionInput = requestInputHistory(from: baseHistory, includeDynamicContext: false) + [
             Self.message(role: "user", textType: "input_text", text: Self.compactionSummaryPrompt)
         ]
         let reasoning = Self.reasoningParameter(options: options)
@@ -872,11 +874,18 @@ public actor CodexSession {
             .joined(separator: "\n\n")
     }
 
-    private func requestInputHistory(from items: [[String: Any]]? = nil) -> [[String: Any]] {
-        Self.requestInputHistory(
+    private func requestInputHistory(
+        from items: [[String: Any]]? = nil,
+        includeDynamicContext: Bool = true
+    ) -> [[String: Any]] {
+        let input = Self.requestInputHistory(
             contextualUserInstructions: configuration.contextualUserInstructions,
             history: items ?? history
         )
+        guard includeDynamicContext, let subagentContextMessage = subagentEnvironmentContextMessage() else {
+            return input
+        }
+        return [subagentContextMessage] + input
     }
 
     static func requestInputHistory(
@@ -890,6 +899,93 @@ public actor CodexSession {
         return [
             message(role: "user", textType: "input_text", text: trimmedInstructions)
         ] + history
+    }
+
+    private func subagentEnvironmentContextMessage() -> [String: Any]? {
+        let statuses = subagents.values
+            .sorted { $0.createdOrder < $1.createdOrder }
+            .map(Self.subagentStatus)
+        guard let context = Self.subagentEnvironmentContext(statuses: statuses) else {
+            return nil
+        }
+        return Self.message(role: "user", textType: "input_text", text: context)
+    }
+
+    static func subagentEnvironmentContext(statuses: [CodexSubagentStatus]) -> String? {
+        let openStatuses = statuses.filter { $0.status != SubagentStatus.closed.rawValue }
+        guard !openStatuses.isEmpty else {
+            return nil
+        }
+
+        var lines = openStatuses
+            .prefix(maxSubagentEnvironmentContextAgents)
+            .map(subagentEnvironmentContextLine)
+        let hiddenCount = openStatuses.count - lines.count
+        if hiddenCount > 0 {
+            lines.append("- \(hiddenCount) more subagent\(hiddenCount == 1 ? "" : "s") available via list_agents")
+        }
+
+        let body = lines
+            .map { "    \($0)" }
+            .joined(separator: "\n")
+        return """
+        <environment_context>
+          <subagents>
+        \(body)
+          </subagents>
+        </environment_context>
+        """
+    }
+
+    private static func subagentEnvironmentContextLine(_ status: CodexSubagentStatus) -> String {
+        var parts = [
+            "- \(escapeEnvironmentContext(status.agentID)): \(escapeEnvironmentContext(subagentContextDisplayName(status)))",
+            "path=\(escapeEnvironmentContext(status.path))",
+            "status=\(escapeEnvironmentContext(status.status))",
+        ]
+        if status.queuedMessages > 0 {
+            parts.append("queued_messages=\(status.queuedMessages)")
+        }
+        if status.queuedFollowups > 0 {
+            parts.append("queued_followups=\(status.queuedFollowups)")
+        }
+        if !status.modelSettings.isEmpty {
+            let settings = status.modelSettings
+                .sorted { $0.key < $1.key }
+                .map { "\(escapeEnvironmentContext($0.key))=\(escapeEnvironmentContext($0.value))" }
+                .joined(separator: ",")
+            parts.append("model_settings={\(settings)}")
+        }
+        if let finalAnswer = status.finalAnswer, !finalAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append("final_answer_preview=\"\(subagentEnvironmentContextPreview(finalAnswer))\"")
+        }
+        if let error = status.error, !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append("error=\"\(subagentEnvironmentContextPreview(error))\"")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private static func subagentContextDisplayName(_ status: CodexSubagentStatus) -> String {
+        let candidate = status.taskName.isEmpty ? status.path : status.taskName
+        let trimmed = candidate.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return trimmed.split(separator: "/").last.map(String.init) ?? status.agentID
+    }
+
+    private static func subagentEnvironmentContextPreview(_ text: String) -> String {
+        let normalized = text
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        let prefix = String(normalized.prefix(maxSubagentEnvironmentContextPreviewCharacters))
+        let suffix = normalized.count > maxSubagentEnvironmentContextPreviewCharacters ? "..." : ""
+        return escapeEnvironmentContext(prefix + suffix)
+    }
+
+    private static func escapeEnvironmentContext(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
     }
 
     private func buildToolDefinitions(options: CodexTurnOptions?) -> [[String: Any]] {
