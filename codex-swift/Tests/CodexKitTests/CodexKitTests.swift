@@ -1190,6 +1190,7 @@ func portableShellSupportsJavaScriptRuntimeEntrypoints() async throws {
         node -e 'console.log(require("node:path").join("alpha", "beta"))'
         node -p '21 * 2'
         node --input-type=module -e 'import path from "node:path"; console.log(path.extname("file.swift"))'
+        node --input-type=module -e 'import { Workbook } from "@oai/artifact-tool"; const workbook = Workbook.create(); const sheet = workbook.worksheets.add("Smoke"); sheet.getRange("A1").values = [["runtime"]]; console.log(sheet.getRange("A1").values[0][0])'
         node script.mjs /tmp/report.txt
         """#,
         "maxOutputBytes": 64 * 1024,
@@ -1201,6 +1202,7 @@ func portableShellSupportsJavaScriptRuntimeEntrypoints() async throws {
     #expect(output.contains("alpha/beta\n"))
     #expect(output.contains("42\n"))
     #expect(output.contains(".swift\n"))
+    #expect(output.contains("runtime\n"))
     #expect(output.contains("report.txt\n"))
 }
 

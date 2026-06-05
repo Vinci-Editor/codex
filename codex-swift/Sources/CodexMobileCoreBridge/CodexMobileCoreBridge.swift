@@ -890,7 +890,7 @@ public enum CodexMobileCoreBridge {
             maxLoopIterations: 10_000,
             maxSubstitutionDepth: 50
         )
-        let bash = Bash(options: BashOptions(
+        var options = BashOptions(
             env: [
                 "HOME": "/",
                 "USER": "coder",
@@ -909,7 +909,9 @@ public enum CodexMobileCoreBridge {
             filesystem: fileSystem,
             allowedURLPrefixes: [],
             embeddedRuntimes: justBashEmbeddedRuntimes()
-        ))
+        )
+        options.enableOAIPrimaryRuntime()
+        let bash = Bash(options: options)
         await seedJailedCommandStubs(from: bash, into: fileSystem)
 
         let outcome = await runJustBash(command: command, bash: bash, timeoutMilliseconds: timeoutMilliseconds)
