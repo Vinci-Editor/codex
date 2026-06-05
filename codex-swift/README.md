@@ -309,7 +309,17 @@ let configuration = CodexSessionConfiguration(
     subagentOptions: CodexSubagentOptions(
         isEnabled: true,
         maxOpenAgents: 4,
-        maxDepth: nil
+        maxDepth: nil,
+        roles: [
+            .default,
+            .explorer,
+            CodexSubagentRole(
+                name: "reviewer",
+                description: "Review code and call out correctness risks.",
+                nicknameCandidates: ["Ada", "Grace"],
+                additionalInstructions: "Prioritize concrete bugs, regressions, and missing tests."
+            ),
+        ]
     )
 )
 ```
@@ -321,6 +331,13 @@ approval handler, and auth context. `fork_turns` can be `none`, `all`, or a
 positive integer string to control how much parent history is copied into the
 child session. Set `maxDepth` to cap recursive agent nesting; `nil` leaves
 nesting unlimited.
+
+`spawn_agent` accepts `agent_type` for configured roles. Roles can add
+role-specific developer instructions, lock a child model/reasoning/service tier,
+and provide nickname candidates that flow through subagent status events and
+`list_agents`. Full-history forks inherit the parent agent type, model, and
+reasoning effort, so use `fork_turns: "none"` or a positive integer when
+selecting a different `agent_type`.
 
 ## Thread Goals
 

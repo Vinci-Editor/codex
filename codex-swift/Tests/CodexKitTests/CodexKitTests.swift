@@ -318,6 +318,8 @@ func subagentEnvironmentContextSummarizesOpenSubagents() {
             agentID: "agent-1",
             taskName: "research",
             path: "/root/research",
+            agentRole: "explorer",
+            agentNickname: "Scout",
             status: "completed",
             finalAnswer: "Found <three> options.\nUse \"fast\" mode.",
             queuedMessages: 1,
@@ -333,9 +335,11 @@ func subagentEnvironmentContextSummarizesOpenSubagents() {
 
     #expect(context?.contains("<environment_context>") == true)
     #expect(context?.contains("<subagents>") == true)
-    #expect(context?.contains("- agent-1: research") == true)
+    #expect(context?.contains("- agent-1: Scout") == true)
     #expect(context?.contains("path=/root/research") == true)
     #expect(context?.contains("status=completed") == true)
+    #expect(context?.contains("agent_type=explorer") == true)
+    #expect(context?.contains("nickname=Scout") == true)
     #expect(context?.contains("queued_messages=1") == true)
     #expect(context?.contains("model_settings={model=gpt-5.5}") == true)
     #expect(context?.contains("Found &lt;three&gt; options. Use &quot;fast&quot; mode.") == true)
@@ -819,6 +823,68 @@ func subagentTurnOptionsInheritResponsesLiteMetadataWithoutModelOverride() {
 }
 
 @Test
+func subagentOptionsNormalizeRolesAndNicknames() {
+    let reviewer = CodexSubagentRole(
+        name: "reviewer",
+        description: "Review code.",
+        nicknameCandidates: ["Ada", "Ada", " Grace "],
+        model: "gpt-5.5"
+    )
+    let invalid = CodexSubagentRole(name: "bad role", description: "Invalid.")
+    let options = CodexSubagentOptions(isEnabled: true, roles: [reviewer, invalid])
+
+    #expect(options.roles.map(\.name) == ["default", "reviewer"])
+    #expect(options.roles[1].nicknameCandidates == ["Ada", "Grace"])
+    #expect(options.roles[1].model == "gpt-5.5")
+}
+
+@Test
+func subagentRoleDescriptionIncludesLockedSettings() {
+    let role = CodexSubagentRole(
+        name: "reviewer",
+        description: "Review code.",
+        model: "gpt-5.5",
+        reasoningEffort: "high",
+        serviceTier: "priority"
+    )
+    let description = CodexSession.subagentRoleDescription(roles: [role])
+
+    #expect(description.contains("Available agent types:"))
+    #expect(description.contains("`reviewer`: Review code."))
+    #expect(description.contains("model=gpt-5.5"))
+    #expect(description.contains("reasoning_effort=high"))
+    #expect(description.contains("service_tier=priority"))
+}
+
+@Test
+func subagentTurnOptionsApplyRoleOverrides() {
+    let parent = CodexTurnOptions(
+        model: "gpt-5.4",
+        reasoningEffort: "medium",
+        serviceTier: "standard",
+        verbosity: .high
+    )
+    let role = CodexSubagentRole(
+        name: "reviewer",
+        description: "Review code.",
+        model: "gpt-5.5",
+        reasoningEffort: "high",
+        serviceTier: "priority"
+    )
+
+    let options = CodexSession.subagentTurnOptions(
+        arguments: [:],
+        parentOptions: parent,
+        role: role
+    )
+
+    #expect(options.model == "gpt-5.5")
+    #expect(options.reasoningEffort == "high")
+    #expect(options.serviceTier == "priority")
+    #expect(options.verbosity == nil)
+}
+
+@Test
 func subagentTurnOptionValidationRejectsUnavailableOverrides() {
     let options = CodexTurnOptions(
         model: "gpt-5.5",
@@ -894,9 +960,14 @@ func subagentSpawnValidationRejectsFullHistoryModelOverrides() {
         arguments: ["fork_turns": "all", "reasoning_effort": "low"],
         parentOptions: options
     )
+    let explicitFullForkAgentType = CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["agent_type": "explorer"],
+        parentOptions: options
+    )
 
     #expect(defaultForkModelOverride?.contains("Full-history forked agents inherit") == true)
     #expect(explicitFullForkReasoningOverride?.contains("Full-history forked agents inherit") == true)
+    #expect(explicitFullForkAgentType?.contains("parent agent type") == true)
     #expect(CodexSession.subagentSpawnArgumentsValidationError(
         arguments: ["fork_turns": "none", "model": "gpt-5.5"],
         parentOptions: options
@@ -909,6 +980,33 @@ func subagentSpawnValidationRejectsFullHistoryModelOverrides() {
         arguments: ["fork_turns": "all", "service_tier": "priority"],
         parentOptions: options
     ) == nil)
+}
+
+@Test
+func subagentSpawnValidationRejectsRoleLockedOverrides() {
+    let role = CodexSubagentRole(
+        name: "reviewer",
+        description: "Review code.",
+        model: "gpt-5.5",
+        reasoningEffort: "high",
+        serviceTier: "priority"
+    )
+
+    #expect(CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["fork_turns": "none", "model": "gpt-5.4"],
+        parentOptions: nil,
+        role: role
+    ) == "agent_type `reviewer` sets its own model; omit model for spawn_agent.")
+    #expect(CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["fork_turns": "none", "reasoning_effort": "low"],
+        parentOptions: nil,
+        role: role
+    ) == "agent_type `reviewer` sets its own reasoning effort; omit reasoning_effort for spawn_agent.")
+    #expect(CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["fork_turns": "none", "service_tier": "standard"],
+        parentOptions: nil,
+        role: role
+    ) == "agent_type `reviewer` sets its own service tier; omit service_tier for spawn_agent.")
 }
 
 @Test

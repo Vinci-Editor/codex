@@ -214,6 +214,8 @@ public struct CodexSubagentStatus: Codable, Sendable, Equatable, Hashable, Ident
     public let agentID: String
     public let taskName: String
     public let path: String
+    public let agentRole: String?
+    public let agentNickname: String?
     public let status: String
     public let finalAnswer: String?
     public let error: String?
@@ -227,6 +229,8 @@ public struct CodexSubagentStatus: Codable, Sendable, Equatable, Hashable, Ident
         agentID: String,
         taskName: String,
         path: String,
+        agentRole: String? = nil,
+        agentNickname: String? = nil,
         status: String,
         finalAnswer: String? = nil,
         error: String? = nil,
@@ -237,6 +241,8 @@ public struct CodexSubagentStatus: Codable, Sendable, Equatable, Hashable, Ident
         self.agentID = agentID
         self.taskName = taskName
         self.path = path
+        self.agentRole = agentRole
+        self.agentNickname = agentNickname
         self.status = status
         self.finalAnswer = finalAnswer
         self.error = error
@@ -705,16 +711,23 @@ public actor CodexSession {
 
     static func subagentTurnOptions(
         arguments: [String: Any],
-        parentOptions: CodexTurnOptions?
+        parentOptions: CodexTurnOptions?,
+        role: CodexSubagentRole? = nil
     ) -> CodexTurnOptions {
-        let modelOverride = trimmedNonEmpty(arguments["model"] as? String)
+        let modelOverride = role?.model ?? trimmedNonEmpty(arguments["model"] as? String)
+        let reasoningEffort = role?.reasoningEffort
+            ?? trimmedNonEmpty(arguments["reasoning_effort"] as? String)
+            ?? parentOptions?.reasoningEffort
+        let serviceTier = role?.serviceTier
+            ?? trimmedNonEmpty(arguments["service_tier"] as? String)
+            ?? parentOptions?.serviceTier
         let inheritsParentModelMetadata = modelOverride == nil || modelOverride == parentOptions?.model
         return CodexTurnOptions(
             model: modelOverride ?? parentOptions?.model,
-            reasoningEffort: trimmedNonEmpty(arguments["reasoning_effort"] as? String) ?? parentOptions?.reasoningEffort,
+            reasoningEffort: reasoningEffort,
             reasoningSummary: inheritsParentModelMetadata ? parentOptions?.reasoningSummary : nil,
             supportsReasoningSummaries: inheritsParentModelMetadata ? parentOptions?.supportsReasoningSummaries : nil,
-            serviceTier: trimmedNonEmpty(arguments["service_tier"] as? String) ?? (inheritsParentModelMetadata ? parentOptions?.serviceTier : nil),
+            serviceTier: inheritsParentModelMetadata ? serviceTier : role?.serviceTier ?? trimmedNonEmpty(arguments["service_tier"] as? String),
             toolChoice: parentOptions?.toolChoice,
             parallelToolCalls: parentOptions?.parallelToolCalls,
             usesResponsesLite: inheritsParentModelMetadata ? parentOptions?.usesResponsesLite ?? false : false,
@@ -969,6 +982,12 @@ public actor CodexSession {
             "path=\(escapeEnvironmentContext(status.path))",
             "status=\(escapeEnvironmentContext(status.status))",
         ]
+        if let role = status.agentRole, !role.isEmpty {
+            parts.append("agent_type=\(escapeEnvironmentContext(role))")
+        }
+        if let nickname = status.agentNickname, !nickname.isEmpty {
+            parts.append("nickname=\(escapeEnvironmentContext(nickname))")
+        }
         if status.queuedMessages > 0 {
             parts.append("queued_messages=\(status.queuedMessages)")
         }
@@ -992,6 +1011,9 @@ public actor CodexSession {
     }
 
     private static func subagentContextDisplayName(_ status: CodexSubagentStatus) -> String {
+        if let nickname = status.agentNickname?.trimmingCharacters(in: .whitespacesAndNewlines), !nickname.isEmpty {
+            return nickname
+        }
         let candidate = status.taskName.isEmpty ? status.path : status.taskName
         let trimmed = candidate.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         return trimmed.split(separator: "/").last.map(String.init) ?? status.agentID
@@ -1085,6 +1107,30 @@ public actor CodexSession {
         return parts.joined(separator: " ")
     }
 
+    static func subagentRoleDescription(roles: [CodexSubagentRole]) -> String {
+        guard !roles.isEmpty else {
+            return ""
+        }
+        let lines = roles.map { role in
+            var details = role.description.isEmpty ? "no description" : role.description
+            if role.model != nil || role.reasoningEffort != nil || role.serviceTier != nil {
+                var locked: [String] = []
+                if let model = role.model {
+                    locked.append("model=\(model)")
+                }
+                if let reasoningEffort = role.reasoningEffort {
+                    locked.append("reasoning_effort=\(reasoningEffort)")
+                }
+                if let serviceTier = role.serviceTier {
+                    locked.append("service_tier=\(serviceTier)")
+                }
+                details += " Locked settings: \(locked.joined(separator: ", "))."
+            }
+            return "- `\(role.name)`: \(details)"
+        }
+        return "Available agent types:\n\(lines.joined(separator: "\n"))"
+    }
+
     private static func subagentVisibleModelOptions(options: CodexTurnOptions?) -> [CodexModelOption] {
         let models = options?.availableModelOptions ?? []
         var seen: Set<String> = []
@@ -1119,11 +1165,23 @@ public actor CodexSession {
 
     static func subagentTurnOptionsValidationError(
         arguments: [String: Any],
-        parentOptions: CodexTurnOptions?
+        parentOptions: CodexTurnOptions?,
+        role: CodexSubagentRole? = nil
     ) -> String? {
         let requestedModel = trimmedNonEmpty(arguments["model"] as? String)
         let requestedReasoningEffort = trimmedNonEmpty(arguments["reasoning_effort"] as? String)
         let requestedServiceTier = trimmedNonEmpty(arguments["service_tier"] as? String)
+        if let role {
+            if role.model != nil, requestedModel != nil {
+                return "agent_type `\(role.name)` sets its own model; omit model for spawn_agent."
+            }
+            if role.reasoningEffort != nil, requestedReasoningEffort != nil {
+                return "agent_type `\(role.name)` sets its own reasoning effort; omit reasoning_effort for spawn_agent."
+            }
+            if role.serviceTier != nil, requestedServiceTier != nil {
+                return "agent_type `\(role.name)` sets its own service tier; omit service_tier for spawn_agent."
+            }
+        }
         guard requestedModel != nil || requestedReasoningEffort != nil || requestedServiceTier != nil else {
             return nil
         }
@@ -1179,7 +1237,8 @@ public actor CodexSession {
 
     static func subagentSpawnArgumentsValidationError(
         arguments: [String: Any],
-        parentOptions: CodexTurnOptions?
+        parentOptions: CodexTurnOptions?,
+        role: CodexSubagentRole? = nil
     ) -> String? {
         if arguments["fork_context"] != nil {
             return "fork_context is not supported; use fork_turns instead."
@@ -1188,13 +1247,14 @@ public actor CodexSession {
             return forkTurnsError
         }
         if subagentUsesFullHistoryFork(arguments: arguments) {
+            let requestedRole = trimmedNonEmpty(arguments["agent_type"] as? String)
             let requestedModel = trimmedNonEmpty(arguments["model"] as? String)
             let requestedReasoningEffort = trimmedNonEmpty(arguments["reasoning_effort"] as? String)
-            if requestedModel != nil || requestedReasoningEffort != nil {
-                return "Full-history forked agents inherit the parent model and reasoning effort; omit model and reasoning_effort, or spawn with fork_turns set to none or a positive integer string."
+            if requestedRole != nil || requestedModel != nil || requestedReasoningEffort != nil {
+                return "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn with fork_turns set to none or a positive integer string."
             }
         }
-        return subagentTurnOptionsValidationError(arguments: arguments, parentOptions: parentOptions)
+        return subagentTurnOptionsValidationError(arguments: arguments, parentOptions: parentOptions, role: role)
     }
 
     private static func subagentForkTurnsValidationError(arguments: [String: Any]) -> String? {
@@ -1326,11 +1386,13 @@ public actor CodexSession {
         let modelValues = Self.subagentModelOverrideValues(options: options)
         let reasoningEffortValues = Self.subagentReasoningEffortValues(options: options)
         let serviceTierValues = Self.subagentServiceTierValues(options: options)
+        let roles = configuration.subagentOptions.roles
         let spawnAgentDescription = [
             "Spawn a child agent to work on the specified task. The child inherits the same workspace and tools and runs in the background.",
+            Self.subagentRoleDescription(roles: roles),
             Self.subagentModelOverrideDescription(options: options),
             Self.subagentInheritedModelGuidance(options: options),
-            "The default `fork_turns` is `all`. Full-history forked agents inherit the parent model and reasoning effort; omit `model` and `reasoning_effort` unless `fork_turns` is `none` or a positive integer string.",
+            "The default `fork_turns` is `all`. Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit `agent_type`, `model`, and `reasoning_effort` unless `fork_turns` is `none` or a positive integer string.",
             "This session allows up to \(configuration.subagentOptions.maxOpenAgents) open subagents.",
             configuration.subagentOptions.maxDepth.map { "This session allows subagent nesting up to depth \($0), where direct children of `/root` are depth 1." } ?? "",
         ]
@@ -1350,6 +1412,10 @@ public actor CodexSession {
                         "type": "string",
                         "description": "Initial plain-text task for the new agent.",
                     ],
+                    "agent_type": Self.schemaStringProperty(
+                        description: "Optional type name for the new agent. If omitted, `default` is used.",
+                        enumValues: roles.map(\.name)
+                    ),
                     "fork_turns": [
                         "type": "string",
                         "description": "Optional history fork depth. Use none, all, or a positive integer string. Defaults to all.",
@@ -2223,7 +2289,20 @@ public actor CodexSession {
         guard !message.isEmpty else {
             return CodexToolResult(output: "Missing message.", success: false)
         }
-        if let validationError = Self.subagentSpawnArgumentsValidationError(arguments: arguments, parentOptions: activeTurnOptions) {
+        let roleName = Self.trimmedNonEmpty(arguments["agent_type"] as? String) ?? CodexSubagentRole.default.name
+        guard CodexSubagentOptions.isValidRoleName(roleName) else {
+            return CodexToolResult(
+                output: "Invalid agent_type. Use letters, digits, underscores, or hyphens.",
+                success: false
+            )
+        }
+        guard let role = subagentRole(named: roleName) else {
+            return CodexToolResult(
+                output: "Unknown agent_type `\(roleName)`. Available agent types: \(Self.availableValuesDescription(configuration.subagentOptions.roles.map(\.name))).",
+                success: false
+            )
+        }
+        if let validationError = Self.subagentSpawnArgumentsValidationError(arguments: arguments, parentOptions: activeTurnOptions, role: role) {
             return CodexToolResult(output: validationError, success: false)
         }
 
@@ -2247,18 +2326,22 @@ public actor CodexSession {
         }
 
         subagentSequence += 1
+        let roleNameForStatus = role.name == CodexSubagentRole.default.name ? nil : role.name
+        let nickname = Self.subagentNickname(role: role, sequence: subagentSequence)
         let child = CodexSession(
-            configuration: configuration,
+            configuration: subagentConfiguration(role: role),
             snapshot: snapshot,
             agentPath: childPath,
             subagentRegistry: subagentRegistry
         )
-        let options = Self.subagentTurnOptions(arguments: arguments, parentOptions: activeTurnOptions)
+        let options = Self.subagentTurnOptions(arguments: arguments, parentOptions: activeTurnOptions, role: role)
 
         subagents[id] = SubagentRecord(
             id: id,
             taskName: taskName,
             path: childPath,
+            agentRole: roleNameForStatus,
+            agentNickname: nickname,
             session: child,
             status: .running,
             turnOptions: options,
@@ -2715,6 +2798,70 @@ public actor CodexSession {
         return subagents.values.first(where: { $0.path == canonical })?.id
     }
 
+    private func subagentRole(named name: String) -> CodexSubagentRole? {
+        configuration.subagentOptions.roles.first { $0.name == name }
+    }
+
+    private func subagentConfiguration(role: CodexSubagentRole) -> CodexSessionConfiguration {
+        guard let roleInstructions = Self.subagentRoleInstructions(role) else {
+            return configuration
+        }
+        let additionalDeveloperInstructions = [
+            configuration.additionalDeveloperInstructions,
+            roleInstructions,
+        ]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+
+        return CodexSessionConfiguration(
+            provider: configuration.provider,
+            model: configuration.model,
+            authStore: configuration.authStore,
+            apiKeyStore: configuration.apiKeyStore,
+            chatGPTAuthenticator: configuration.chatGPTAuthenticator,
+            workspace: configuration.workspace,
+            baseInstructionsOverride: configuration.baseInstructionsOverride,
+            additionalDeveloperInstructions: additionalDeveloperInstructions.isEmpty ? nil : additionalDeveloperInstructions,
+            contextualUserInstructions: configuration.contextualUserInstructions,
+            tools: configuration.tools,
+            subagentOptions: configuration.subagentOptions,
+            webSearch: configuration.webSearch,
+            compactionOptions: configuration.compactionOptions,
+            urlSession: configuration.urlSession,
+            toolApprovalHandler: configuration.toolApprovalHandler
+        )
+    }
+
+    private static func subagentRoleInstructions(_ role: CodexSubagentRole) -> String? {
+        if role.name == CodexSubagentRole.default.name, role.additionalInstructions == nil {
+            return nil
+        }
+        var parts: [String] = []
+        if role.name != CodexSubagentRole.default.name {
+            parts.append("You are a `\(role.name)` subagent.")
+        }
+        if !role.description.isEmpty {
+            parts.append(role.description)
+        }
+        if let additionalInstructions = role.additionalInstructions {
+            parts.append(additionalInstructions)
+        }
+        let text = parts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        return text.isEmpty ? nil : text
+    }
+
+    private static func subagentNickname(role: CodexSubagentRole, sequence: Int) -> String? {
+        guard !role.nicknameCandidates.isEmpty else {
+            return nil
+        }
+        let index = max(0, sequence - 1) % role.nicknameCandidates.count
+        return role.nicknameCandidates[index]
+    }
+
     private func waitTimeoutMilliseconds(from arguments: [String: Any]) -> Int {
         let options = configuration.subagentOptions
         let requested = Self.intValue(arguments["timeout_ms"]) ?? options.defaultWaitTimeoutMilliseconds
@@ -2860,6 +3007,14 @@ public actor CodexSession {
             "task_name": status.path,
             "status": status.status,
         ]
+        if let agentRole = status.agentRole {
+            payload["agent_type"] = agentRole
+            payload["agent_role"] = agentRole
+        }
+        if let agentNickname = status.agentNickname {
+            payload["nickname"] = agentNickname
+            payload["agent_nickname"] = agentNickname
+        }
         if !status.modelSettings.isEmpty {
             payload["model_settings"] = status.modelSettings
         }
@@ -2883,6 +3038,8 @@ public actor CodexSession {
             agentID: record.id,
             taskName: record.taskName,
             path: record.path,
+            agentRole: record.agentRole,
+            agentNickname: record.agentNickname,
             status: record.status.rawValue,
             finalAnswer: record.status == .completed ? record.finalAnswer ?? "" : nil,
             error: record.status == .failed ? record.errorMessage ?? "Subagent failed." : nil,
@@ -3254,6 +3411,8 @@ private struct SubagentRecord {
     let id: String
     let taskName: String
     let path: String
+    let agentRole: String?
+    let agentNickname: String?
     let session: CodexSession
     var status: SubagentStatus
     var task: Task<Void, Never>?
