@@ -293,6 +293,38 @@ func sessionDecodesAssistantItemLifecycle() throws {
 }
 
 @Test
+func sessionDecodesCompletedTokenUsage() throws {
+    let normalized = try CodexMobileCoreBridge.parseSSEEvent(Data("""
+    {
+      "type": "response.completed",
+      "response": {
+        "id": "resp-1",
+        "usage": {
+          "input_tokens": 120,
+          "input_tokens_details": { "cached_tokens": 40 },
+          "output_tokens": 30,
+          "output_tokens_details": { "reasoning_tokens": 12 },
+          "total_tokens": 150
+        }
+      }
+    }
+    """.utf8))
+
+    guard case .completed(_, let usage) = try CodexSession.decodeStreamEvent(normalized) else {
+        Issue.record("Expected completed event")
+        return
+    }
+
+    #expect(usage == CodexTokenUsage(
+        inputTokens: 120,
+        cachedInputTokens: 40,
+        outputTokens: 30,
+        reasoningOutputTokens: 12,
+        totalTokens: 150
+    ))
+}
+
+@Test
 func sessionPreservesCustomToolCallKind() throws {
     let event = try CodexSession.decodeStreamEvent([
         "type": "outputItemDone",

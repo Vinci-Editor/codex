@@ -347,10 +347,10 @@ Update your UI as events arrive:
 ```swift
 for try await event in stream {
     switch event {
-    case .outputTextDelta(let delta):
+    case .outputTextDelta(_, let delta):
         assistantMessage += delta
 
-    case .reasoningSummaryDelta(let delta):
+    case .reasoningSummaryDelta(_, let delta):
         reasoningSummary += delta
 
     case .toolCallInputDelta(_, _, let delta):
@@ -362,7 +362,16 @@ for try await event in stream {
     case .toolResult(let call, let output, let success):
         showToolFinished(name: call.name, output: output, success: success)
 
-    case .completed:
+    case .completed(_, let tokenUsage):
+        if let tokenUsage {
+            showTokenUsage(
+                input: tokenUsage.inputTokens,
+                cachedInput: tokenUsage.cachedInputTokens,
+                output: tokenUsage.outputTokens,
+                reasoningOutput: tokenUsage.reasoningOutputTokens,
+                total: tokenUsage.totalTokens
+            )
+        }
         finishAssistantMessage()
 
     case .error(let message):

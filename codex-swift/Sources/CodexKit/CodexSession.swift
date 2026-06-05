@@ -120,7 +120,7 @@ public enum CodexStreamEvent: Sendable, Equatable {
     case toolOutputDelta(CodexToolCall, String)
     case outputItemAdded(Data)
     case outputItemDone(Data)
-    case completed(Data)
+    case completed(Data, CodexTokenUsage?)
     case toolCall(CodexToolCall)
     case toolResult(CodexToolCall, String, Bool)
     case error(String)
@@ -385,7 +385,7 @@ public actor CodexSession {
                 break
             }
             continuation.yield(event)
-            if case .completed = event {
+            if case .completed(_, _) = event {
                 break
             }
         }
@@ -468,7 +468,7 @@ public actor CodexSession {
             }
             return .outputItemDone(normalizedData)
         case "completed":
-            return .completed(normalizedData)
+            return .completed(normalizedData, CodexTokenUsage.completedResponseUsage(from: normalized))
         case "error":
             return .error(String(decoding: normalizedData, as: UTF8.self))
         default:
