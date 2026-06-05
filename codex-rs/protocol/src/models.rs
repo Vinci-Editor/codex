@@ -1,9 +1,7 @@
 use std::collections::HashMap;
-use std::fmt;
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::path::PathBuf;
 
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::load_for_prompt_bytes;
@@ -27,60 +25,6 @@ use codex_utils_image::ImageProcessingError;
 use schemars::JsonSchema;
 
 use crate::mcp::CallToolResult;
-
-type CommitID = String;
-
-/// Details of a ghost commit created from a repository state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
-pub struct GhostCommit {
-    id: CommitID,
-    parent: Option<CommitID>,
-    preexisting_untracked_files: Vec<PathBuf>,
-    preexisting_untracked_dirs: Vec<PathBuf>,
-}
-
-impl GhostCommit {
-    /// Create a new ghost commit wrapper from a raw commit ID and optional parent.
-    pub fn new(
-        id: CommitID,
-        parent: Option<CommitID>,
-        preexisting_untracked_files: Vec<PathBuf>,
-        preexisting_untracked_dirs: Vec<PathBuf>,
-    ) -> Self {
-        Self {
-            id,
-            parent,
-            preexisting_untracked_files,
-            preexisting_untracked_dirs,
-        }
-    }
-
-    /// Commit ID for the snapshot.
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// Parent commit ID, if the repository had a `HEAD` at creation time.
-    pub fn parent(&self) -> Option<&str> {
-        self.parent.as_deref()
-    }
-
-    /// Untracked or ignored files that already existed when the snapshot was captured.
-    pub fn preexisting_untracked_files(&self) -> &[PathBuf] {
-        &self.preexisting_untracked_files
-    }
-
-    /// Untracked or ignored directories that already existed when the snapshot was captured.
-    pub fn preexisting_untracked_dirs(&self) -> &[PathBuf] {
-        &self.preexisting_untracked_dirs
-    }
-}
-
-impl fmt::Display for GhostCommit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.id)
-    }
-}
 
 /// Controls the per-command sandbox override requested by a shell-like tool call.
 #[derive(
@@ -182,7 +126,7 @@ impl FileSystemPermissions {
             match entry.access {
                 FileSystemAccessMode::Read => read.push(path.clone()),
                 FileSystemAccessMode::Write => write.push(path.clone()),
-                FileSystemAccessMode::None => return None,
+                FileSystemAccessMode::Deny => return None,
             }
         }
 
@@ -266,43 +210,388 @@ impl NetworkPermissions {
     }
 }
 
+/// Partial permission overlay used for per-command requests and approved
+/// session/turn grants.
 #[derive(Debug, Clone, Default, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
-pub struct PermissionProfile {
+pub struct AdditionalPermissionProfile {
     pub network: Option<NetworkPermissions>,
     pub file_system: Option<FileSystemPermissions>,
 }
 
-impl PermissionProfile {
+impl AdditionalPermissionProfile {
     pub fn is_empty(&self) -> bool {
         self.network.is_none() && self.file_system.is_none()
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema, TS,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxEnforcement {
+    /// Codex owns sandbox construction for this profile.
+    #[default]
+    Managed,
+    /// No outer filesystem sandbox should be applied.
+    Disabled,
+    /// Filesystem isolation is enforced by an external caller.
+    External,
+}
+
+impl SandboxEnforcement {
+    pub fn from_legacy_sandbox_policy(sandbox_policy: &SandboxPolicy) -> Self {
+        match sandbox_policy {
+            SandboxPolicy::DangerFullAccess => Self::Disabled,
+            SandboxPolicy::ExternalSandbox { .. } => Self::External,
+            SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. } => Self::Managed,
+        }
+    }
+}
+
+/// Filesystem permissions for profiles where Codex owns sandbox construction.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(tag = "type")]
+pub enum ManagedFileSystemPermissions {
+    /// Apply a managed filesystem sandbox from the listed entries.
+    #[serde(rename_all = "snake_case")]
+    #[ts(rename_all = "snake_case")]
+    Restricted {
+        entries: Vec<FileSystemSandboxEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        glob_scan_max_depth: Option<NonZeroUsize>,
+    },
+    /// Apply a managed sandbox that allows all filesystem access.
+    Unrestricted,
+}
+
+impl ManagedFileSystemPermissions {
+    fn from_sandbox_policy(file_system_sandbox_policy: &FileSystemSandboxPolicy) -> Self {
+        match file_system_sandbox_policy.kind {
+            FileSystemSandboxKind::Restricted => Self::Restricted {
+                entries: file_system_sandbox_policy.entries.clone(),
+                glob_scan_max_depth: file_system_sandbox_policy
+                    .glob_scan_max_depth
+                    .and_then(NonZeroUsize::new),
+            },
+            FileSystemSandboxKind::Unrestricted => Self::Unrestricted,
+            FileSystemSandboxKind::ExternalSandbox => unreachable!(
+                "external filesystem policies are represented by PermissionProfile::External"
+            ),
+        }
+    }
+
+    pub fn to_sandbox_policy(&self) -> FileSystemSandboxPolicy {
+        match self {
+            Self::Restricted {
+                entries,
+                glob_scan_max_depth,
+            } => FileSystemSandboxPolicy {
+                kind: FileSystemSandboxKind::Restricted,
+                glob_scan_max_depth: glob_scan_max_depth.map(usize::from),
+                entries: entries.clone(),
+            },
+            Self::Unrestricted => FileSystemSandboxPolicy::unrestricted(),
+        }
+    }
+}
+
+/// Reserved identifier for the built-in read-only permission profile.
+pub const BUILT_IN_PERMISSION_PROFILE_READ_ONLY: &str = ":read-only";
+
+/// Reserved identifier for the built-in workspace-write permission profile.
+pub const BUILT_IN_PERMISSION_PROFILE_WORKSPACE: &str = ":workspace";
+
+/// Reserved identifier for the built-in full-access permission profile.
+pub const BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS: &str = ":danger-full-access";
+
+/// Canonical active runtime permissions for a conversation, turn, or command.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(tag = "type")]
+pub enum PermissionProfile {
+    /// Codex owns sandbox construction for this profile.
+    #[serde(rename_all = "snake_case")]
+    #[ts(rename_all = "snake_case")]
+    Managed {
+        file_system: ManagedFileSystemPermissions,
+        network: NetworkSandboxPolicy,
+    },
+    /// Do not apply an outer sandbox.
+    Disabled,
+    /// Filesystem isolation is enforced by an external caller.
+    #[serde(rename_all = "snake_case")]
+    #[ts(rename_all = "snake_case")]
+    External { network: NetworkSandboxPolicy },
+}
+
+/// Metadata for the named or implicit built-in permissions profile that
+/// produced the active `PermissionProfile`.
+///
+/// The runtime must honor `PermissionProfile`; this sidecar exists so clients
+/// can display stable profile identity without trying to reverse-engineer a
+/// name from the compiled permissions.
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ActivePermissionProfile {
+    /// Profile identifier from `default_permissions` or the implicit built-in
+    /// default, such as `:workspace` or a user-defined `[permissions.<id>]`
+    /// profile.
+    pub id: String,
+
+    /// Optional parent profile identifier from the selected permissions
+    /// profile's `extends` setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub extends: Option<String>,
+}
+
+impl ActivePermissionProfile {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            extends: None,
+        }
+    }
+
+    pub fn read_only() -> Self {
+        Self::new(BUILT_IN_PERMISSION_PROFILE_READ_ONLY)
+    }
+}
+
+impl Default for PermissionProfile {
+    fn default() -> Self {
+        Self::Managed {
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries: Vec::new(),
+                glob_scan_max_depth: None,
+            },
+            network: NetworkSandboxPolicy::Restricted,
+        }
+    }
+}
+
+impl PermissionProfile {
+    /// Managed read-only filesystem access with restricted network access.
+    pub fn read_only() -> Self {
+        let file_system = FileSystemSandboxPolicy::read_only();
+        Self::Managed {
+            file_system: ManagedFileSystemPermissions::from_sandbox_policy(&file_system),
+            network: NetworkSandboxPolicy::Restricted,
+        }
+    }
+
+    /// Managed workspace-write filesystem access with restricted network
+    /// access.
+    ///
+    /// The returned profile contains symbolic `:workspace_roots` entries that
+    /// must be resolved against the active permission root before enforcement.
+    pub fn workspace_write() -> Self {
+        Self::workspace_write_with(
+            &[],
+            NetworkSandboxPolicy::Restricted,
+            /*exclude_tmpdir_env_var*/ false,
+            /*exclude_slash_tmp*/ false,
+        )
+    }
+
+    /// Managed workspace-write filesystem access with the legacy
+    /// `sandbox_workspace_write` knobs applied directly to the profile.
+    ///
+    /// The returned profile contains symbolic `:workspace_roots` entries that
+    /// must be resolved against the active permission root before enforcement.
+    pub fn workspace_write_with(
+        writable_roots: &[AbsolutePathBuf],
+        network: NetworkSandboxPolicy,
+        exclude_tmpdir_env_var: bool,
+        exclude_slash_tmp: bool,
+    ) -> Self {
+        let file_system = FileSystemSandboxPolicy::workspace_write(
+            writable_roots,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+        );
+        Self::Managed {
+            file_system: ManagedFileSystemPermissions::from_sandbox_policy(&file_system),
+            network,
+        }
+    }
+
+    pub fn materialize_project_roots_with_workspace_roots(
+        self,
+        workspace_roots: &[AbsolutePathBuf],
+    ) -> Self {
+        match self {
+            Self::Managed {
+                file_system,
+                network,
+            } => {
+                let file_system = file_system
+                    .to_sandbox_policy()
+                    .materialize_project_roots_with_workspace_roots(workspace_roots);
+                Self::Managed {
+                    file_system: ManagedFileSystemPermissions::from_sandbox_policy(&file_system),
+                    network,
+                }
+            }
+            Self::Disabled => Self::Disabled,
+            Self::External { network } => Self::External { network },
+        }
     }
 
     pub fn from_runtime_permissions(
         file_system_sandbox_policy: &FileSystemSandboxPolicy,
         network_sandbox_policy: NetworkSandboxPolicy,
     ) -> Self {
-        Self {
-            network: Some(network_sandbox_policy.into()),
-            file_system: Some(file_system_sandbox_policy.into()),
+        let enforcement = match file_system_sandbox_policy.kind {
+            FileSystemSandboxKind::Restricted | FileSystemSandboxKind::Unrestricted => {
+                SandboxEnforcement::Managed
+            }
+            FileSystemSandboxKind::ExternalSandbox => SandboxEnforcement::External,
+        };
+        Self::from_runtime_permissions_with_enforcement(
+            enforcement,
+            file_system_sandbox_policy,
+            network_sandbox_policy,
+        )
+    }
+
+    pub fn from_runtime_permissions_with_enforcement(
+        enforcement: SandboxEnforcement,
+        file_system_sandbox_policy: &FileSystemSandboxPolicy,
+        network_sandbox_policy: NetworkSandboxPolicy,
+    ) -> Self {
+        match file_system_sandbox_policy.kind {
+            FileSystemSandboxKind::ExternalSandbox => Self::External {
+                network: network_sandbox_policy,
+            },
+            FileSystemSandboxKind::Unrestricted if enforcement == SandboxEnforcement::Disabled => {
+                Self::Disabled
+            }
+            FileSystemSandboxKind::Restricted | FileSystemSandboxKind::Unrestricted => {
+                Self::Managed {
+                    file_system: ManagedFileSystemPermissions::from_sandbox_policy(
+                        file_system_sandbox_policy,
+                    ),
+                    network: network_sandbox_policy,
+                }
+            }
         }
     }
 
-    pub fn from_legacy_sandbox_policy(sandbox_policy: &SandboxPolicy, cwd: &Path) -> Self {
-        Self::from_runtime_permissions(
-            &FileSystemSandboxPolicy::from_legacy_sandbox_policy(sandbox_policy, cwd),
+    pub fn from_legacy_sandbox_policy(sandbox_policy: &SandboxPolicy) -> Self {
+        Self::from_runtime_permissions_with_enforcement(
+            SandboxEnforcement::from_legacy_sandbox_policy(sandbox_policy),
+            &FileSystemSandboxPolicy::from(sandbox_policy),
             NetworkSandboxPolicy::from(sandbox_policy),
         )
     }
 
-    pub fn file_system_sandbox_policy(&self) -> FileSystemSandboxPolicy {
-        self.file_system.as_ref().map_or_else(
-            || FileSystemSandboxPolicy::restricted(Vec::new()),
-            FileSystemSandboxPolicy::from,
+    pub fn from_legacy_sandbox_policy_for_cwd(sandbox_policy: &SandboxPolicy, cwd: &Path) -> Self {
+        Self::from_runtime_permissions_with_enforcement(
+            SandboxEnforcement::from_legacy_sandbox_policy(sandbox_policy),
+            &FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(sandbox_policy, cwd),
+            NetworkSandboxPolicy::from(sandbox_policy),
         )
     }
 
+    pub fn enforcement(&self) -> SandboxEnforcement {
+        match self {
+            Self::Managed { .. } => SandboxEnforcement::Managed,
+            Self::Disabled => SandboxEnforcement::Disabled,
+            Self::External { .. } => SandboxEnforcement::External,
+        }
+    }
+
+    pub fn file_system_sandbox_policy(&self) -> FileSystemSandboxPolicy {
+        match self {
+            Self::Managed { file_system, .. } => file_system.to_sandbox_policy(),
+            Self::Disabled => FileSystemSandboxPolicy::unrestricted(),
+            Self::External { .. } => FileSystemSandboxPolicy::external_sandbox(),
+        }
+    }
+
     pub fn network_sandbox_policy(&self) -> NetworkSandboxPolicy {
-        if self
+        match self {
+            Self::Managed { network, .. } | Self::External { network } => *network,
+            Self::Disabled => NetworkSandboxPolicy::Enabled,
+        }
+    }
+
+    pub fn to_legacy_sandbox_policy(&self, cwd: &Path) -> io::Result<SandboxPolicy> {
+        match self {
+            Self::Managed {
+                file_system,
+                network,
+            } => file_system
+                .to_sandbox_policy()
+                .to_legacy_sandbox_policy(*network, cwd),
+            Self::Disabled => Ok(SandboxPolicy::DangerFullAccess),
+            Self::External { network } => Ok(SandboxPolicy::ExternalSandbox {
+                network_access: if network.is_enabled() {
+                    crate::protocol::NetworkAccess::Enabled
+                } else {
+                    crate::protocol::NetworkAccess::Restricted
+                },
+            }),
+        }
+    }
+
+    pub fn to_runtime_permissions(&self) -> (FileSystemSandboxPolicy, NetworkSandboxPolicy) {
+        (
+            self.file_system_sandbox_policy(),
+            self.network_sandbox_policy(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TaggedPermissionProfile {
+    #[serde(rename_all = "snake_case")]
+    Managed {
+        file_system: ManagedFileSystemPermissions,
+        network: NetworkSandboxPolicy,
+    },
+    Disabled,
+    #[serde(rename_all = "snake_case")]
+    External {
+        network: NetworkSandboxPolicy,
+    },
+}
+
+impl From<TaggedPermissionProfile> for PermissionProfile {
+    fn from(value: TaggedPermissionProfile) -> Self {
+        match value {
+            TaggedPermissionProfile::Managed {
+                file_system,
+                network,
+            } => Self::Managed {
+                file_system,
+                network,
+            },
+            TaggedPermissionProfile::Disabled => Self::Disabled,
+            TaggedPermissionProfile::External { network } => Self::External { network },
+        }
+    }
+}
+
+/// Pre-tagged shape written to rollout files before `PermissionProfile`
+/// represented enforcement explicitly.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPermissionProfile {
+    network: Option<NetworkPermissions>,
+    file_system: Option<FileSystemPermissions>,
+}
+
+impl From<LegacyPermissionProfile> for PermissionProfile {
+    fn from(value: LegacyPermissionProfile) -> Self {
+        let file_system_sandbox_policy = value.file_system.as_ref().map_or_else(
+            || FileSystemSandboxPolicy::restricted(Vec::new()),
+            FileSystemSandboxPolicy::from,
+        );
+        let network_sandbox_policy = if value
             .network
             .as_ref()
             .and_then(|network| network.enabled)
@@ -311,12 +600,27 @@ impl PermissionProfile {
             NetworkSandboxPolicy::Enabled
         } else {
             NetworkSandboxPolicy::Restricted
-        }
+        };
+        Self::from_runtime_permissions(&file_system_sandbox_policy, network_sandbox_policy)
     }
+}
 
-    pub fn to_legacy_sandbox_policy(&self, cwd: &Path) -> io::Result<SandboxPolicy> {
-        self.file_system_sandbox_policy()
-            .to_legacy_sandbox_policy(self.network_sandbox_policy(), cwd)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum PermissionProfileDe {
+    Tagged(TaggedPermissionProfile),
+    Legacy(LegacyPermissionProfile),
+}
+
+impl<'de> Deserialize<'de> for PermissionProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match PermissionProfileDe::deserialize(deserializer)? {
+            PermissionProfileDe::Tagged(tagged) => tagged.into(),
+            PermissionProfileDe::Legacy(legacy) => legacy.into(),
+        })
     }
 }
 
@@ -362,6 +666,9 @@ pub enum ResponseInputItem {
     Message {
         role: String,
         content: Vec<ContentItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        phase: Option<MessagePhase>,
     },
     FunctionCallOutput {
         call_id: String,
@@ -444,10 +751,6 @@ pub enum ResponseItem {
         id: Option<String>,
         role: String,
         content: Vec<ContentItem>,
-        // Do not use directly, no available consistently across all providers.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        end_turn: Option<bool>,
         // Optional output-message phase (for example: "commentary", "final_answer").
         // Availability varies by provider/model, so downstream consumers must
         // preserve fallback behavior when this is absent.
@@ -580,16 +883,25 @@ pub enum ResponseItem {
         revised_prompt: Option<String>,
         result: String,
     },
-    // Generated by the harness but considered exactly as a model response.
-    GhostSnapshot {
-        ghost_commit: GhostCommit,
-    },
     #[serde(alias = "compaction_summary")]
     Compaction {
         encrypted_content: String,
     },
+    CompactionTrigger,
+    ContextCompaction {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_content: Option<String>,
+    },
     #[serde(other)]
     Other,
+}
+
+impl ResponseItem {
+    /// Returns whether this item is an ordinary user-role message.
+    pub fn is_user_message(&self) -> bool {
+        matches!(self, Self::Message { role, .. } if role == "user")
+    }
 }
 
 pub const BASE_INSTRUCTIONS_DEFAULT: &str = include_str!("prompts/base_instructions/default.md");
@@ -707,9 +1019,10 @@ pub fn local_image_label_text(label_number: usize) -> String {
     format!("[Image #{label_number}]")
 }
 
-pub fn local_image_open_tag_text(label_number: usize) -> String {
+pub fn local_image_open_tag_text_with_path(label_number: usize, path: &std::path::Path) -> String {
     let label = local_image_label_text(label_number);
-    format!("{LOCAL_IMAGE_OPEN_TAG_PREFIX}{label}{LOCAL_IMAGE_OPEN_TAG_SUFFIX}")
+    let path = path.display();
+    format!("{LOCAL_IMAGE_OPEN_TAG_PREFIX}{label} path=\"{path}\"{LOCAL_IMAGE_OPEN_TAG_SUFFIX}")
 }
 
 pub fn is_local_image_open_tag_text(text: &str) -> bool {
@@ -756,19 +1069,24 @@ pub fn local_image_content_items_with_label_number(
     path: &std::path::Path,
     file_bytes: Vec<u8>,
     label_number: Option<usize>,
-    mode: PromptImageMode,
+    detail: ImageDetail,
 ) -> Vec<ContentItem> {
+    let mode = match detail {
+        ImageDetail::Original => PromptImageMode::Original,
+        ImageDetail::Auto | ImageDetail::Low | ImageDetail::High => PromptImageMode::ResizeToFit,
+    };
+
     match load_for_prompt_bytes(path, file_bytes, mode) {
         Ok(image) => {
             let mut items = Vec::with_capacity(3);
             if let Some(label_number) = label_number {
                 items.push(ContentItem::InputText {
-                    text: local_image_open_tag_text(label_number),
+                    text: local_image_open_tag_text_with_path(label_number, path),
                 });
             }
             items.push(ContentItem::InputImage {
                 image_url: image.into_data_url(),
-                detail: Some(DEFAULT_IMAGE_DETAIL),
+                detail: Some(detail),
             });
             if label_number.is_some() {
                 items.push(ContentItem::InputText {
@@ -797,12 +1115,15 @@ pub fn local_image_content_items_with_label_number(
 impl From<ResponseInputItem> for ResponseItem {
     fn from(item: ResponseInputItem) -> Self {
         match item {
-            ResponseInputItem::Message { role, content } => Self::Message {
+            ResponseInputItem::Message {
+                role,
+                content,
+                phase,
+            } => Self::Message {
                 role,
                 content,
                 id: None,
-                end_turn: None,
-                phase: None,
+                phase,
             },
             ResponseInputItem::FunctionCallOutput { call_id, output } => {
                 Self::FunctionCallOutput { call_id, output }
@@ -910,29 +1231,25 @@ impl From<Vec<UserInput>> for ResponseInputItem {
                 .into_iter()
                 .flat_map(|c| match c {
                     UserInput::Text { text, .. } => vec![ContentItem::InputText { text }],
-                    UserInput::Image { image_url } => {
+                    UserInput::Image {
+                        image_url, detail, ..
+                    } => {
                         image_index += 1;
-                        vec![
-                            ContentItem::InputText {
-                                text: image_open_tag_text(),
-                            },
-                            ContentItem::InputImage {
-                                image_url,
-                                detail: Some(DEFAULT_IMAGE_DETAIL),
-                            },
-                            ContentItem::InputText {
-                                text: image_close_tag_text(),
-                            },
-                        ]
+                        let detail = detail.unwrap_or(DEFAULT_IMAGE_DETAIL);
+                        vec![ContentItem::InputImage {
+                            image_url,
+                            detail: Some(detail),
+                        }]
                     }
-                    UserInput::LocalImage { path } => {
+                    UserInput::LocalImage { path, detail, .. } => {
                         image_index += 1;
+                        let detail = detail.unwrap_or(DEFAULT_IMAGE_DETAIL);
                         match std::fs::read(&path) {
                             Ok(file_bytes) => local_image_content_items_with_label_number(
                                 &path,
                                 file_bytes,
                                 Some(image_index),
-                                PromptImageMode::ResizeToFit,
+                                detail,
                             ),
                             Err(err) => vec![local_image_error_placeholder(&path, err)],
                         }
@@ -940,6 +1257,7 @@ impl From<Vec<UserInput>> for ResponseInputItem {
                     UserInput::Skill { .. } | UserInput::Mention { .. } => Vec::new(), // Tool bodies are injected later in core
                 })
                 .collect::<Vec<ContentItem>>(),
+            phase: None,
         }
     }
 }
@@ -949,30 +1267,6 @@ pub struct SearchToolCallParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub limit: Option<usize>,
-}
-
-/// If the `name` of a `ResponseItem::FunctionCall` is either `container.exec`
-/// or `shell`, the `arguments` field should deserialize to this struct.
-#[derive(Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-pub struct ShellToolCallParams {
-    pub command: Vec<String>,
-    pub workdir: Option<String>,
-
-    /// This is the maximum time in milliseconds that the command is allowed to run.
-    #[serde(alias = "timeout")]
-    pub timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub sandbox_permissions: Option<SandboxPermissions>,
-    /// Suggests a command prefix to persist for future sessions
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub prefix_rule: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub additional_permissions: Option<PermissionProfile>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub justification: Option<String>,
 }
 
 /// If the `name` of a `ResponseItem::FunctionCall` is `shell_command`, the
@@ -996,7 +1290,7 @@ pub struct ShellCommandToolCallParams {
     pub prefix_rule: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub additional_permissions: Option<PermissionProfile>,
+    pub additional_permissions: Option<AdditionalPermissionProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub justification: Option<String>,
 }
@@ -1016,6 +1310,9 @@ pub enum FunctionCallOutputContentItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         detail: Option<ImageDetail>,
+    },
+    EncryptedContent {
+        encrypted_content: String,
     },
 }
 
@@ -1040,7 +1337,8 @@ pub fn function_call_output_content_items_to_text(
                 Some(text.as_str())
             }
             FunctionCallOutputContentItem::InputText { .. }
-            | FunctionCallOutputContentItem::InputImage { .. } => None,
+            | FunctionCallOutputContentItem::InputImage { .. }
+            | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
         })
         .collect::<Vec<_>>();
 
@@ -1342,7 +1640,69 @@ mod tests {
     use anyhow::Result;
     use codex_execpolicy::Policy;
     use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
     use tempfile::tempdir;
+
+    // A tiny valid PNG (1x1) so image conversion tests don't depend on cross-crate
+    // file paths, which break under Bazel sandboxing.
+    const TINY_PNG_BYTES: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 0, 2, 0, 0, 5, 0,
+        1, 122, 94, 171, 63, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    #[test]
+    fn response_input_message_conversion_preserves_phase() {
+        let item = ResponseItem::from(ResponseInputItem::Message {
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "still working".to_string(),
+            }],
+            phase: Some(MessagePhase::Commentary),
+        });
+
+        assert_eq!(
+            item,
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "still working".to_string(),
+                }],
+                phase: Some(MessagePhase::Commentary),
+            }
+        );
+    }
+
+    #[test]
+    fn image_detail_roundtrips_all_wire_values() -> Result<()> {
+        assert_eq!(
+            serde_json::from_str::<ImageDetail>("\"auto\"")?,
+            ImageDetail::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<ImageDetail>("\"low\"")?,
+            ImageDetail::Low
+        );
+        assert_eq!(serde_json::to_string(&ImageDetail::Auto)?, "\"auto\"");
+        assert_eq!(serde_json::to_string(&ImageDetail::Low)?, "\"low\"");
+
+        let content_item: ContentItem = serde_json::from_value(serde_json::json!({
+            "type": "input_image",
+            "image_url": "data:image/png;base64,abc",
+            "detail": "auto",
+        }))?;
+
+        assert_eq!(
+            content_item,
+            ContentItem::InputImage {
+                image_url: "data:image/png;base64,abc".to_string(),
+                detail: Some(ImageDetail::Auto),
+            }
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn sandbox_permissions_helpers_match_documented_semantics() {
@@ -1441,13 +1801,13 @@ mod tests {
     }
 
     #[test]
-    fn permission_profile_is_empty_when_all_fields_are_none() {
-        assert_eq!(PermissionProfile::default().is_empty(), true);
+    fn additional_permission_profile_is_empty_when_all_fields_are_none() {
+        assert_eq!(AdditionalPermissionProfile::default().is_empty(), true);
     }
 
     #[test]
-    fn permission_profile_is_not_empty_when_field_is_present_but_nested_empty() {
-        let permission_profile = PermissionProfile {
+    fn additional_permission_profile_is_not_empty_when_field_is_present_but_nested_empty() {
+        let permission_profile = AdditionalPermissionProfile {
             network: Some(NetworkPermissions { enabled: None }),
             file_system: None,
         };
@@ -1461,7 +1821,7 @@ mod tests {
                 path: FileSystemPath::GlobPattern {
                     pattern: "**/*.env".to_string(),
                 },
-                access: FileSystemAccessMode::None,
+                access: FileSystemAccessMode::Deny,
             }]);
         file_system_sandbox_policy.glob_scan_max_depth = Some(2);
 
@@ -1474,6 +1834,168 @@ mod tests {
             permission_profile.file_system_sandbox_policy(),
             file_system_sandbox_policy
         );
+    }
+
+    #[test]
+    fn permission_profile_deserializes_legacy_rollout_shape() -> Result<()> {
+        let legacy = serde_json::json!({
+            "network": {
+                "enabled": true,
+            },
+            "file_system": {
+                "entries": [{
+                    "path": {
+                        "type": "special",
+                        "value": {
+                            "kind": "root",
+                        },
+                    },
+                    "access": "write",
+                }],
+                "glob_scan_max_depth": 2,
+            },
+        });
+
+        let permission_profile: PermissionProfile = serde_json::from_value(legacy)?;
+
+        assert_eq!(
+            permission_profile,
+            PermissionProfile::Managed {
+                file_system: ManagedFileSystemPermissions::Restricted {
+                    entries: vec![FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        access: FileSystemAccessMode::Write,
+                    }],
+                    glob_scan_max_depth: NonZeroUsize::new(2),
+                },
+                network: NetworkSandboxPolicy::Enabled,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn permission_profile_presets_match_legacy_defaults() {
+        assert_eq!(
+            PermissionProfile::read_only(),
+            PermissionProfile::from_legacy_sandbox_policy(&SandboxPolicy::new_read_only_policy())
+        );
+        assert_eq!(
+            PermissionProfile::workspace_write(),
+            PermissionProfile::from_legacy_sandbox_policy(
+                &SandboxPolicy::new_workspace_write_policy()
+            )
+        );
+    }
+
+    #[test]
+    fn permission_profile_round_trip_preserves_disabled_sandbox() -> Result<()> {
+        let cwd = tempdir()?;
+        let permission_profile =
+            PermissionProfile::from_legacy_sandbox_policy(&SandboxPolicy::DangerFullAccess);
+
+        assert_eq!(permission_profile, PermissionProfile::Disabled);
+        assert_eq!(
+            permission_profile.to_legacy_sandbox_policy(cwd.path())?,
+            SandboxPolicy::DangerFullAccess
+        );
+        assert_eq!(
+            permission_profile.to_runtime_permissions(),
+            (
+                FileSystemSandboxPolicy::unrestricted(),
+                NetworkSandboxPolicy::Enabled
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_permission_profile_ignores_runtime_network_policy() {
+        let permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
+            SandboxEnforcement::Disabled,
+            &FileSystemSandboxPolicy::unrestricted(),
+            NetworkSandboxPolicy::Restricted,
+        );
+
+        assert_eq!(permission_profile, PermissionProfile::Disabled);
+    }
+
+    #[test]
+    fn permission_profile_from_runtime_permissions_preserves_external_sandbox() {
+        let permission_profile = PermissionProfile::from_runtime_permissions(
+            &FileSystemSandboxPolicy::external_sandbox(),
+            NetworkSandboxPolicy::Restricted,
+        );
+
+        assert_eq!(
+            permission_profile,
+            PermissionProfile::External {
+                network: NetworkSandboxPolicy::Restricted,
+            }
+        );
+        assert_eq!(
+            PermissionProfile::from_runtime_permissions_with_enforcement(
+                SandboxEnforcement::Managed,
+                &FileSystemSandboxPolicy::external_sandbox(),
+                NetworkSandboxPolicy::Restricted,
+            ),
+            permission_profile,
+        );
+    }
+
+    #[test]
+    fn permission_profile_from_runtime_permissions_preserves_unrestricted_managed_network() {
+        let permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
+            SandboxEnforcement::External,
+            &FileSystemSandboxPolicy::unrestricted(),
+            NetworkSandboxPolicy::Restricted,
+        );
+
+        assert_eq!(
+            permission_profile,
+            PermissionProfile::Managed {
+                file_system: ManagedFileSystemPermissions::Unrestricted,
+                network: NetworkSandboxPolicy::Restricted,
+            },
+            "the legacy ExternalSandbox projection must not hide a split unrestricted filesystem policy"
+        );
+        assert_eq!(
+            permission_profile.to_runtime_permissions(),
+            (
+                FileSystemSandboxPolicy::unrestricted(),
+                NetworkSandboxPolicy::Restricted,
+            )
+        );
+    }
+
+    #[test]
+    fn permission_profile_round_trip_preserves_external_sandbox() -> Result<()> {
+        let cwd = tempdir()?;
+        let sandbox_policy = SandboxPolicy::ExternalSandbox {
+            network_access: crate::protocol::NetworkAccess::Restricted,
+        };
+        let permission_profile = PermissionProfile::from_legacy_sandbox_policy(&sandbox_policy);
+
+        assert_eq!(
+            permission_profile,
+            PermissionProfile::External {
+                network: NetworkSandboxPolicy::Restricted,
+            }
+        );
+        assert_eq!(
+            permission_profile.to_legacy_sandbox_policy(cwd.path())?,
+            sandbox_policy
+        );
+        assert_eq!(
+            permission_profile.to_runtime_permissions(),
+            (
+                FileSystemSandboxPolicy::external_sandbox(),
+                NetworkSandboxPolicy::Restricted
+            )
+        );
+        Ok(())
     }
 
     #[test]
@@ -1573,6 +2095,9 @@ mod tests {
             FunctionCallOutputContentItem::InputImage {
                 image_url: "data:image/png;base64,AAA".to_string(),
                 detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+            FunctionCallOutputContentItem::EncryptedContent {
+                encrypted_content: "enc_opaque".to_string(),
             },
         ];
 
@@ -1782,6 +2307,35 @@ mod tests {
     }
 
     #[test]
+    fn serializes_encrypted_function_output_content_as_array() -> Result<()> {
+        let item = ResponseInputItem::FunctionCallOutput {
+            call_id: "call1".into(),
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::EncryptedContent {
+                    encrypted_content: "enc_opaque".into(),
+                },
+            ]),
+        };
+
+        let json = serde_json::to_value(&item)?;
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call1",
+                "output": [
+                    {
+                        "type": "encrypted_content",
+                        "encrypted_content": "enc_opaque",
+                    }
+                ],
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn preserves_existing_image_data_urls() -> Result<()> {
         let call_tool_result = CallToolResult {
             content: vec![serde_json::json!({
@@ -1906,6 +2460,30 @@ mod tests {
     }
 
     #[test]
+    fn deserializes_encrypted_array_payload_into_items() -> Result<()> {
+        let json = r#"[
+            {"type": "encrypted_content", "encrypted_content": "enc_opaque"}
+        ]"#;
+
+        let payload: FunctionCallOutputPayload = serde_json::from_str(json)?;
+        let expected_items = vec![FunctionCallOutputContentItem::EncryptedContent {
+            encrypted_content: "enc_opaque".into(),
+        }];
+
+        assert_eq!(payload.success, None);
+        assert_eq!(
+            payload.body,
+            FunctionCallOutputBody::ContentItems(expected_items.clone())
+        );
+        assert_eq!(
+            serde_json::to_string(&payload)?,
+            serde_json::to_string(&expected_items)?
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn deserializes_compaction_alias() -> Result<()> {
         let json = r#"{"type":"compaction_summary","encrypted_content":"abc"}"#;
 
@@ -1917,6 +2495,62 @@ mod tests {
                 encrypted_content: "abc".into(),
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn deserializes_context_compaction() -> Result<()> {
+        let json = r#"{"type":"context_compaction","encrypted_content":"abc"}"#;
+
+        let item: ResponseItem = serde_json::from_str(json)?;
+
+        assert_eq!(
+            item,
+            ResponseItem::ContextCompaction {
+                encrypted_content: Some("abc".into()),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serializes_compaction_trigger_without_payload() -> Result<()> {
+        let item = ResponseItem::CompactionTrigger;
+
+        assert_eq!(
+            serde_json::to_value(item)?,
+            serde_json::json!({
+                "type": "compaction_trigger",
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deserializes_compaction_trigger_without_payload() -> Result<()> {
+        let json = r#"{"type":"compaction_trigger"}"#;
+
+        let item: ResponseItem = serde_json::from_str(json)?;
+
+        assert_eq!(item, ResponseItem::CompactionTrigger);
+        Ok(())
+    }
+
+    #[test]
+    fn deserializes_legacy_ghost_snapshot_as_other() -> Result<()> {
+        let json = r#"{
+            "type":"ghost_snapshot",
+            "ghost_commit":{
+                "id":"ghost-1",
+                "parent":null,
+                "preexisting_untracked_files":[],
+                "preexisting_untracked_dirs":[]
+            }
+        }"#;
+
+        let item: ResponseItem = serde_json::from_str(json)?;
+
+        assert_eq!(item, ResponseItem::Other);
         Ok(())
     }
 
@@ -2010,52 +2644,46 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_shell_tool_call_params() -> Result<()> {
-        let json = r#"{
-            "command": ["ls", "-l"],
-            "workdir": "/tmp",
-            "timeout": 1000
-        }"#;
-
-        let params: ShellToolCallParams = serde_json::from_str(json)?;
-        assert_eq!(
-            ShellToolCallParams {
-                command: vec!["ls".to_string(), "-l".to_string()],
-                workdir: Some("/tmp".to_string()),
-                timeout_ms: Some(1000),
-                sandbox_permissions: None,
-                prefix_rule: None,
-                additional_permissions: None,
-                justification: None,
-            },
-            params
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn wraps_image_user_input_with_tags() -> Result<()> {
+    fn serializes_image_user_input_without_tags() -> Result<()> {
         let image_url = "data:image/png;base64,abc".to_string();
 
         let item = ResponseInputItem::from(vec![UserInput::Image {
             image_url: image_url.clone(),
+            detail: None,
         }]);
 
         match item {
             ResponseInputItem::Message { content, .. } => {
-                let expected = vec![
-                    ContentItem::InputText {
-                        text: image_open_tag_text(),
-                    },
-                    ContentItem::InputImage {
-                        image_url,
-                        detail: Some(DEFAULT_IMAGE_DETAIL),
-                    },
-                    ContentItem::InputText {
-                        text: image_close_tag_text(),
-                    },
-                ];
+                let expected = vec![ContentItem::InputImage {
+                    image_url,
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                }];
                 assert_eq!(content, expected);
+            }
+            other => panic!("expected message response but got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn image_user_input_preserves_requested_detail() -> Result<()> {
+        let image_url = "data:image/png;base64,abc".to_string();
+
+        let item = ResponseInputItem::from(vec![UserInput::Image {
+            image_url: image_url.clone(),
+            detail: Some(ImageDetail::Original),
+        }]);
+
+        match item {
+            ResponseInputItem::Message { content, .. } => {
+                assert_eq!(
+                    content.first(),
+                    Some(&ContentItem::InputImage {
+                        image_url,
+                        detail: Some(ImageDetail::Original),
+                    })
+                );
             }
             other => panic!("expected message response but got {other:?}"),
         }
@@ -2231,59 +2859,85 @@ mod tests {
         let image_url = "data:image/png;base64,abc".to_string();
         let dir = tempdir()?;
         let local_path = dir.path().join("local.png");
-        // A tiny valid PNG (1x1) so this test doesn't depend on cross-crate file paths, which
-        // break under Bazel sandboxing.
-        const TINY_PNG_BYTES: &[u8] = &[
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
-            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 0, 2,
-            0, 0, 5, 0, 1, 122, 94, 171, 63, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-        ];
         std::fs::write(&local_path, TINY_PNG_BYTES)?;
 
         let item = ResponseInputItem::from(vec![
             UserInput::Image {
                 image_url: image_url.clone(),
+                detail: None,
             },
-            UserInput::LocalImage { path: local_path },
+            UserInput::LocalImage {
+                path: local_path.clone(),
+                detail: None,
+            },
         ]);
 
         match item {
             ResponseInputItem::Message { content, .. } => {
                 assert_eq!(
                     content.first(),
-                    Some(&ContentItem::InputText {
-                        text: image_open_tag_text(),
-                    })
-                );
-                assert_eq!(
-                    content.get(1),
                     Some(&ContentItem::InputImage {
                         image_url,
                         detail: Some(DEFAULT_IMAGE_DETAIL),
                     })
                 );
                 assert_eq!(
-                    content.get(2),
+                    content.get(1),
                     Some(&ContentItem::InputText {
-                        text: image_close_tag_text(),
-                    })
-                );
-                assert_eq!(
-                    content.get(3),
-                    Some(&ContentItem::InputText {
-                        text: local_image_open_tag_text(/*label_number*/ 2),
+                        text: local_image_open_tag_text_with_path(
+                            /*label_number*/ 2,
+                            &local_path
+                        ),
                     })
                 );
                 assert!(matches!(
-                    content.get(4),
+                    content.get(2),
                     Some(ContentItem::InputImage { .. })
                 ));
                 assert_eq!(
-                    content.get(5),
+                    content.get(3),
                     Some(&ContentItem::InputText {
                         text: image_close_tag_text(),
                     })
                 );
+            }
+            other => panic!("expected message response but got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn local_image_open_tag_preserves_path() {
+        assert_eq!(
+            local_image_open_tag_text_with_path(
+                /*label_number*/ 1,
+                std::path::Path::new(r#"/tmp/a&"<b>.png"#),
+            ),
+            r#"<image name=[Image #1] path="/tmp/a&"<b>.png">"#
+        );
+    }
+
+    #[test]
+    fn local_image_user_input_preserves_requested_detail() -> Result<()> {
+        let dir = tempdir()?;
+        let local_path = dir.path().join("local.png");
+        std::fs::write(&local_path, TINY_PNG_BYTES)?;
+
+        let item = ResponseInputItem::from(vec![UserInput::LocalImage {
+            path: local_path,
+            detail: Some(ImageDetail::Original),
+        }]);
+
+        match item {
+            ResponseInputItem::Message { content, .. } => {
+                assert!(matches!(
+                    content.get(1),
+                    Some(ContentItem::InputImage {
+                        detail: Some(ImageDetail::Original),
+                        ..
+                    })
+                ));
             }
             other => panic!("expected message response but got {other:?}"),
         }
@@ -2298,6 +2952,7 @@ mod tests {
 
         let item = ResponseInputItem::from(vec![UserInput::LocalImage {
             path: missing_path.clone(),
+            detail: None,
         }]);
 
         match item {
@@ -2332,6 +2987,7 @@ mod tests {
 
         let item = ResponseInputItem::from(vec![UserInput::LocalImage {
             path: json_path.clone(),
+            detail: None,
         }]);
 
         match item {
@@ -2369,6 +3025,7 @@ mod tests {
 
         let item = ResponseInputItem::from(vec![UserInput::LocalImage {
             path: svg_path.clone(),
+            detail: None,
         }]);
 
         match item {

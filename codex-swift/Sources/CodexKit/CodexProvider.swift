@@ -94,14 +94,22 @@ public struct CodexProvider: Sendable, Equatable, Hashable, Identifiable {
             }
             return CodexProvider(
                 id: id,
-            name: name,
-            baseURL: url,
-            requiresChatGPTAuth: value["requiresChatgptAuth"] as? Bool ?? false
-        )
-    }
+                name: name,
+                baseURL: url,
+                requiresChatGPTAuth: value["requiresChatgptAuth"] as? Bool ?? false
+            )
+        }
     }
 
     func responsesURL() -> URL {
         baseURL.appending(path: "responses")
+    }
+
+    func modelsURL() -> URL {
+        var components = URLComponents(url: baseURL.appending(path: "models"), resolvingAgainstBaseURL: false)
+        if id == "openai" {
+            components?.queryItems = [URLQueryItem(name: "client_version", value: "0.0.0")]
+        }
+        return components?.url ?? baseURL.appending(path: "models")
     }
 }

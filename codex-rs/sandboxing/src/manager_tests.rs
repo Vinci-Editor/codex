@@ -4,7 +4,9 @@ use super::SandboxTransformRequest;
 use super::SandboxType;
 use super::SandboxablePreference;
 use super::get_platform_sandbox;
+use super::with_managed_mitm_ca_readable_root;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
@@ -14,9 +16,6 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
-use codex_protocol::protocol::NetworkAccess;
-use codex_protocol::protocol::ReadOnlyAccess;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use dunce::canonicalize;
 use pretty_assertions::assert_eq;
@@ -75,6 +74,10 @@ fn restricted_file_system_uses_platform_sandbox_without_managed_network() {
 fn transform_preserves_unrestricted_file_system_policy_for_restricted_network() {
     let manager = SandboxManager::new();
     let cwd = AbsolutePathBuf::current_dir().expect("current dir");
+    let permissions = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::unrestricted(),
+        NetworkSandboxPolicy::Restricted,
+    );
     let exec_request = manager
         .transform(SandboxTransformRequest {
             command: SandboxCommand {
@@ -84,11 +87,7 @@ fn transform_preserves_unrestricted_file_system_policy_for_restricted_network() 
                 env: HashMap::new(),
                 additional_permissions: None,
             },
-            policy: &SandboxPolicy::ExternalSandbox {
-                network_access: NetworkAccess::Restricted,
-            },
-            file_system_policy: &FileSystemSandboxPolicy::unrestricted(),
-            network_policy: NetworkSandboxPolicy::Restricted,
+            permissions: &permissions,
             sandbox: SandboxType::None,
             enforce_managed_network: false,
             network: None,
@@ -114,6 +113,9 @@ fn transform_preserves_unrestricted_file_system_policy_for_restricted_network() 
 fn transform_additional_permissions_enable_network_for_external_sandbox() {
     let manager = SandboxManager::new();
     let cwd = AbsolutePathBuf::current_dir().expect("current dir");
+    let permissions = PermissionProfile::External {
+        network: NetworkSandboxPolicy::Restricted,
+    };
     let temp_dir = TempDir::new().expect("create temp dir");
     let path = AbsolutePathBuf::from_absolute_path(
         canonicalize(temp_dir.path()).expect("canonicalize temp dir"),
@@ -126,7 +128,7 @@ fn transform_additional_permissions_enable_network_for_external_sandbox() {
                 args: Vec::new(),
                 cwd: cwd.clone(),
                 env: HashMap::new(),
-                additional_permissions: Some(PermissionProfile {
+                additional_permissions: Some(AdditionalPermissionProfile {
                     network: Some(NetworkPermissions {
                         enabled: Some(true),
                     }),
@@ -136,11 +138,7 @@ fn transform_additional_permissions_enable_network_for_external_sandbox() {
                     )),
                 }),
             },
-            policy: &SandboxPolicy::ExternalSandbox {
-                network_access: NetworkAccess::Restricted,
-            },
-            file_system_policy: &FileSystemSandboxPolicy::unrestricted(),
-            network_policy: NetworkSandboxPolicy::Restricted,
+            permissions: &permissions,
             sandbox: SandboxType::None,
             enforce_managed_network: false,
             network: None,
@@ -153,9 +151,9 @@ fn transform_additional_permissions_enable_network_for_external_sandbox() {
         .expect("transform");
 
     assert_eq!(
-        exec_request.sandbox_policy,
-        SandboxPolicy::ExternalSandbox {
-            network_access: NetworkAccess::Enabled,
+        exec_request.permission_profile,
+        PermissionProfile::External {
+            network: NetworkSandboxPolicy::Enabled,
         }
     );
     assert_eq!(
@@ -175,6 +173,24 @@ fn transform_additional_permissions_preserves_denied_entries() {
     .expect("absolute temp dir");
     let allowed_path = workspace_root.join("allowed");
     let denied_path = workspace_root.join("denied");
+    let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            access: FileSystemAccessMode::Read,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: denied_path.clone(),
+            },
+            access: FileSystemAccessMode::Deny,
+        },
+    ]);
+    let permissions = PermissionProfile::from_runtime_permissions(
+        &file_system_policy,
+        NetworkSandboxPolicy::Restricted,
+    );
     let exec_request = manager
         .transform(SandboxTransformRequest {
             command: SandboxCommand {
@@ -182,7 +198,7 @@ fn transform_additional_permissions_preserves_denied_entries() {
                 args: Vec::new(),
                 cwd: cwd.clone(),
                 env: HashMap::new(),
-                additional_permissions: Some(PermissionProfile {
+                additional_permissions: Some(AdditionalPermissionProfile {
                     file_system: Some(FileSystemPermissions::from_read_write_roots(
                         /*read*/ None,
                         Some(vec![allowed_path.clone()]),
@@ -190,25 +206,7 @@ fn transform_additional_permissions_preserves_denied_entries() {
                     ..Default::default()
                 }),
             },
-            policy: &SandboxPolicy::ReadOnly {
-                access: ReadOnlyAccess::FullAccess,
-                network_access: false,
-            },
-            file_system_policy: &FileSystemSandboxPolicy::restricted(vec![
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::Special {
-                        value: FileSystemSpecialPath::Root,
-                    },
-                    access: FileSystemAccessMode::Read,
-                },
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::Path {
-                        path: denied_path.clone(),
-                    },
-                    access: FileSystemAccessMode::None,
-                },
-            ]),
-            network_policy: NetworkSandboxPolicy::Restricted,
+            permissions: &permissions,
             sandbox: SandboxType::None,
             enforce_managed_network: false,
             network: None,
@@ -231,7 +229,7 @@ fn transform_additional_permissions_preserves_denied_entries() {
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path: denied_path },
-                access: FileSystemAccessMode::None,
+                access: FileSystemAccessMode::Deny,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path: allowed_path },
@@ -245,12 +243,55 @@ fn transform_additional_permissions_preserves_denied_entries() {
     );
 }
 
+#[test]
+fn managed_mitm_ca_bundle_becomes_readable_for_restricted_sandbox() {
+    let cwd = TempDir::new().expect("create cwd");
+    let cwd =
+        AbsolutePathBuf::from_absolute_path(canonicalize(cwd.path()).expect("canonicalize cwd"))
+            .expect("absolute cwd");
+    let managed_bundle_dir = TempDir::new().expect("create managed bundle dir");
+    let managed_bundle_path =
+        AbsolutePathBuf::from_absolute_path(managed_bundle_dir.path().join("ca-bundle.pem"))
+            .expect("absolute managed bundle path");
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Path { path: cwd.clone() },
+            access: FileSystemAccessMode::Read,
+        }]),
+        NetworkSandboxPolicy::Restricted,
+    );
+
+    let permission_profile = with_managed_mitm_ca_readable_root(
+        permission_profile,
+        Some(&managed_bundle_path),
+        cwd.as_path(),
+    );
+    let (file_system_sandbox_policy, _) = permission_profile.to_runtime_permissions();
+
+    assert_eq!(
+        file_system_sandbox_policy,
+        FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: cwd },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: managed_bundle_path,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+        ])
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn transform_linux_seccomp_request(
     codex_linux_sandbox_exe: &std::path::Path,
 ) -> super::SandboxExecRequest {
     let manager = SandboxManager::new();
     let cwd = AbsolutePathBuf::current_dir().expect("current dir");
+    let permissions = PermissionProfile::Disabled;
     manager
         .transform(SandboxTransformRequest {
             command: SandboxCommand {
@@ -260,9 +301,7 @@ fn transform_linux_seccomp_request(
                 env: HashMap::new(),
                 additional_permissions: None,
             },
-            policy: &SandboxPolicy::DangerFullAccess,
-            file_system_policy: &FileSystemSandboxPolicy::unrestricted(),
-            network_policy: NetworkSandboxPolicy::Enabled,
+            permissions: &permissions,
             sandbox: SandboxType::LinuxSeccomp,
             enforce_managed_network: false,
             network: None,

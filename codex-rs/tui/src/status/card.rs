@@ -1,25 +1,32 @@
 use crate::history_cell::CompositeHistoryCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
+use crate::history_cell::plain_lines;
 use crate::history_cell::with_border_with_inner_width;
 use crate::legacy_core::config::Config;
+use crate::token_usage::TokenUsage;
+use crate::token_usage::TokenUsageInfo;
 use crate::version::CODEX_CLI_VERSION;
 use chrono::DateTime;
 use chrono::Local;
+use codex_app_server_protocol::AskForApproval;
 use codex_model_provider_info::WireApi;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
+use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::NetworkAccess;
-use codex_protocol::protocol::SandboxPolicy;
-use codex_protocol::protocol::TokenUsage;
-use codex_protocol::protocol::TokenUsageInfo;
-use codex_utils_sandbox_summary::summarize_sandbox_policy;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_sandbox_summary::summarize_permission_profile;
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use unicode_width::UnicodeWidthStr;
 use url::Url;
 
 use super::account::StatusAccountDisplay;
@@ -39,10 +46,14 @@ use super::rate_limits::compose_rate_limit_data;
 use super::rate_limits::compose_rate_limit_data_many;
 use super::rate_limits::format_status_limit_summary;
 use super::rate_limits::render_status_limit_progress_bar;
+use super::remote_connection::RemoteConnectionStatus;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_lines;
+use crate::wrapping::word_wrap_lines;
 use std::sync::Arc;
 use std::sync::RwLock;
+
+const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/codex/settings/usage";
 
 #[derive(Debug, Clone)]
 struct StatusContextWindowData {
@@ -100,6 +111,8 @@ struct StatusHistoryCell {
     agents_summary: Arc<RwLock<String>>,
     collaboration_mode: Option<String>,
     model_provider: Option<String>,
+    remote_connection: Option<RemoteConnectionStatus>,
+    show_chatgpt_usage_link: bool,
     account: Option<StatusAccountDisplay>,
     thread_name: Option<String>,
     session_id: Option<String>,
@@ -164,6 +177,8 @@ pub(crate) fn new_status_output_with_rate_limits(
 ) -> CompositeHistoryCell {
     new_status_output_with_rate_limits_handle(
         config,
+        /*runtime_model_provider_base_url*/ None,
+        /*remote_connection*/ None,
         account_display,
         token_info,
         total_usage,
@@ -185,6 +200,8 @@ pub(crate) fn new_status_output_with_rate_limits(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn new_status_output_with_rate_limits_handle(
     config: &Config,
+    runtime_model_provider_base_url: Option<&str>,
+    remote_connection: Option<&RemoteConnectionStatus>,
     account_display: Option<&StatusAccountDisplay>,
     token_info: Option<&TokenUsageInfo>,
     total_usage: &TokenUsage,
@@ -203,6 +220,8 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
     let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
     let (card, handle) = StatusHistoryCell::new(
         config,
+        runtime_model_provider_base_url,
+        remote_connection,
         account_display,
         token_info,
         total_usage,
@@ -229,6 +248,8 @@ impl StatusHistoryCell {
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: &Config,
+        runtime_model_provider_base_url: Option<&str>,
+        remote_connection: Option<&RemoteConnectionStatus>,
         account_display: Option<&StatusAccountDisplay>,
         token_info: Option<&TokenUsageInfo>,
         total_usage: &TokenUsage,
@@ -244,6 +265,9 @@ impl StatusHistoryCell {
         agents_summary: String,
         refreshing_rate_limits: bool,
     ) -> (Self, StatusHistoryHandle) {
+        let approval_policy = AskForApproval::from(config.permissions.approval_policy.value());
+        let permission_profile = config.permissions.effective_permission_profile();
+        let workspace_roots = config.effective_workspace_roots();
         let mut config_entries = vec![
             ("workdir", config.cwd.display().to_string()),
             ("model", model_name.to_string()),
@@ -254,12 +278,16 @@ impl StatusHistoryCell {
             ),
             (
                 "sandbox",
-                summarize_sandbox_policy(config.permissions.sandbox_policy.get()),
+                summarize_permission_profile(
+                    &permission_profile,
+                    &config.cwd,
+                    workspace_roots.as_slice(),
+                ),
             ),
         ];
         if config.model_provider.wire_api == WireApi::Responses {
             let effort_value = reasoning_effort_override
-                .unwrap_or(config.model_reasoning_effort)
+                .unwrap_or_else(|| config.model_reasoning_effort.clone())
                 .map(|effort| effort.to_string())
                 .unwrap_or_else(|| "none".to_string());
             config_entries.push(("reasoning effort", effort_value));
@@ -277,35 +305,21 @@ impl StatusHistoryCell {
             .find(|(k, _)| *k == "approval")
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "<unknown>".to_string());
-        let sandbox = match config.permissions.sandbox_policy.get() {
-            SandboxPolicy::DangerFullAccess => "danger-full-access".to_string(),
-            SandboxPolicy::ReadOnly { .. } => "read-only".to_string(),
-            SandboxPolicy::WorkspaceWrite {
-                network_access: true,
-                ..
-            } => "workspace-write with network access".to_string(),
-            SandboxPolicy::WorkspaceWrite { .. } => "workspace-write".to_string(),
-            SandboxPolicy::ExternalSandbox { network_access } => {
-                if matches!(network_access, NetworkAccess::Enabled) {
-                    "external-sandbox (network access enabled)".to_string()
-                } else {
-                    "external-sandbox".to_string()
-                }
-            }
-        };
-        let permissions = if config.permissions.approval_policy.value() == AskForApproval::OnRequest
-            && *config.permissions.sandbox_policy.get()
-                == SandboxPolicy::new_workspace_write_policy()
-        {
-            "Default".to_string()
-        } else if config.permissions.approval_policy.value() == AskForApproval::Never
-            && *config.permissions.sandbox_policy.get() == SandboxPolicy::DangerFullAccess
-        {
-            "Full Access".to_string()
-        } else {
-            format!("Custom ({sandbox}, {approval})")
-        };
-        let model_provider = format_model_provider(config);
+        let active_permission_profile = config.permissions.active_permission_profile();
+        let sandbox =
+            status_permission_summary(&permission_profile, &config.cwd, workspace_roots.as_slice());
+        let workspace_root_suffix = workspace_root_suffix(workspace_roots.as_slice(), &config.cwd);
+        let approval = status_approval_label(approval_policy, config.approvals_reviewer, &approval);
+        let permissions = status_permissions_label(
+            active_permission_profile.as_ref(),
+            &permission_profile,
+            approval_policy,
+            &sandbox,
+            &approval,
+            workspace_root_suffix.as_deref(),
+        );
+        let model_provider = format_model_provider(config, runtime_model_provider_base_url);
+        let show_chatgpt_usage_link = config.model_provider.requires_openai_auth;
         let account = compose_account_display(account_display);
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
         let forked_from = forked_from.map(|id| id.to_string());
@@ -345,6 +359,8 @@ impl StatusHistoryCell {
                 permissions,
                 collaboration_mode: collaboration_mode.map(ToString::to_string),
                 model_provider,
+                remote_connection: remote_connection.cloned(),
+                show_chatgpt_usage_link,
                 account,
                 thread_name,
                 session_id,
@@ -455,6 +471,7 @@ impl StatusHistoryCell {
                 StatusRateLimitValue::Window {
                     percent_used,
                     resets_at,
+                    details,
                 } => {
                     let percent_remaining = (100.0 - percent_used).clamp(0.0, 100.0);
                     let summary = format_status_limit_summary(percent_remaining);
@@ -506,6 +523,18 @@ impl StatusHistoryCell {
                     } else {
                         lines.push(base_line);
                     }
+                    if let Some(details) = details {
+                        let detail_width = formatter.value_width(available_inner_width).max(1);
+                        let wrap_options = textwrap::Options::new(detail_width).break_words(false);
+                        lines.extend(
+                            textwrap::wrap(details.as_str(), wrap_options)
+                                .into_iter()
+                                .map(|wrapped| {
+                                    formatter
+                                        .continuation(vec![Span::from(wrapped.into_owned()).dim()])
+                                }),
+                        );
+                    }
                 }
                 StatusRateLimitValue::Text(text) => {
                     let label = row.label.clone();
@@ -547,6 +576,135 @@ impl StatusHistoryCell {
     }
 }
 
+fn status_permission_summary(
+    permission_profile: &PermissionProfile,
+    cwd: &AbsolutePathBuf,
+    workspace_roots: &[AbsolutePathBuf],
+) -> String {
+    let summary = summarize_permission_profile(permission_profile, cwd, workspace_roots);
+    if let Some(details) = summary.strip_prefix("read-only") {
+        if details.contains("(network access enabled)") {
+            return "read-only with network access".to_string();
+        }
+        return "read-only".to_string();
+    }
+    if let Some(details) = summary.strip_prefix("workspace-write") {
+        if details.contains("(network access enabled)") {
+            return "workspace with network access".to_string();
+        }
+        return "workspace".to_string();
+    }
+    if summary == "custom permissions (network access enabled)" {
+        return "custom permissions with network access".to_string();
+    }
+    summary
+}
+
+fn workspace_root_suffix(
+    workspace_roots: &[AbsolutePathBuf],
+    cwd: &AbsolutePathBuf,
+) -> Option<String> {
+    let extra_roots = workspace_roots
+        .iter()
+        .filter(|root| *root != cwd)
+        .map(|root| root.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    if extra_roots.is_empty() {
+        None
+    } else {
+        Some(format!(" [{}]", extra_roots.join(", ")))
+    }
+}
+
+fn status_permissions_label(
+    active_permission_profile: Option<&ActivePermissionProfile>,
+    permission_profile: &PermissionProfile,
+    approval_policy: AskForApproval,
+    sandbox: &str,
+    approval: &str,
+    workspace_root_suffix: Option<&str>,
+) -> String {
+    let active_id = active_permission_profile.map(|active| active.id.as_str());
+    match active_id {
+        Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY) => {
+            let label = if sandbox == "read-only with network access" {
+                "Read Only with network access"
+            } else {
+                "Read Only"
+            };
+            return format!("{label} ({approval})");
+        }
+        Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE) => match sandbox {
+            "workspace" => {
+                return format!(
+                    "Workspace{} ({approval})",
+                    workspace_root_suffix.unwrap_or("")
+                );
+            }
+            "workspace with network access" => {
+                return format!(
+                    "Workspace with network access{} ({approval})",
+                    workspace_root_suffix.unwrap_or("")
+                );
+            }
+            _ => {}
+        },
+        Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS)
+            if permission_profile == &PermissionProfile::Disabled =>
+        {
+            return if approval_policy == AskForApproval::Never {
+                "Full Access".to_string()
+            } else {
+                format!("No Sandbox ({approval})")
+            };
+        }
+        Some(id) => {
+            let sandbox = decorate_workspace_sandbox_label(sandbox, workspace_root_suffix);
+            return format!("Profile {id} ({sandbox}, {approval})");
+        }
+        None => {}
+    }
+
+    if sandbox == "read-only" {
+        return format!("Read Only ({approval})");
+    }
+    if approval_policy == AskForApproval::OnRequest && sandbox == "workspace" {
+        return format!(
+            "Workspace{} ({approval})",
+            workspace_root_suffix.unwrap_or("")
+        );
+    }
+    if approval_policy == AskForApproval::Never
+        && permission_profile == &PermissionProfile::Disabled
+    {
+        return "Full Access".to_string();
+    }
+    let sandbox = decorate_workspace_sandbox_label(sandbox, workspace_root_suffix);
+    format!("Custom ({sandbox}, {approval})")
+}
+
+fn decorate_workspace_sandbox_label(sandbox: &str, workspace_root_suffix: Option<&str>) -> String {
+    match workspace_root_suffix {
+        Some(suffix) if sandbox.starts_with("workspace") => format!("{sandbox}{suffix}"),
+        _ => sandbox.to_string(),
+    }
+}
+
+fn status_approval_label(
+    approval_policy: AskForApproval,
+    approvals_reviewer: ApprovalsReviewer,
+    approval: &str,
+) -> String {
+    if approval_policy == AskForApproval::OnRequest {
+        return match approvals_reviewer {
+            ApprovalsReviewer::AutoReview => "Approve for me".to_string(),
+            ApprovalsReviewer::User => "Ask for approval".to_string(),
+        };
+    }
+
+    approval.to_string()
+}
+
 impl HistoryCell for StatusHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -556,7 +714,6 @@ impl HistoryCell for StatusHistoryCell {
             Span::from(" ").dim(),
             Span::from(format!("(v{CODEX_CLI_VERSION})")).dim(),
         ]));
-        lines.push(Line::from(Vec::<Span<'static>>::new()));
 
         let available_inner_width = usize::from(width.saturating_sub(4));
         if available_inner_width == 0 {
@@ -623,9 +780,7 @@ impl HistoryCell for StatusHistoryCell {
 
         let note_first_line = Line::from(vec![
             Span::from("Visit ").cyan(),
-            "https://chatgpt.com/codex/settings/usage"
-                .cyan()
-                .underlined(),
+            CHATGPT_USAGE_URL.cyan().underlined(),
             Span::from(" for up-to-date").cyan(),
         ]);
         let note_second_line = Line::from(vec![
@@ -635,8 +790,30 @@ impl HistoryCell for StatusHistoryCell {
             [note_first_line, note_second_line],
             RtOptions::new(available_inner_width),
         );
-        lines.extend(note_lines);
         lines.push(Line::from(Vec::<Span<'static>>::new()));
+        // The ChatGPT usage page only applies to providers backed by OpenAI auth;
+        // providers like Bedrock manage limits and billing elsewhere.
+        if self.show_chatgpt_usage_link {
+            lines.extend(note_lines);
+            lines.push(Line::from(Vec::<Span<'static>>::new()));
+        }
+        if let Some(remote_connection) = self.remote_connection.as_ref() {
+            let wrapped_remote = word_wrap_lines(
+                [Line::from(vec![
+                    Span::from(remote_connection.address.clone()),
+                    Span::from(" (").dim(),
+                    Span::from(remote_connection.version.clone()).dim(),
+                    Span::from(")").dim(),
+                ])],
+                RtOptions::new(value_width.max(1)),
+            );
+            let mut wrapped_remote = wrapped_remote.into_iter();
+            if let Some(first) = wrapped_remote.next() {
+                lines.push(formatter.line("Remote", first.spans));
+                lines.extend(wrapped_remote.map(|line| formatter.continuation(line.spans)));
+            }
+            lines.push(Line::from(Vec::<Span<'static>>::new()));
+        }
 
         let mut model_spans = vec![Span::from(self.model_name.clone())];
         if !self.model_details.is_empty() {
@@ -695,9 +872,45 @@ impl HistoryCell for StatusHistoryCell {
 
         with_border_with_inner_width(truncated_lines, inner_width)
     }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        plain_lines(self.display_lines(u16::MAX))
+    }
+
+    fn display_hyperlink_lines(
+        &self,
+        width: u16,
+    ) -> Vec<crate::terminal_hyperlinks::HyperlinkLine> {
+        let mut lines =
+            crate::terminal_hyperlinks::plain_hyperlink_lines(self.display_lines(width));
+        for line in &mut lines {
+            let visible = line
+                .line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            if let Some(start_byte) = visible.find(CHATGPT_USAGE_URL) {
+                let start = visible[..start_byte].width();
+                line.hyperlinks
+                    .push(crate::terminal_hyperlinks::TerminalHyperlink {
+                        columns: start..start + CHATGPT_USAGE_URL.width(),
+                        destination: CHATGPT_USAGE_URL.to_string(),
+                    });
+            }
+        }
+        lines
+    }
+
+    fn transcript_hyperlink_lines(
+        &self,
+        width: u16,
+    ) -> Vec<crate::terminal_hyperlinks::HyperlinkLine> {
+        self.display_hyperlink_lines(width)
+    }
 }
 
-fn format_model_provider(config: &Config) -> Option<String> {
+fn format_model_provider(config: &Config, runtime_base_url: Option<&str>) -> Option<String> {
     let provider = &config.model_provider;
     let name = provider.name.trim();
     let provider_name = if name.is_empty() {
@@ -705,7 +918,7 @@ fn format_model_provider(config: &Config) -> Option<String> {
     } else {
         name
     };
-    let base_url = provider.base_url.as_deref().and_then(sanitize_base_url);
+    let base_url = runtime_base_url.and_then(sanitize_base_url);
     let is_default_openai = provider.is_openai() && base_url.is_none();
     if is_default_openai {
         return None;

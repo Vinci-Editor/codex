@@ -5,21 +5,38 @@ use codex_features::Feature;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::PathBufExt;
 use core_test_support::TempDirExt;
+use core_test_support::create_directory_symlink;
 use pretty_assertions::assert_eq;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
 async fn get_user_instructions(config: &Config) -> Option<String> {
+    let mut warnings = Vec::new();
     AgentsMdManager::new(config)
-        .user_instructions_with_fs(LOCAL_FS.as_ref())
+        .user_instructions_with_fs(LOCAL_FS.as_ref(), &mut warnings)
         .await
+        .map(|loaded| loaded.text())
 }
 
 async fn agents_md_paths(config: &Config) -> std::io::Result<Vec<AbsolutePathBuf>> {
     AgentsMdManager::new(config)
         .agents_md_paths(LOCAL_FS.as_ref())
         .await
+}
+
+fn assert_invalid_utf8_warning(warnings: &[String], source: &str, path: &Path) {
+    let path_display = path.display().to_string();
+    assert_eq!(warnings.len(), 1, "expected one warning, got {warnings:?}");
+    let warning = &warnings[0];
+    assert!(
+        warning.contains(&format!("{source} AGENTS.md instructions"))
+            && warning.contains(&path_display)
+            && warning.contains("invalid UTF-8")
+            && warning.contains("Invalid byte sequences were replaced."),
+        "unexpected invalid UTF-8 warning: {warning:?}"
+    );
 }
 
 /// Helper that returns a `Config` pointing at `root` and using `limit` as
@@ -38,7 +55,12 @@ async fn make_config(root: &TempDir, limit: usize, instructions: Option<&str>) -
     config.cwd = root.abs();
     config.project_doc_max_bytes = limit;
 
-    config.user_instructions = instructions.map(ToOwned::to_owned);
+    config.user_instructions = instructions.map(|text| {
+        LoadedAgentsMd::new_user(
+            text.to_owned(),
+            config.codex_home.join(DEFAULT_AGENTS_MD_FILENAME),
+        )
+    });
     config
 }
 
@@ -81,7 +103,12 @@ async fn make_config_with_project_root_markers(
 
     config.cwd = root.abs();
     config.project_doc_max_bytes = limit;
-    config.user_instructions = instructions.map(ToOwned::to_owned);
+    config.user_instructions = instructions.map(|text| {
+        LoadedAgentsMd::new_user(
+            text.to_owned(),
+            config.codex_home.join(DEFAULT_AGENTS_MD_FILENAME),
+        )
+    });
     config
 }
 
@@ -100,16 +127,46 @@ async fn no_doc_file_returns_none() {
     assert!(res.is_none(), "Expected None when AGENTS.md is absent");
 }
 
-#[tokio::test]
-async fn no_environment_returns_none() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let config = make_config(&tmp, /*limit*/ 4096, Some("user instructions")).await;
+#[test]
+fn empty_loaded_instructions_are_empty() {
+    let source =
+        AbsolutePathBuf::from_absolute_path("/tmp/AGENTS.md").expect("absolute source path");
 
-    let res = AgentsMdManager::new(&config)
-        .user_instructions(/*environment*/ None)
-        .await;
+    assert_eq!(
+        LoadedAgentsMd::new_user(String::new(), source.clone()),
+        LoadedAgentsMd::default()
+    );
+    assert_eq!(
+        LoadedAgentsMd::new_user(" \n\t".to_string(), source),
+        LoadedAgentsMd::default()
+    );
+    assert_eq!(
+        LoadedAgentsMd::from_text_for_testing(String::new()),
+        LoadedAgentsMd::default()
+    );
+    assert_eq!(
+        LoadedAgentsMd::from_text_for_testing(" \n\t"),
+        LoadedAgentsMd::default()
+    );
+}
 
-    assert_eq!(res, None);
+#[test]
+fn loaded_instructions_with_only_empty_or_whitespace_entries_are_empty() {
+    let empty = LoadedAgentsMd {
+        entries: vec![InstructionEntry {
+            contents: String::new(),
+            provenance: InstructionProvenance::Internal,
+        }],
+    };
+    let whitespace = LoadedAgentsMd {
+        entries: vec![InstructionEntry {
+            contents: " \n\t".to_string(),
+            provenance: InstructionProvenance::Internal,
+        }],
+    };
+
+    assert!(empty.is_empty());
+    assert!(whitespace.is_empty());
 }
 
 /// Small file within the byte-limit is returned unmodified.
@@ -127,6 +184,47 @@ async fn doc_smaller_than_limit_is_returned() {
         res, "hello world",
         "The document should be returned verbatim when it is smaller than the limit and there are no existing instructions"
     );
+}
+
+#[tokio::test]
+async fn global_doc_invalid_utf8_warns_and_uses_lossy_text() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let codex_home_abs = codex_home.abs();
+    let path = codex_home_abs.join(DEFAULT_AGENTS_MD_FILENAME);
+    fs::write(&path, b"global\xFF doc").unwrap();
+
+    let mut warnings = Vec::new();
+    let loaded = AgentsMdManager::load_global_instructions(
+        LOCAL_FS.as_ref(),
+        Some(&codex_home_abs),
+        &mut warnings,
+    )
+    .await
+    .expect("global doc expected");
+
+    assert_eq!(
+        loaded,
+        LoadedAgentsMd::new_user("global\u{FFFD} doc".to_string(), path.clone())
+    );
+    assert_invalid_utf8_warning(&warnings, "Global", path.as_path());
+}
+
+#[tokio::test]
+async fn project_doc_invalid_utf8_warns_and_uses_lossy_text() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("AGENTS.md");
+    fs::write(&path, b"project\xFF doc").unwrap();
+
+    let config = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
+    let mut warnings = Vec::new();
+    let res = AgentsMdManager::new(&config)
+        .user_instructions_with_fs(LOCAL_FS.as_ref(), &mut warnings)
+        .await
+        .expect("doc expected")
+        .text();
+
+    assert_eq!(res, "project\u{FFFD} doc");
+    assert_invalid_utf8_warning(&warnings, "Project", config.cwd.join("AGENTS.md").as_path());
 }
 
 /// Oversize file is truncated to `project_doc_max_bytes`.
@@ -199,40 +297,6 @@ async fn zero_byte_limit_disables_discovery() {
     assert_eq!(discovery, Vec::<AbsolutePathBuf>::new());
 }
 
-#[tokio::test]
-async fn js_repl_instructions_are_appended_when_enabled() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
-    cfg.features
-        .enable(Feature::JsRepl)
-        .expect("test config should allow js_repl");
-
-    let res = get_user_instructions(&cfg)
-        .await
-        .expect("js_repl instructions expected");
-    let expected = "## JavaScript REPL (Node)\n- Use `js_repl` for Node-backed JavaScript with top-level await in a persistent kernel.\n- `js_repl` is a freeform/custom tool. Direct `js_repl` calls must send raw JavaScript tool input (optionally with first-line `// codex-js-repl: timeout_ms=15000`). Do not wrap code in JSON (for example `{\"code\":\"...\"}`), quotes, or markdown code fences.\n- Helpers: `codex.cwd`, `codex.homeDir`, `codex.tmpDir`, `codex.tool(name, args?)`, and `codex.emitImage(imageLike)`.\n- `codex.tool` executes a normal tool call and resolves to the raw tool output object. Use it for shell and non-shell tools alike. Nested tool outputs stay inside JavaScript unless you emit them explicitly.\n- `codex.emitImage(...)` adds one image to the outer `js_repl` function output each time you call it, so you can call it multiple times to emit multiple images. It accepts a data URL, a single `input_image` item, an object like `{ bytes, mimeType }`, or a raw tool response object with exactly one image and no text. It rejects mixed text-and-image content.\n- `codex.tool(...)` and `codex.emitImage(...)` keep stable helper identities across cells. Saved references and persisted objects can reuse them in later cells, but async callbacks that fire after a cell finishes still fail because no exec is active.\n- Request full-resolution image processing with `detail: \"original\"` only when the `view_image` tool schema includes a `detail` argument. The same availability applies to `codex.emitImage(...)`: if `view_image.detail` is present, you may also pass `detail: \"original\"` there. Use this when high-fidelity image perception or precise localization is needed, especially for CUA agents.\n- Raw MCP image blocks can request the same behavior by returning `_meta: { \"codex/imageDetail\": \"original\" }` on the image content item.\n- Example of sharing an in-memory Playwright screenshot: `await codex.emitImage({ bytes: await page.screenshot({ type: \"jpeg\", quality: 85 }), mimeType: \"image/jpeg\", detail: \"original\" })`.\n- Example of sharing a local image tool result: `await codex.emitImage(codex.tool(\"view_image\", { path: \"/absolute/path\", detail: \"original\" }))`.\n- When encoding an image to send with `codex.emitImage(...)` or `view_image`, prefer JPEG at about 85 quality when lossy compression is acceptable; use PNG when transparency or lossless detail matters. Smaller uploads are faster and less likely to hit size limits.\n- Top-level bindings persist across cells. If a cell throws, prior bindings remain available and bindings that finished initializing before the throw often remain usable in later cells. For code you plan to reuse across cells, prefer declaring or assigning it in direct top-level statements before operations that might throw. If you hit `SyntaxError: Identifier 'x' has already been declared`, first reuse the existing binding, reassign a previously declared `let`, or pick a new descriptive name. Use `{ ... }` only for a short temporary block when you specifically need local scratch names; do not wrap an entire cell in block scope if you want those names reusable later. Reset the kernel with `js_repl_reset` only when you need a clean state.\n- Top-level static import declarations (for example `import x from \"./file.js\"`) are currently unsupported in `js_repl`; use dynamic imports with `await import(\"pkg\")`, `await import(\"./file.js\")`, or `await import(\"/abs/path/file.mjs\")` instead. Imported local files must be ESM `.js`/`.mjs` files and run in the same REPL VM context. Bare package imports always resolve from REPL-global search roots (`CODEX_JS_REPL_NODE_MODULE_DIRS`, then cwd), not relative to the imported file location. Local files may statically import only other local relative/absolute/`file://` `.js`/`.mjs` files; package and builtin imports from local files must stay dynamic. `import.meta.resolve()` returns importable strings such as `file://...`, bare package names, and `node:...` specifiers. Local file modules reload between execs, while top-level bindings persist until `js_repl_reset`.\n- Avoid direct access to `process.stdout` / `process.stderr` / `process.stdin`; it can corrupt the JSON line protocol. Use `console.log`, `codex.tool(...)`, and `codex.emitImage(...)`.";
-    assert_eq!(res, expected);
-}
-
-#[tokio::test]
-async fn js_repl_tools_only_instructions_are_feature_gated() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
-    let mut features = cfg.features.get().clone();
-    features
-        .enable(Feature::JsRepl)
-        .enable(Feature::JsReplToolsOnly);
-    cfg.features
-        .set(features)
-        .expect("test config should allow js_repl tool restrictions");
-
-    let res = get_user_instructions(&cfg)
-        .await
-        .expect("js_repl instructions expected");
-    let expected = "## JavaScript REPL (Node)\n- Use `js_repl` for Node-backed JavaScript with top-level await in a persistent kernel.\n- `js_repl` is a freeform/custom tool. Direct `js_repl` calls must send raw JavaScript tool input (optionally with first-line `// codex-js-repl: timeout_ms=15000`). Do not wrap code in JSON (for example `{\"code\":\"...\"}`), quotes, or markdown code fences.\n- Helpers: `codex.cwd`, `codex.homeDir`, `codex.tmpDir`, `codex.tool(name, args?)`, and `codex.emitImage(imageLike)`.\n- `codex.tool` executes a normal tool call and resolves to the raw tool output object. Use it for shell and non-shell tools alike. Nested tool outputs stay inside JavaScript unless you emit them explicitly.\n- `codex.emitImage(...)` adds one image to the outer `js_repl` function output each time you call it, so you can call it multiple times to emit multiple images. It accepts a data URL, a single `input_image` item, an object like `{ bytes, mimeType }`, or a raw tool response object with exactly one image and no text. It rejects mixed text-and-image content.\n- `codex.tool(...)` and `codex.emitImage(...)` keep stable helper identities across cells. Saved references and persisted objects can reuse them in later cells, but async callbacks that fire after a cell finishes still fail because no exec is active.\n- Request full-resolution image processing with `detail: \"original\"` only when the `view_image` tool schema includes a `detail` argument. The same availability applies to `codex.emitImage(...)`: if `view_image.detail` is present, you may also pass `detail: \"original\"` there. Use this when high-fidelity image perception or precise localization is needed, especially for CUA agents.\n- Raw MCP image blocks can request the same behavior by returning `_meta: { \"codex/imageDetail\": \"original\" }` on the image content item.\n- Example of sharing an in-memory Playwright screenshot: `await codex.emitImage({ bytes: await page.screenshot({ type: \"jpeg\", quality: 85 }), mimeType: \"image/jpeg\", detail: \"original\" })`.\n- Example of sharing a local image tool result: `await codex.emitImage(codex.tool(\"view_image\", { path: \"/absolute/path\", detail: \"original\" }))`.\n- When encoding an image to send with `codex.emitImage(...)` or `view_image`, prefer JPEG at about 85 quality when lossy compression is acceptable; use PNG when transparency or lossless detail matters. Smaller uploads are faster and less likely to hit size limits.\n- Top-level bindings persist across cells. If a cell throws, prior bindings remain available and bindings that finished initializing before the throw often remain usable in later cells. For code you plan to reuse across cells, prefer declaring or assigning it in direct top-level statements before operations that might throw. If you hit `SyntaxError: Identifier 'x' has already been declared`, first reuse the existing binding, reassign a previously declared `let`, or pick a new descriptive name. Use `{ ... }` only for a short temporary block when you specifically need local scratch names; do not wrap an entire cell in block scope if you want those names reusable later. Reset the kernel with `js_repl_reset` only when you need a clean state.\n- Top-level static import declarations (for example `import x from \"./file.js\"`) are currently unsupported in `js_repl`; use dynamic imports with `await import(\"pkg\")`, `await import(\"./file.js\")`, or `await import(\"/abs/path/file.mjs\")` instead. Imported local files must be ESM `.js`/`.mjs` files and run in the same REPL VM context. Bare package imports always resolve from REPL-global search roots (`CODEX_JS_REPL_NODE_MODULE_DIRS`, then cwd), not relative to the imported file location. Local files may statically import only other local relative/absolute/`file://` `.js`/`.mjs` files; package and builtin imports from local files must stay dynamic. `import.meta.resolve()` returns importable strings such as `file://...`, bare package names, and `node:...` specifiers. Local file modules reload between execs, while top-level bindings persist until `js_repl_reset`.\n- Do not call tools directly; use `js_repl` + `codex.tool(...)` for all tool calls, including shell commands.\n- MCP tools (if any) can also be called by name via `codex.tool(...)`.\n- Avoid direct access to `process.stdout` / `process.stderr` / `process.stdin`; it can corrupt the JSON line protocol. Use `console.log`, `codex.tool(...)`, and `codex.emitImage(...)`.";
-    assert_eq!(res, expected);
-}
-
 /// When both system instructions and AGENTS.md docs are present the two
 /// should be concatenated with the separator.
 #[tokio::test]
@@ -249,6 +313,30 @@ async fn merges_existing_instructions_with_agents_md() {
     let expected = format!("{INSTRUCTIONS}{AGENTS_MD_SEPARATOR}{}", "proj doc");
 
     assert_eq!(res, expected);
+}
+
+#[tokio::test]
+async fn sourceless_user_instructions_preserve_separator_without_reporting_a_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("AGENTS.md"), "project doc").unwrap();
+
+    let mut cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
+    cfg.user_instructions = Some(LoadedAgentsMd::from_text_for_testing(
+        "user instructions".to_string(),
+    ));
+
+    let mut warnings = Vec::new();
+    let loaded = AgentsMdManager::new(&cfg)
+        .user_instructions_with_fs(LOCAL_FS.as_ref(), &mut warnings)
+        .await
+        .expect("instructions expected");
+    let project_agents = cfg.cwd.join("AGENTS.md");
+
+    assert_eq!(
+        loaded.text(),
+        format!("user instructions{AGENTS_MD_SEPARATOR}project doc")
+    );
+    assert_eq!(loaded.sources().collect::<Vec<_>>(), vec![&project_agents]);
 }
 
 /// If there are existing system instructions but AGENTS.md docs are
@@ -289,8 +377,32 @@ async fn concatenates_root_and_cwd_docs() {
     let mut cfg = make_config(&repo, /*limit*/ 4096, /*instructions*/ None).await;
     cfg.cwd = nested.abs();
 
-    let res = get_user_instructions(&cfg).await.expect("doc expected");
-    assert_eq!(res, "root doc\n\ncrate doc");
+    let mut warnings = Vec::new();
+    let loaded = AgentsMdManager::new(&cfg)
+        .user_instructions_with_fs(LOCAL_FS.as_ref(), &mut warnings)
+        .await
+        .expect("doc expected");
+    let root_agents = repo.path().join("AGENTS.md").abs();
+    let crate_agents = cfg.cwd.join("AGENTS.md");
+    let expected = LoadedAgentsMd {
+        entries: vec![
+            InstructionEntry {
+                contents: "root doc".to_string(),
+                provenance: InstructionProvenance::Project(root_agents.clone()),
+            },
+            InstructionEntry {
+                contents: "crate doc".to_string(),
+                provenance: InstructionProvenance::Project(crate_agents.clone()),
+            },
+        ],
+    };
+
+    assert_eq!(loaded, expected);
+    assert_eq!(loaded.text(), "root doc\n\ncrate doc");
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![&root_agents, &crate_agents]
+    );
 }
 
 #[tokio::test]
@@ -313,20 +425,66 @@ async fn project_root_markers_are_honored_for_agents_discovery() {
     cfg.cwd = nested.abs();
 
     let discovery = agents_md_paths(&cfg).await.expect("discover paths");
-    let expected_parent = AbsolutePathBuf::try_from(
-        dunce::canonicalize(root.path().join("AGENTS.md")).expect("canonical parent doc path"),
-    )
-    .expect("absolute parent doc path");
-    let expected_child = AbsolutePathBuf::try_from(
-        dunce::canonicalize(cfg.cwd.join("AGENTS.md")).expect("canonical child doc path"),
-    )
-    .expect("absolute child doc path");
+    let expected_parent = root.path().join("AGENTS.md").abs();
+    let expected_child = cfg.cwd.join("AGENTS.md");
     assert_eq!(discovery.len(), 2);
     assert_eq!(discovery[0], expected_parent);
     assert_eq!(discovery[1], expected_child);
 
     let res = get_user_instructions(&cfg).await.expect("doc expected");
     assert_eq!(res, "parent doc\n\nchild doc");
+}
+
+#[tokio::test]
+async fn agents_md_paths_preserve_symlinked_cwd() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("AGENTS.md"), "project doc").unwrap();
+
+    let linked_cwd = tmp.path().join("linked");
+    create_directory_symlink(&target, &linked_cwd);
+
+    let mut cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
+    cfg.cwd = linked_cwd.abs();
+
+    let discovery = agents_md_paths(&cfg).await.expect("discover paths");
+    assert_eq!(discovery, vec![cfg.cwd.join("AGENTS.md")]);
+
+    let res = get_user_instructions(&cfg).await.expect("doc expected");
+    assert_eq!(res, "project doc");
+}
+
+#[tokio::test]
+async fn child_agents_message_after_global_instructions_uses_plain_separator() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cfg = make_config(&tmp, /*limit*/ 4096, Some("global doc")).await;
+    cfg.features.enable(Feature::ChildAgentsMd).unwrap();
+
+    let mut warnings = Vec::new();
+    let loaded = AgentsMdManager::new(&cfg)
+        .user_instructions_with_fs(LOCAL_FS.as_ref(), &mut warnings)
+        .await
+        .expect("instructions expected");
+    let global_agents = cfg.codex_home.join(DEFAULT_AGENTS_MD_FILENAME);
+    let expected = LoadedAgentsMd {
+        entries: vec![
+            InstructionEntry {
+                contents: "global doc".to_string(),
+                provenance: InstructionProvenance::User(global_agents),
+            },
+            InstructionEntry {
+                contents: HIERARCHICAL_AGENTS_MESSAGE.to_string(),
+                provenance: InstructionProvenance::Internal,
+            },
+        ],
+    };
+
+    assert_eq!(loaded, expected);
+    assert_eq!(
+        loaded.text(),
+        format!("global doc\n\n{HIERARCHICAL_AGENTS_MESSAGE}")
+    );
 }
 
 #[tokio::test]
@@ -339,15 +497,79 @@ async fn instruction_sources_include_global_before_agents_md_docs() {
     fs::create_dir_all(&cfg.codex_home).unwrap();
     fs::write(&global_agents, "global doc").unwrap();
 
-    let sources = AgentsMdManager::new(&cfg)
-        .instruction_sources(LOCAL_FS.as_ref())
-        .await;
-    let project_agents = AbsolutePathBuf::try_from(
-        dunce::canonicalize(cfg.cwd.join("AGENTS.md")).expect("canonical project doc path"),
-    )
-    .expect("absolute project doc path");
+    let mut warnings = Vec::new();
+    let loaded = AgentsMdManager::new(&cfg)
+        .user_instructions_with_fs(LOCAL_FS.as_ref(), &mut warnings)
+        .await
+        .expect("instructions expected");
+    let project_agents = cfg.cwd.join("AGENTS.md");
 
-    assert_eq!(sources, vec![global_agents, project_agents]);
+    let expected = LoadedAgentsMd {
+        entries: vec![
+            InstructionEntry {
+                contents: "global doc".to_string(),
+                provenance: InstructionProvenance::User(global_agents.clone()),
+            },
+            InstructionEntry {
+                contents: "project doc".to_string(),
+                provenance: InstructionProvenance::Project(project_agents.clone()),
+            },
+        ],
+    };
+    assert_eq!(loaded, expected);
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![&global_agents, &project_agents]
+    );
+    assert_eq!(
+        loaded.text(),
+        format!("global doc{AGENTS_MD_SEPARATOR}project doc")
+    );
+}
+
+#[tokio::test]
+async fn child_agents_message_after_project_docs_is_not_an_instruction_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("AGENTS.md"), "project doc").unwrap();
+
+    let mut cfg = make_config(&tmp, /*limit*/ 4096, Some("global doc")).await;
+    cfg.features.enable(Feature::ChildAgentsMd).unwrap();
+    let global_agents = cfg.codex_home.join(DEFAULT_AGENTS_MD_FILENAME);
+    fs::create_dir_all(&cfg.codex_home).unwrap();
+    fs::write(&global_agents, "global doc").unwrap();
+
+    let mut warnings = Vec::new();
+    let loaded = AgentsMdManager::new(&cfg)
+        .user_instructions_with_fs(LOCAL_FS.as_ref(), &mut warnings)
+        .await
+        .expect("instructions expected");
+    let project_agents = cfg.cwd.join("AGENTS.md");
+
+    let expected = LoadedAgentsMd {
+        entries: vec![
+            InstructionEntry {
+                contents: "global doc".to_string(),
+                provenance: InstructionProvenance::User(global_agents.clone()),
+            },
+            InstructionEntry {
+                contents: "project doc".to_string(),
+                provenance: InstructionProvenance::Project(project_agents.clone()),
+            },
+            InstructionEntry {
+                contents: HIERARCHICAL_AGENTS_MESSAGE.to_string(),
+                provenance: InstructionProvenance::Internal,
+            },
+        ],
+    };
+    assert_eq!(loaded, expected);
+    assert_eq!(
+        loaded.sources().collect::<Vec<_>>(),
+        vec![&global_agents, &project_agents]
+    );
+    assert_eq!(
+        loaded.text(),
+        format!("global doc{AGENTS_MD_SEPARATOR}project doc\n\n{HIERARCHICAL_AGENTS_MESSAGE}")
+    );
 }
 
 /// AGENTS.override.md is preferred over AGENTS.md when both are present.

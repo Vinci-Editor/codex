@@ -1,5 +1,5 @@
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::create_fake_rollout;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::rollout_path;
@@ -33,6 +33,7 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 
 #[tokio::test]
 async fn thread_metadata_update_patches_git_branch_and_returns_updated_thread() -> Result<()> {
@@ -40,7 +41,7 @@ async fn thread_metadata_update_patches_git_branch_and_returns_updated_thread() 
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
@@ -76,6 +77,7 @@ async fn thread_metadata_update_patches_git_branch_and_returns_updated_thread() 
         to_response::<ThreadMetadataUpdateResponse>(update_resp)?;
 
     assert_eq!(updated.id, thread.id);
+    assert_eq!(updated.session_id, thread.session_id);
     assert_eq!(
         updated.git_info,
         Some(GitInfo {
@@ -89,6 +91,10 @@ async fn thread_metadata_update_patches_git_branch_and_returns_updated_thread() 
         .get("thread")
         .and_then(Value::as_object)
         .expect("thread/metadata/update result.thread must be an object");
+    assert_eq!(
+        updated_thread_json.get("sessionId").and_then(Value::as_str),
+        Some(thread.session_id.as_str())
+    );
     let updated_git_info_json = updated_thread_json
         .get("gitInfo")
         .and_then(Value::as_object)
@@ -130,7 +136,7 @@ async fn thread_metadata_update_rejects_empty_git_info_patch() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let start_id = mcp
@@ -171,6 +177,57 @@ async fn thread_metadata_update_rejects_empty_git_info_patch() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_metadata_update_rejects_ephemeral_thread() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ephemeral: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let update_id = mcp
+        .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+            thread_id: thread.id.clone(),
+            git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                sha: None,
+                branch: Some(Some("feature/ephemeral".to_string())),
+                origin_url: None,
+            }),
+        })
+        .await?;
+    let update_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(update_id)),
+    )
+    .await??;
+
+    assert_eq!(update_err.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert_eq!(
+        update_err.error.message,
+        format!(
+            "ephemeral thread does not support metadata updates: {}",
+            thread.id
+        )
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_metadata_update_repairs_missing_sqlite_row_for_stored_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -187,7 +244,7 @@ async fn thread_metadata_update_repairs_missing_sqlite_row_for_stored_thread() -
         /*git_info*/ None,
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let update_id = mcp
@@ -252,7 +309,7 @@ async fn thread_metadata_update_repairs_loaded_thread_without_resetting_summary(
     )
     .await;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let resume_id = mcp
@@ -330,7 +387,7 @@ async fn thread_metadata_update_repairs_missing_sqlite_row_for_archived_thread()
     );
     fs::rename(&archived_source, &archived_dest)?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let update_id = mcp
@@ -386,7 +443,7 @@ async fn thread_metadata_update_can_clear_stored_git_fields() -> Result<()> {
     )?;
     let _state_db = init_state_db(codex_home.path()).await?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let update_id = mcp

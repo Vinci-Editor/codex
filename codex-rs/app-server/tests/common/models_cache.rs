@@ -18,7 +18,7 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         slug: preset.id.clone(),
         display_name: preset.display_name.clone(),
         description: Some(preset.description.clone()),
-        default_reasoning_level: Some(preset.default_reasoning_effort),
+        default_reasoning_level: Some(preset.default_reasoning_effort.clone()),
         supported_reasoning_levels: preset.supported_reasoning_efforts.clone(),
         shell_type: ConfigShellToolType::ShellCommand,
         visibility: if preset.show_in_picker {
@@ -29,6 +29,8 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         supported_in_api: preset.supported_in_api,
         priority,
         additional_speed_tiers: preset.additional_speed_tiers.clone(),
+        service_tiers: preset.service_tiers.clone(),
+        default_service_tier: preset.default_service_tier.clone(),
         upgrade: preset.upgrade.as_ref().map(Into::into),
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -36,7 +38,7 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
-        availability_nux: None,
+        availability_nux: preset.availability_nux.clone(),
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
@@ -50,6 +52,9 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        auto_review_model_override: None,
+        tool_mode: None,
+        multi_agent_version: None,
     }
 }
 

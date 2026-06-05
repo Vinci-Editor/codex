@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,11 +10,15 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Json;
 use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::http::HeaderValue;
 use axum::http::Method;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::header::HOST;
+use axum::http::header::WWW_AUTHENTICATE;
 use axum::middleware;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -59,6 +64,233 @@ const MEMO_URI: &str = "memo://codex/example-note";
 const MEMO_CONTENT: &str = "This is a sample MCP resource served by the rmcp test server.";
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const SESSION_POST_FAILURE_CONTROL_PATH: &str = "/test/control/session-post-failure";
+
+#[derive(Clone, Default)]
+struct SessionFailureState {
+    armed_failure: Arc<Mutex<Option<ArmedFailure>>>,
+}
+
+#[derive(Clone, Debug)]
+struct ArmedFailure {
+    status: StatusCode,
+    remaining: usize,
+    /// Raw `WWW-Authenticate` challenge header field values returned with the failure.
+    www_authenticate_headers: Vec<HeaderValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArmSessionPostFailureRequest {
+    status: u16,
+    remaining: usize,
+    /// Raw `WWW-Authenticate` challenge header field values to add to the failure.
+    #[serde(default)]
+    www_authenticate_headers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct EchoArgs {
+    message: String,
+    #[allow(dead_code)]
+    env_var: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bind_addr = parse_bind_addr()?;
+    let session_failure_state = SessionFailureState::default();
+    const MAX_BIND_RETRIES: u32 = 20;
+    const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+    let mut bind_retries = 0;
+    let listener = loop {
+        match tokio::net::TcpListener::bind(&bind_addr).await {
+            Ok(listener) => break listener,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "failed to bind to {bind_addr}: {err}. make sure the process has network access"
+                );
+                return Ok(());
+            }
+            Err(err) if err.kind() == ErrorKind::AddrInUse && bind_retries < MAX_BIND_RETRIES => {
+                bind_retries += 1;
+                sleep(BIND_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    };
+    let actual_bind_addr = listener.local_addr()?;
+    if let Ok(bound_addr_file) = std::env::var("MCP_STREAMABLE_HTTP_BOUND_ADDR_FILE") {
+        fs::write(bound_addr_file, actual_bind_addr.to_string())?;
+    }
+    eprintln!("starting rmcp streamable http test server on http://{actual_bind_addr}/mcp");
+
+    let router = Router::new()
+        .route(
+            SESSION_POST_FAILURE_CONTROL_PATH,
+            post(arm_session_post_failure),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server/mcp",
+            get({
+                move |headers: HeaderMap| async move {
+                    let metadata_base = headers
+                        .get(HOST)
+                        .and_then(|value| value.to_str().ok())
+                        .map(|host| format!("http://{host}"))
+                        .unwrap_or_else(|| format!("http://{actual_bind_addr}"));
+                    #[expect(clippy::expect_used)]
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "authorization_endpoint": format!("{metadata_base}/oauth/authorize"),
+                                "token_endpoint": format!("{metadata_base}/oauth/token"),
+                                "scopes_supported": [""],
+                            })).expect("failed to serialize metadata"),
+                        ))
+                        .expect("valid metadata response")
+                }
+            }),
+        )
+        .nest_service(
+            "/mcp",
+            StreamableHttpService::new(
+                || Ok(TestToolServer::new()),
+                Arc::new(LocalSessionManager::default()),
+                StreamableHttpServerConfig::default(),
+            ),
+        )
+        .layer(middleware::from_fn_with_state(
+            session_failure_state.clone(),
+            fail_session_post_when_armed,
+        ))
+        .with_state(session_failure_state);
+
+    let router = if let Ok(token) = std::env::var("MCP_EXPECT_BEARER") {
+        let expected = Arc::new(format!("Bearer {token}"));
+        router.layer(middleware::from_fn_with_state(expected, require_bearer))
+    } else {
+        router
+    };
+
+    axum::serve(listener, router).await?;
+    task::yield_now().await;
+    Ok(())
+}
+
+impl ServerHandler for TestToolServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .enable_resources()
+                .build(),
+        )
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        let tools = self.tools.clone();
+        async move {
+            Ok(ListToolsResult {
+                tools: (*tools).clone(),
+                next_cursor: None,
+                meta: None,
+            })
+        }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        let resources = self.resources.clone();
+        async move {
+            Ok(ListResourcesResult {
+                resources: (*resources).clone(),
+                next_cursor: None,
+                meta: None,
+            })
+        }
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        Ok(ListResourceTemplatesResult {
+            resource_templates: (*self.resource_templates).clone(),
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        ReadResourceRequestParams { uri, .. }: ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        if uri == MEMO_URI {
+            Ok(ReadResourceResult::new(vec![
+                ResourceContents::TextResourceContents {
+                    uri,
+                    mime_type: Some("text/plain".to_string()),
+                    text: Self::memo_text().to_string(),
+                    meta: None,
+                },
+            ]))
+        } else {
+            Err(McpError::resource_not_found(
+                "resource_not_found",
+                Some(json!({ "uri": uri })),
+            ))
+        }
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        match request.name.as_ref() {
+            "echo" => {
+                let args: EchoArgs = match request.arguments {
+                    Some(arguments) => serde_json::from_value(serde_json::Value::Object(
+                        arguments.into_iter().collect(),
+                    ))
+                    .map_err(|err| McpError::invalid_params(err.to_string(), None))?,
+                    None => {
+                        return Err(McpError::invalid_params(
+                            "missing arguments for echo tool",
+                            None,
+                        ));
+                    }
+                };
+
+                let env_snapshot: HashMap<String, String> = std::env::vars().collect();
+                let structured_content = json!({
+                    "echo": format!("ECHOING: {}", args.message),
+                    "env": env_snapshot.get("MCP_TEST_VALUE"),
+                });
+
+                let mut result = CallToolResult::success(Vec::new());
+                result.structured_content = Some(structured_content);
+                Ok(result)
+            }
+            other => Err(McpError::invalid_params(
+                format!("unknown tool: {other}"),
+                None,
+            )),
+        }
+    }
+}
 
 impl TestToolServer {
     fn new() -> Self {
@@ -144,230 +376,12 @@ impl TestToolServer {
     }
 }
 
-#[derive(Clone, Default)]
-struct SessionFailureState {
-    armed_failure: Arc<Mutex<Option<ArmedFailure>>>,
-}
-
-#[derive(Clone, Debug)]
-struct ArmedFailure {
-    status: StatusCode,
-    remaining: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct ArmSessionPostFailureRequest {
-    status: u16,
-    remaining: usize,
-}
-
-#[derive(Deserialize)]
-struct EchoArgs {
-    message: String,
-    #[allow(dead_code)]
-    env_var: Option<String>,
-}
-
-impl ServerHandler for TestToolServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .enable_tool_list_changed()
-                .enable_resources()
-                .build(),
-            ..ServerInfo::default()
-        }
-    }
-
-    fn list_tools(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        let tools = self.tools.clone();
-        async move {
-            Ok(ListToolsResult {
-                tools: (*tools).clone(),
-                next_cursor: None,
-                meta: None,
-            })
-        }
-    }
-
-    fn list_resources(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
-        let resources = self.resources.clone();
-        async move {
-            Ok(ListResourcesResult {
-                resources: (*resources).clone(),
-                next_cursor: None,
-                meta: None,
-            })
-        }
-    }
-
-    async fn list_resource_templates(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, McpError> {
-        Ok(ListResourceTemplatesResult {
-            resource_templates: (*self.resource_templates).clone(),
-            next_cursor: None,
-            meta: None,
-        })
-    }
-
-    async fn read_resource(
-        &self,
-        ReadResourceRequestParams { uri, .. }: ReadResourceRequestParams,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
-        if uri == MEMO_URI {
-            Ok(ReadResourceResult {
-                contents: vec![ResourceContents::TextResourceContents {
-                    uri,
-                    mime_type: Some("text/plain".to_string()),
-                    text: Self::memo_text().to_string(),
-                    meta: None,
-                }],
-            })
-        } else {
-            Err(McpError::resource_not_found(
-                "resource_not_found",
-                Some(json!({ "uri": uri })),
-            ))
-        }
-    }
-
-    async fn call_tool(
-        &self,
-        request: CallToolRequestParams,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        match request.name.as_ref() {
-            "echo" => {
-                let args: EchoArgs = match request.arguments {
-                    Some(arguments) => serde_json::from_value(serde_json::Value::Object(
-                        arguments.into_iter().collect(),
-                    ))
-                    .map_err(|err| McpError::invalid_params(err.to_string(), None))?,
-                    None => {
-                        return Err(McpError::invalid_params(
-                            "missing arguments for echo tool",
-                            None,
-                        ));
-                    }
-                };
-
-                let env_snapshot: HashMap<String, String> = std::env::vars().collect();
-                let structured_content = json!({
-                    "echo": format!("ECHOING: {}", args.message),
-                    "env": env_snapshot.get("MCP_TEST_VALUE"),
-                });
-
-                Ok(CallToolResult {
-                    content: Vec::new(),
-                    structured_content: Some(structured_content),
-                    is_error: Some(false),
-                    meta: None,
-                })
-            }
-            other => Err(McpError::invalid_params(
-                format!("unknown tool: {other}"),
-                None,
-            )),
-        }
-    }
-}
-
 fn parse_bind_addr() -> Result<SocketAddr, Box<dyn std::error::Error>> {
     let default_addr = "127.0.0.1:3920";
     let bind_addr = std::env::var("MCP_STREAMABLE_HTTP_BIND_ADDR")
         .or_else(|_| std::env::var("BIND_ADDR"))
         .unwrap_or_else(|_| default_addr.to_string());
     Ok(bind_addr.parse()?)
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bind_addr = parse_bind_addr()?;
-    let session_failure_state = SessionFailureState::default();
-    const MAX_BIND_RETRIES: u32 = 20;
-    const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
-
-    let mut bind_retries = 0;
-    let listener = loop {
-        match tokio::net::TcpListener::bind(&bind_addr).await {
-            Ok(listener) => break listener,
-            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-                eprintln!(
-                    "failed to bind to {bind_addr}: {err}. make sure the process has network access"
-                );
-                return Ok(());
-            }
-            Err(err) if err.kind() == ErrorKind::AddrInUse && bind_retries < MAX_BIND_RETRIES => {
-                bind_retries += 1;
-                sleep(BIND_RETRY_DELAY).await;
-            }
-            Err(err) => return Err(err.into()),
-        }
-    };
-    eprintln!("starting rmcp streamable http test server on http://{bind_addr}/mcp");
-
-    let router = Router::new()
-        .route(
-            SESSION_POST_FAILURE_CONTROL_PATH,
-            post(arm_session_post_failure),
-        )
-        .route(
-            "/.well-known/oauth-authorization-server/mcp",
-            get({
-                move || async move {
-                    let metadata_base = format!("http://{bind_addr}");
-                    #[expect(clippy::expect_used)]
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "application/json")
-                        .body(Body::from(
-                            serde_json::to_vec(&json!({
-                                "authorization_endpoint": format!("{metadata_base}/oauth/authorize"),
-                                "token_endpoint": format!("{metadata_base}/oauth/token"),
-                                "scopes_supported": [""],
-                            })).expect("failed to serialize metadata"),
-                        ))
-                        .expect("valid metadata response")
-                }
-            }),
-        )
-        .nest_service(
-            "/mcp",
-            StreamableHttpService::new(
-                || Ok(TestToolServer::new()),
-                Arc::new(LocalSessionManager::default()),
-                StreamableHttpServerConfig::default(),
-            ),
-        )
-        .layer(middleware::from_fn_with_state(
-            session_failure_state.clone(),
-            fail_session_post_when_armed,
-        ))
-        .with_state(session_failure_state);
-
-    let router = if let Ok(token) = std::env::var("MCP_EXPECT_BEARER") {
-        let expected = Arc::new(format!("Bearer {token}"));
-        router.layer(middleware::from_fn_with_state(expected, require_bearer))
-    } else {
-        router
-    };
-
-    axum::serve(listener, router).await?;
-    task::yield_now().await;
-    Ok(())
 }
 
 async fn require_bearer(
@@ -394,12 +408,18 @@ async fn arm_session_post_failure(
     Json(request): Json<ArmSessionPostFailureRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let status = StatusCode::from_u16(request.status).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let www_authenticate_headers = request
+        .www_authenticate_headers
+        .into_iter()
+        .map(|value| HeaderValue::from_str(&value).map_err(|_| StatusCode::BAD_REQUEST))
+        .collect::<Result<Vec<_>, _>>()?;
     let armed_failure = if request.remaining == 0 {
         None
     } else {
         Some(ArmedFailure {
             status,
             remaining: request.remaining,
+            www_authenticate_headers,
         })
     };
     *state.armed_failure.lock().await = armed_failure;
@@ -425,6 +445,7 @@ async fn fail_session_post_when_armed(
         {
             failure.remaining -= 1;
             let status = failure.status;
+            let www_authenticate_headers = failure.www_authenticate_headers.clone();
             if failure.remaining == 0 {
                 *armed_failure = None;
             }
@@ -432,6 +453,11 @@ async fn fail_session_post_when_armed(
                 "forced session failure with status {status}"
             )));
             *response.status_mut() = status;
+            for www_authenticate_header in www_authenticate_headers {
+                response
+                    .headers_mut()
+                    .append(WWW_AUTHENTICATE, www_authenticate_header);
+            }
             return response;
         }
     }

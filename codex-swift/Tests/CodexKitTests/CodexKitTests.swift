@@ -13,6 +13,79 @@ func providerDefaultsExposeOpenAIAndLocalProviders() {
 }
 
 @Test
+func modelCatalogDecodesCodexBackendModels() throws {
+    let data = Data("""
+    {
+      "models": [
+        {
+          "slug": "hidden",
+          "display_name": "Hidden",
+          "description": "Hidden model",
+          "default_reasoning_level": "medium",
+          "supported_reasoning_levels": [],
+          "visibility": "hide",
+          "supported_in_api": true,
+          "priority": 0,
+          "input_modalities": ["text"]
+        },
+        {
+          "slug": "gpt-5.4",
+          "display_name": "GPT-5.4",
+          "description": "Latest",
+          "default_reasoning_level": "medium",
+          "supported_reasoning_levels": [
+            {"effort": "low", "description": "Low"},
+            {"effort": "xhigh", "description": "Extra high"}
+          ],
+          "visibility": "list",
+          "supported_in_api": true,
+          "priority": 2,
+          "input_modalities": ["text", "image"]
+        }
+      ]
+    }
+    """.utf8)
+
+    let models = try CodexModelCatalog.decodeModelsResponse(data, provider: .openAI)
+
+    #expect(models.map(\.id) == ["gpt-5.4"])
+    #expect(models[0].isDefault)
+    #expect(models[0].defaultReasoningEffort == "medium")
+    #expect(models[0].supportedReasoningEfforts.map(\.reasoningEffort) == ["low", "xhigh"])
+    #expect(models[0].inputModalities == ["text", "image"])
+}
+
+@Test
+func modelCatalogDecodesOpenAICompatibleModels() throws {
+    let data = Data("""
+    {
+      "data": [
+        {"id": "qwen/qwen3-coder", "object": "model"},
+        {"id": "openai/gpt-oss-20b", "object": "model"}
+      ]
+    }
+    """.utf8)
+
+    let models = try CodexModelCatalog.decodeModelsResponse(data, provider: .lmStudio())
+
+    #expect(models.map(\.id) == ["qwen/qwen3-coder", "openai/gpt-oss-20b"])
+    #expect(models[0].isDefault)
+    #expect(models[0].supportedReasoningEfforts.isEmpty)
+}
+
+@Test
+func modelCatalogFallbacksTrackBundledCodexDefaults() {
+    let openAI = CodexModelCatalog.fallbackModels(for: .openAI)
+    let local = CodexModelCatalog.fallbackModels(for: .ollama())
+
+    #expect(openAI.map(\.id).contains("gpt-5.3-codex"))
+    #expect(openAI.first?.id == "gpt-5.4")
+    #expect(openAI.first?.supportedReasoningEfforts.map(\.reasoningEffort) == ["low", "medium", "high", "xhigh"])
+    #expect(local.first?.id == "local-model")
+    #expect(local.first?.supportedReasoningEfforts.isEmpty == true)
+}
+
+@Test
 func authTokensResolveChatGPTAccountIDFromIDToken() throws {
     let idToken = try jwt(payload: [
         "https://api.openai.com/auth": [

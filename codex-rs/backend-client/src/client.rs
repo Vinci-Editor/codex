@@ -1,11 +1,14 @@
+use crate::types::AccountsCheckResponse;
 use crate::types::CodeTaskDetailsResponse;
-use crate::types::ConfigFileResponse;
+use crate::types::ConfigBundleResponse;
 use crate::types::PaginatedListTaskListItem;
 use crate::types::RateLimitReachedKind as BackendRateLimitReachedKind;
 use crate::types::RateLimitStatusPayload;
 use crate::types::TurnAttemptsSiblingTurnsResponse;
 use anyhow::Result;
+use codex_api::SharedAuthProvider;
 use codex_client::build_reqwest_client_with_custom_ca;
+use codex_client::with_chatgpt_cloudflare_cookie_store;
 use codex_login::CodexAuth;
 use codex_login::default_client::get_codex_user_agent;
 use codex_protocol::account::PlanType as AccountPlanType;
@@ -13,8 +16,8 @@ use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
+use codex_protocol::protocol::SpendControlLimitSnapshot;
 use reqwest::StatusCode;
-use reqwest::header::AUTHORIZATION;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderName;
@@ -112,15 +115,31 @@ impl PathStyle {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Client {
     base_url: String,
     http: reqwest::Client,
-    authorization_header_value: Option<String>,
+    auth_provider: SharedAuthProvider,
     user_agent: Option<HeaderValue>,
     chatgpt_account_id: Option<String>,
     chatgpt_account_is_fedramp: bool,
     path_style: PathStyle,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("auth_provider", &"<provider>")
+            .field("user_agent", &self.user_agent)
+            .field("chatgpt_account_id", &self.chatgpt_account_id)
+            .field(
+                "chatgpt_account_is_fedramp",
+                &self.chatgpt_account_is_fedramp,
+            )
+            .field("path_style", &self.path_style)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Client {
@@ -137,12 +156,14 @@ impl Client {
         {
             base_url = format!("{base_url}/backend-api");
         }
-        let http = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
+        let http = build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(
+            reqwest::Client::builder(),
+        ))?;
         let path_style = PathStyle::from_base_url(&base_url);
         Ok(Self {
             base_url,
             http,
-            authorization_header_value: None,
+            auth_provider: codex_model_provider::unauthenticated_auth_provider(),
             user_agent: None,
             chatgpt_account_id: None,
             chatgpt_account_is_fedramp: false,
@@ -151,26 +172,13 @@ impl Client {
     }
 
     pub fn from_auth(base_url: impl Into<String>, auth: &CodexAuth) -> Result<Self> {
-        let token = auth.get_token().map_err(anyhow::Error::from)?;
-        let mut client = Self::new(base_url)?
+        Ok(Self::new(base_url)?
             .with_user_agent(get_codex_user_agent())
-            .with_bearer_token(token);
-        if let Some(account_id) = auth.get_account_id() {
-            client = client.with_chatgpt_account_id(account_id);
-        }
-        if auth.is_fedramp_account() {
-            client = client.with_fedramp_routing_header();
-        }
-        Ok(client)
+            .with_auth_provider(codex_model_provider::auth_provider_from_auth(auth)))
     }
 
-    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.authorization_header_value = Some(format!("Bearer {}", token.into()));
-        self
-    }
-
-    pub fn with_authorization_header_value(mut self, value: impl Into<String>) -> Self {
-        self.authorization_header_value = Some(value.into());
+    pub fn with_auth_provider(mut self, auth: SharedAuthProvider) -> Self {
+        self.auth_provider = auth;
         self
     }
 
@@ -203,11 +211,7 @@ impl Client {
         } else {
             h.insert(USER_AGENT, HeaderValue::from_static("codex-cli"));
         }
-        if let Some(value) = &self.authorization_header_value
-            && let Ok(hv) = HeaderValue::from_str(value)
-        {
-            h.insert(AUTHORIZATION, hv);
-        }
+        self.auth_provider.add_auth_headers(&mut h);
         if let Some(acc) = &self.chatgpt_account_id
             && let Ok(name) = HeaderName::from_bytes(b"ChatGPT-Account-Id")
             && let Ok(hv) = HeaderValue::from_str(acc)
@@ -297,6 +301,16 @@ impl Client {
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         let payload: RateLimitStatusPayload = self.decode_json(&url, &ct, &body)?;
         Ok(Self::rate_limit_snapshots_from_payload(payload))
+    }
+
+    pub async fn get_accounts_check(&self) -> Result<AccountsCheckResponse> {
+        let url = match self.path_style {
+            PathStyle::CodexApi => format!("{}/api/codex/accounts/check", self.base_url),
+            PathStyle::ChatGptApi => format!("{}/wham/accounts/check", self.base_url),
+        };
+        let req = self.http.get(&url).headers(self.headers());
+        let (body, ct) = self.exec_request(req, "GET", &url).await?;
+        self.decode_json(&url, &ct, &body)
     }
 
     pub async fn send_add_credits_nudge_email(
@@ -389,20 +403,20 @@ impl Client {
         self.decode_json::<TurnAttemptsSiblingTurnsResponse>(&url, &ct, &body)
     }
 
-    /// Fetch the managed requirements file from codex-backend.
+    /// Fetch the selected cloud-managed config bundle from codex-backend.
     ///
-    /// `GET /api/codex/config/requirements` (Codex API style) or
-    /// `GET /wham/config/requirements` (ChatGPT backend-api style).
-    pub async fn get_config_requirements_file(
+    /// `GET /api/codex/config/bundle` (Codex API style) or
+    /// `GET /wham/config/bundle` (ChatGPT backend-api style).
+    pub async fn get_config_bundle(
         &self,
-    ) -> std::result::Result<ConfigFileResponse, RequestError> {
+    ) -> std::result::Result<ConfigBundleResponse, RequestError> {
         let url = match self.path_style {
-            PathStyle::CodexApi => format!("{}/api/codex/config/requirements", self.base_url),
-            PathStyle::ChatGptApi => format!("{}/wham/config/requirements", self.base_url),
+            PathStyle::CodexApi => format!("{}/api/codex/config/bundle", self.base_url),
+            PathStyle::ChatGptApi => format!("{}/wham/config/bundle", self.base_url),
         };
         let req = self.http.get(&url).headers(self.headers());
         let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
-        self.decode_json::<ConfigFileResponse>(&url, &ct, &body)
+        self.decode_json::<ConfigBundleResponse>(&url, &ct, &body)
             .map_err(RequestError::from)
     }
 
@@ -450,11 +464,17 @@ impl Client {
             .rate_limit_reached_type
             .flatten()
             .and_then(|details| Self::map_rate_limit_reached_type(details.kind));
+        let individual_limit = payload
+            .spend_control
+            .flatten()
+            .and_then(|details| details.individual_limit.flatten())
+            .map(|details| Self::map_individual_limit(*details));
         let mut snapshots = vec![Self::make_rate_limit_snapshot(
             Some("codex".to_string()),
             /*limit_name*/ None,
             payload.rate_limit.flatten().map(|details| *details),
             payload.credits.flatten().map(|details| *details),
+            individual_limit,
             plan_type,
             rate_limit_reached_type,
         )];
@@ -465,6 +485,7 @@ impl Client {
                     Some(details.limit_name),
                     details.rate_limit.flatten().map(|rate_limit| *rate_limit),
                     /*credits*/ None,
+                    /*individual_limit*/ None,
                     plan_type,
                     /*rate_limit_reached_type*/ None,
                 )
@@ -478,6 +499,7 @@ impl Client {
         limit_name: Option<String>,
         rate_limit: Option<crate::types::RateLimitStatusDetails>,
         credits: Option<crate::types::CreditStatusDetails>,
+        individual_limit: Option<SpendControlLimitSnapshot>,
         plan_type: Option<AccountPlanType>,
         rate_limit_reached_type: Option<RateLimitReachedType>,
     ) -> RateLimitSnapshot {
@@ -494,6 +516,7 @@ impl Client {
             primary,
             secondary,
             credits: Self::map_credits(credits),
+            individual_limit,
             plan_type,
             rate_limit_reached_type,
         }
@@ -560,6 +583,17 @@ impl Client {
             unlimited: details.unlimited,
             balance: details.balance.flatten(),
         })
+    }
+
+    fn map_individual_limit(
+        details: crate::types::SpendControlLimitDetails,
+    ) -> SpendControlLimitSnapshot {
+        SpendControlLimitSnapshot {
+            limit: details.limit,
+            used: details.used,
+            remaining_percent: details.remaining_percent,
+            resets_at: i64::from(details.reset_at),
+        }
     }
 
     fn map_plan_type(plan_type: crate::types::PlanType) -> AccountPlanType {
@@ -656,6 +690,23 @@ mod tests {
                 balance: Some(Some("9.99".to_string())),
                 ..Default::default()
             }))),
+            spend_control: Some(Some(Box::new(
+                codex_backend_openapi_models::models::SpendControlStatusDetails {
+                    reached: false,
+                    individual_limit: Some(Some(Box::new(
+                        crate::types::SpendControlLimitDetails {
+                            source: None,
+                            limit: "25000".to_string(),
+                            used: "8000".to_string(),
+                            remaining: "17000".to_string(),
+                            used_percent: 32,
+                            remaining_percent: 68,
+                            reset_after_seconds: 3600,
+                            reset_at: 789,
+                        },
+                    ))),
+                },
+            ))),
             rate_limit_reached_type: Some(Some(BackendRateLimitReachedType {
                 kind: RateLimitReachedKind::WorkspaceMemberCreditsDepleted,
             })),
@@ -687,6 +738,15 @@ mod tests {
             snapshots[0].rate_limit_reached_type,
             Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted)
         );
+        assert_eq!(
+            snapshots[0].individual_limit,
+            Some(SpendControlLimitSnapshot {
+                limit: "25000".to_string(),
+                used: "8000".to_string(),
+                remaining_percent: 68,
+                resets_at: 789,
+            })
+        );
 
         assert_eq!(snapshots[1].limit_id.as_deref(), Some("codex_other"));
         assert_eq!(snapshots[1].limit_name.as_deref(), Some("codex_other"));
@@ -695,6 +755,7 @@ mod tests {
             Some(70.0)
         );
         assert_eq!(snapshots[1].credits, None);
+        assert_eq!(snapshots[1].individual_limit, None);
         assert_eq!(snapshots[1].plan_type, Some(AccountPlanType::Pro));
         assert_eq!(snapshots[1].rate_limit_reached_type, None);
     }
@@ -710,6 +771,7 @@ mod tests {
                 rate_limit: None,
             }])),
             credits: None,
+            spend_control: None,
             rate_limit_reached_type: None,
         };
 
@@ -735,6 +797,7 @@ mod tests {
                 }),
                 secondary: None,
                 credits: None,
+                individual_limit: None,
                 plan_type: Some(AccountPlanType::Pro),
                 rate_limit_reached_type: None,
             },
@@ -748,6 +811,7 @@ mod tests {
                 }),
                 secondary: None,
                 credits: None,
+                individual_limit: None,
                 plan_type: Some(AccountPlanType::Pro),
                 rate_limit_reached_type: None,
             },
@@ -792,6 +856,7 @@ mod tests {
                 plan_type: crate::types::PlanType::Plus,
                 rate_limit: None,
                 credits: None,
+                spend_control: None,
                 additional_rate_limits: None,
                 rate_limit_reached_type: Some(Some(BackendRateLimitReachedType { kind })),
             };
@@ -807,6 +872,7 @@ mod tests {
             plan_type: crate::types::PlanType::Plus,
             rate_limit: None,
             credits: None,
+            spend_control: None,
             additional_rate_limits: None,
             rate_limit_reached_type: None,
         };
@@ -820,7 +886,7 @@ mod tests {
         let codex_client = Client {
             base_url: "https://example.test".to_string(),
             http: reqwest::Client::new(),
-            authorization_header_value: None,
+            auth_provider: codex_model_provider::unauthenticated_auth_provider(),
             user_agent: None,
             chatgpt_account_id: None,
             chatgpt_account_is_fedramp: false,
@@ -834,7 +900,7 @@ mod tests {
         let chatgpt_client = Client {
             base_url: "https://chatgpt.com/backend-api".to_string(),
             http: reqwest::Client::new(),
-            authorization_header_value: None,
+            auth_provider: codex_model_provider::unauthenticated_auth_provider(),
             user_agent: None,
             chatgpt_account_id: None,
             chatgpt_account_is_fedramp: false,

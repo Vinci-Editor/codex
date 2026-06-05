@@ -79,24 +79,6 @@ async fn app_server_default_analytics_enabled_with_flag() -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn enable_analytics_capture(server: &MockServer, codex_home: &Path) -> Result<()> {
-    let config_path = codex_home.join("config.toml");
-    let config_toml = std::fs::read_to_string(&config_path)?;
-    if !config_toml.contains("[features]") {
-        std::fs::write(
-            &config_path,
-            format!("{config_toml}\n[features]\ngeneral_analytics = true\n"),
-        )?;
-    } else if !config_toml.contains("general_analytics") {
-        std::fs::write(
-            &config_path,
-            config_toml.replace("[features]\n", "[features]\ngeneral_analytics = true\n"),
-        )?;
-    }
-
-    mount_analytics_capture(server, codex_home).await
-}
-
 pub(crate) async fn mount_analytics_capture(server: &MockServer, codex_home: &Path) -> Result<()> {
     Mock::given(method("POST"))
         .and(path("/codex/analytics-events/events"))
@@ -186,10 +168,13 @@ pub(crate) fn thread_initialized_event(payload: &Value) -> Result<&Value> {
 pub(crate) fn assert_basic_thread_initialized_event(
     event: &Value,
     thread_id: &str,
+    session_id: &str,
     expected_model: &str,
     initialization_mode: &str,
+    expected_thread_source: &str,
 ) {
     assert_eq!(event["event_params"]["thread_id"], thread_id);
+    assert_eq!(event["event_params"]["session_id"], session_id);
     assert_eq!(
         event["event_params"]["app_server_client"]["product_client_id"],
         DEFAULT_CLIENT_NAME
@@ -204,7 +189,10 @@ pub(crate) fn assert_basic_thread_initialized_event(
     );
     assert_eq!(event["event_params"]["model"], expected_model);
     assert_eq!(event["event_params"]["ephemeral"], false);
-    assert_eq!(event["event_params"]["thread_source"], "user");
+    assert_eq!(
+        event["event_params"]["thread_source"],
+        expected_thread_source
+    );
     assert_eq!(
         event["event_params"]["subagent_source"],
         serde_json::Value::Null

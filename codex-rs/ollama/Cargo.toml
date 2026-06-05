@@ -7,6 +7,7 @@ license.workspace = true
 [lib]
 name = "codex_ollama"
 path = "src/lib.rs"
+doctest = false
 
 [lints]
 workspace = true
@@ -17,6 +18,7 @@ bytes = { workspace = true }
 codex-core = { workspace = true }
 codex-model-provider-info = { workspace = true }
 futures = { workspace = true }
+memchr = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
 semver = { workspace = true }
 serde_json = { workspace = true }

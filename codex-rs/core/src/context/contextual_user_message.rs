@@ -2,9 +2,14 @@ use codex_protocol::items::HookPromptItem;
 use codex_protocol::items::parse_hook_prompt_fragment;
 use codex_protocol::models::ContentItem;
 
+use super::AdditionalContextUserFragment;
 use super::EnvironmentContext;
 use super::FragmentRegistration;
 use super::FragmentRegistrationProxy;
+use super::InternalModelContextFragment;
+use super::LegacyApplyPatchExecCommandWarning;
+use super::LegacyModelMismatchWarning;
+use super::LegacyUnifiedExecProcessLimitWarning;
 use super::SkillInstructions;
 use super::SubagentNotification;
 use super::TurnAborted;
@@ -15,6 +20,8 @@ static USER_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<UserInstruction
     FragmentRegistrationProxy::new();
 static ENVIRONMENT_CONTEXT_REGISTRATION: FragmentRegistrationProxy<EnvironmentContext> =
     FragmentRegistrationProxy::new();
+static ADDITIONAL_CONTEXT_REGISTRATION: FragmentRegistrationProxy<AdditionalContextUserFragment> =
+    FragmentRegistrationProxy::new();
 static SKILL_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<SkillInstructions> =
     FragmentRegistrationProxy::new();
 static USER_SHELL_COMMAND_REGISTRATION: FragmentRegistrationProxy<UserShellCommand> =
@@ -23,40 +30,35 @@ static TURN_ABORTED_REGISTRATION: FragmentRegistrationProxy<TurnAborted> =
     FragmentRegistrationProxy::new();
 static SUBAGENT_NOTIFICATION_REGISTRATION: FragmentRegistrationProxy<SubagentNotification> =
     FragmentRegistrationProxy::new();
+static INTERNAL_MODEL_CONTEXT_REGISTRATION: FragmentRegistrationProxy<
+    InternalModelContextFragment,
+> = FragmentRegistrationProxy::new();
+static LEGACY_UNIFIED_EXEC_PROCESS_LIMIT_WARNING_REGISTRATION: FragmentRegistrationProxy<
+    LegacyUnifiedExecProcessLimitWarning,
+> = FragmentRegistrationProxy::new();
+static LEGACY_APPLY_PATCH_EXEC_COMMAND_WARNING_REGISTRATION: FragmentRegistrationProxy<
+    LegacyApplyPatchExecCommandWarning,
+> = FragmentRegistrationProxy::new();
+static LEGACY_MODEL_MISMATCH_WARNING_REGISTRATION: FragmentRegistrationProxy<
+    LegacyModelMismatchWarning,
+> = FragmentRegistrationProxy::new();
 
 static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &USER_INSTRUCTIONS_REGISTRATION,
     &ENVIRONMENT_CONTEXT_REGISTRATION,
+    &ADDITIONAL_CONTEXT_REGISTRATION,
     &SKILL_INSTRUCTIONS_REGISTRATION,
     &USER_SHELL_COMMAND_REGISTRATION,
     &TURN_ABORTED_REGISTRATION,
     &SUBAGENT_NOTIFICATION_REGISTRATION,
-];
-
-static MEMORY_EXCLUDED_CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
-    &USER_INSTRUCTIONS_REGISTRATION,
-    &SKILL_INSTRUCTIONS_REGISTRATION,
+    &INTERNAL_MODEL_CONTEXT_REGISTRATION,
+    &LEGACY_UNIFIED_EXEC_PROCESS_LIMIT_WARNING_REGISTRATION,
+    &LEGACY_APPLY_PATCH_EXEC_COMMAND_WARNING_REGISTRATION,
+    &LEGACY_MODEL_MISMATCH_WARNING_REGISTRATION,
 ];
 
 fn is_standard_contextual_user_text(text: &str) -> bool {
     CONTEXTUAL_USER_FRAGMENTS
-        .iter()
-        .any(|fragment| fragment.matches_text(text))
-}
-
-/// Returns whether a contextual user fragment should be omitted from memory
-/// stage-1 inputs.
-///
-/// We exclude injected `AGENTS.md` instructions and skill payloads because
-/// they are prompt scaffolding rather than conversation content, so they do
-/// not improve the resulting memory. We keep environment context and
-/// subagent notifications because they can carry useful execution context or
-/// subtask outcomes that should remain visible to memory generation.
-pub(crate) fn is_memory_excluded_contextual_user_fragment(content_item: &ContentItem) -> bool {
-    let ContentItem::InputText { text } = content_item else {
-        return false;
-    };
-    MEMORY_EXCLUDED_CONTEXTUAL_USER_FRAGMENTS
         .iter()
         .any(|fragment| fragment.matches_text(text))
 }

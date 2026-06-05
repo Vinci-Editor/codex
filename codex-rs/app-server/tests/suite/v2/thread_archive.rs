@@ -1,5 +1,5 @@
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::create_fake_rollout;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
@@ -38,7 +38,7 @@ async fn thread_archive_requires_materialized_rollout() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     // Start a thread.
@@ -63,7 +63,7 @@ async fn thread_archive_requires_materialized_rollout() -> Result<()> {
         rollout_path.display()
     );
     assert!(
-        find_thread_path_by_id_str(codex_home.path(), &thread.id)
+        find_thread_path_by_id_str(codex_home.path(), &thread.id, /*state_db_ctx*/ None)
             .await?
             .is_none(),
         "thread id should not be discoverable before rollout materialization"
@@ -93,6 +93,7 @@ async fn thread_archive_requires_materialized_rollout() -> Result<()> {
     let turn_start_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "materialize".to_string(),
                 text_elements: Vec::new(),
@@ -118,9 +119,10 @@ async fn thread_archive_requires_materialized_rollout() -> Result<()> {
         rollout_path.display()
     );
 
-    let discovered_path = find_thread_path_by_id_str(codex_home.path(), &thread.id)
-        .await?
-        .expect("expected rollout path for thread id to exist after materialization");
+    let discovered_path =
+        find_thread_path_by_id_str(codex_home.path(), &thread.id, /*state_db_ctx*/ None)
+            .await?
+            .expect("expected rollout path for thread id to exist after materialization");
     assert_paths_match_on_disk(&discovered_path, &rollout_path)?;
 
     let archive_id = mcp
@@ -219,7 +221,7 @@ async fn thread_archive_archives_spawned_descendants() -> Result<()> {
         )
         .await?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let archive_id = mcp
@@ -252,15 +254,23 @@ async fn thread_archive_archives_spawned_descendants() -> Result<()> {
 
     for thread_id in [parent_thread_id, child_thread_id, grandchild_thread_id] {
         assert!(
-            find_thread_path_by_id_str(codex_home.path(), &thread_id.to_string())
-                .await?
-                .is_none(),
+            find_thread_path_by_id_str(
+                codex_home.path(),
+                &thread_id.to_string(),
+                /*state_db_ctx*/ None,
+            )
+            .await?
+            .is_none(),
             "expected active rollout for {thread_id} to be archived"
         );
         assert!(
-            find_archived_thread_path_by_id_str(codex_home.path(), &thread_id.to_string())
-                .await?
-                .is_some(),
+            find_archived_thread_path_by_id_str(
+                codex_home.path(),
+                &thread_id.to_string(),
+                /*state_db_ctx*/ None,
+            )
+            .await?
+            .is_some(),
             "expected archived rollout for {thread_id} to exist"
         );
     }
@@ -322,16 +332,17 @@ async fn thread_archive_succeeds_when_descendant_archive_fails() -> Result<()> {
         )
         .await?;
 
-    let child_rollout_path = find_thread_path_by_id_str(codex_home.path(), &child_id)
-        .await?
-        .expect("child rollout path");
+    let child_rollout_path =
+        find_thread_path_by_id_str(codex_home.path(), &child_id, /*state_db_ctx*/ None)
+            .await?
+            .expect("child rollout path");
     let archived_child_path = codex_home
         .path()
         .join(ARCHIVED_SESSIONS_SUBDIR)
         .join(child_rollout_path.file_name().expect("rollout file name"));
     std::fs::create_dir_all(&archived_child_path)?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let archive_id = mcp
@@ -381,15 +392,23 @@ async fn thread_archive_succeeds_when_descendant_archive_fails() -> Result<()> {
     );
     for thread_id in [parent_thread_id, grandchild_thread_id] {
         assert!(
-            find_thread_path_by_id_str(codex_home.path(), &thread_id.to_string())
-                .await?
-                .is_none(),
+            find_thread_path_by_id_str(
+                codex_home.path(),
+                &thread_id.to_string(),
+                /*state_db_ctx*/ None,
+            )
+            .await?
+            .is_none(),
             "expected active rollout for {thread_id} to be archived"
         );
         assert!(
-            find_archived_thread_path_by_id_str(codex_home.path(), &thread_id.to_string())
-                .await?
-                .is_some(),
+            find_archived_thread_path_by_id_str(
+                codex_home.path(),
+                &thread_id.to_string(),
+                /*state_db_ctx*/ None,
+            )
+            .await?
+            .is_some(),
             "expected archived rollout for {thread_id} to exist"
         );
     }
@@ -427,7 +446,7 @@ async fn thread_archive_succeeds_when_spawned_descendant_is_missing() -> Result<
         )
         .await?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let archive_id = mcp
@@ -455,15 +474,19 @@ async fn thread_archive_succeeds_when_spawned_descendant_is_missing() -> Result<
     assert_eq!(archived_notification.thread_id, parent_id);
 
     assert!(
-        find_thread_path_by_id_str(codex_home.path(), &parent_id)
+        find_thread_path_by_id_str(codex_home.path(), &parent_id, /*state_db_ctx*/ None)
             .await?
             .is_none(),
         "parent should be archived even when a descendant is missing"
     );
     assert!(
-        find_archived_thread_path_by_id_str(codex_home.path(), &parent_id)
-            .await?
-            .is_some(),
+        find_archived_thread_path_by_id_str(
+            codex_home.path(),
+            &parent_id,
+            /*state_db_ctx*/ None,
+        )
+        .await?
+        .is_some(),
         "parent should be moved into archived sessions"
     );
 
@@ -476,7 +499,7 @@ async fn thread_archive_clears_stale_subscriptions_before_resume() -> Result<()>
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut primary = McpProcess::new(codex_home.path()).await?;
+    let mut primary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
 
     let start_id = primary
@@ -495,6 +518,7 @@ async fn thread_archive_clears_stale_subscriptions_before_resume() -> Result<()>
     let turn_start_id = primary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "materialize".to_string(),
                 text_elements: Vec::new(),
@@ -515,7 +539,7 @@ async fn thread_archive_clears_stale_subscriptions_before_resume() -> Result<()>
     .await??;
     primary.clear_message_buffer();
 
-    let mut secondary = McpProcess::new(codex_home.path()).await?;
+    let mut secondary = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
 
     let archive_id = primary
@@ -572,6 +596,7 @@ async fn thread_archive_clears_stale_subscriptions_before_resume() -> Result<()>
     let resumed_turn_id = secondary
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id,
+            client_user_message_id: None,
             input: vec![UserInput::Text {
                 text: "secondary turn".to_string(),
                 text_elements: Vec::new(),

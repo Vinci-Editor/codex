@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::MarketplaceRemoveParams;
@@ -10,7 +10,7 @@ use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::RequestId;
 use codex_config::MarketplaceConfigUpdate;
 use codex_config::record_user_marketplace;
-use codex_core::plugins::marketplace_install_root;
+use codex_core_plugins::installed_marketplaces::marketplace_install_root;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -53,7 +53,7 @@ async fn marketplace_remove_deletes_config_and_installed_root() -> Result<()> {
     write_installed_marketplace(codex_home.path(), "debug")?;
     let installed_root = marketplace_install_root(codex_home.path()).join("debug");
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -91,7 +91,7 @@ async fn marketplace_remove_deletes_config_and_installed_root() -> Result<()> {
 async fn marketplace_remove_rejects_unknown_marketplace() -> Result<()> {
     let codex_home = TempDir::new()?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp

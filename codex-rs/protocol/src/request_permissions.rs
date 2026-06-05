@@ -1,6 +1,6 @@
+use crate::models::AdditionalPermissionProfile;
 use crate::models::FileSystemPermissions;
 use crate::models::NetworkPermissions;
-use crate::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -28,7 +28,7 @@ impl RequestPermissionProfile {
     }
 }
 
-impl From<RequestPermissionProfile> for PermissionProfile {
+impl From<RequestPermissionProfile> for AdditionalPermissionProfile {
     fn from(value: RequestPermissionProfile) -> Self {
         Self {
             network: value.network,
@@ -37,8 +37,8 @@ impl From<RequestPermissionProfile> for PermissionProfile {
     }
 }
 
-impl From<PermissionProfile> for RequestPermissionProfile {
-    fn from(value: PermissionProfile) -> Self {
+impl From<AdditionalPermissionProfile> for RequestPermissionProfile {
+    fn from(value: AdditionalPermissionProfile) -> Self {
         Self {
             network: value.network,
             file_system: value.file_system,
@@ -48,6 +48,14 @@ impl From<PermissionProfile> for RequestPermissionProfile {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct RequestPermissionsArgs {
+    #[serde(
+        default,
+        rename = "environment_id",
+        alias = "environmentId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub environment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub permissions: RequestPermissionProfile,
@@ -58,6 +66,9 @@ pub struct RequestPermissionsResponse {
     pub permissions: RequestPermissionProfile,
     #[serde(default)]
     pub scope: PermissionGrantScope,
+    /// Review every subsequent command in this turn before normal sandboxed execution.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict_auto_review: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -68,6 +79,17 @@ pub struct RequestPermissionsEvent {
     /// Uses `#[serde(default)]` for backwards compatibility.
     #[serde(default)]
     pub turn_id: String,
+    #[serde(
+        default,
+        rename = "environmentId",
+        alias = "environment_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    #[ts(rename = "environmentId")]
+    pub environment_id: Option<String>,
+    #[ts(type = "number")]
+    pub started_at_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub permissions: RequestPermissionProfile,

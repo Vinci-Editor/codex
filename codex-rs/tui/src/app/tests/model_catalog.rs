@@ -1,7 +1,9 @@
 use super::*;
+use assert_matches::assert_matches;
 use codex_config::types::ModelAvailabilityNuxConfig;
 use codex_protocol::openai_models::ModelAvailabilityNux;
 use pretty_assertions::assert_eq;
+use tokio::sync::mpsc::unbounded_channel;
 
 fn all_model_presets() -> Vec<ModelPreset> {
     crate::legacy_core::test_support::all_model_presets().clone()
@@ -173,6 +175,101 @@ fn select_model_availability_nux_returns_none_when_all_models_are_exhausted() {
 }
 
 #[tokio::test]
+async fn prepare_startup_tooltip_override_persists_model_availability_nux_count() {
+    let codex_home = tempdir().expect("temp codex home");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config");
+    let mut presets = all_model_presets();
+    presets.iter_mut().for_each(|preset| {
+        preset.availability_nux = None;
+    });
+    let target = presets
+        .iter_mut()
+        .find(|preset| preset.model == "gpt-5.4")
+        .expect("target preset present");
+    target.availability_nux = Some(ModelAvailabilityNux {
+        message: "gpt-5.4 is available".to_string(),
+    });
+
+    let tooltip =
+        prepare_startup_tooltip_override(&mut config, &presets, /*is_first_run*/ false).await;
+
+    assert_eq!(tooltip.as_deref(), Some("gpt-5.4 is available"));
+    assert_eq!(
+        config.model_availability_nux.shown_count,
+        HashMap::from([("gpt-5.4".to_string(), 1)])
+    );
+
+    let reloaded = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("reloaded config");
+    assert_eq!(
+        reloaded.model_availability_nux.shown_count,
+        HashMap::from([("gpt-5.4".to_string(), 1)])
+    );
+}
+
+#[tokio::test]
+async fn accepted_model_migration_persists_target_default_reasoning_effort() {
+    let codex_home = tempdir().expect("temp codex home");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config");
+    config.model = Some("gpt-5.2".to_string());
+    config.model_reasoning_effort = Some(ReasoningEffortConfig::XHigh);
+
+    let (tx_raw, mut rx) = unbounded_channel();
+    let app_event_tx = AppEventSender::new(tx_raw);
+
+    apply_accepted_model_migration(
+        &mut config,
+        &app_event_tx,
+        "gpt-5.2".to_string(),
+        "gpt-5.4".to_string(),
+        ReasoningEffortConfig::Medium,
+    );
+
+    assert_eq!(config.model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(
+        config.model_reasoning_effort,
+        Some(ReasoningEffortConfig::Medium)
+    );
+
+    let acknowledged = rx.try_recv().expect("acknowledged event");
+    assert_matches!(
+        acknowledged,
+        AppEvent::PersistModelMigrationPromptAcknowledged { from_model, to_model }
+            if from_model == "gpt-5.2" && to_model == "gpt-5.4"
+    );
+
+    let update_model = rx.try_recv().expect("update model event");
+    assert_matches!(
+        update_model,
+        AppEvent::UpdateModel(model) if model == "gpt-5.4"
+    );
+
+    let update_effort = rx.try_recv().expect("update effort event");
+    assert_matches!(
+        update_effort,
+        AppEvent::UpdateReasoningEffort(Some(ReasoningEffortConfig::Medium))
+    );
+
+    let persist_selection = rx.try_recv().expect("persist model selection event");
+    assert_matches!(
+        persist_selection,
+        AppEvent::PersistModelSelection { model, effort }
+            if model == "gpt-5.4" && effort == Some(ReasoningEffortConfig::Medium)
+    );
+}
+
+#[tokio::test]
 async fn model_migration_prompt_respects_hide_flag_and_self_target() {
     let mut seen = BTreeMap::new();
     seen.insert("gpt-5.2".to_string(), "gpt-5.4".to_string());
@@ -200,7 +297,6 @@ async fn model_migration_prompt_skips_when_target_missing_or_hidden() {
         .expect("preset present");
     current.upgrade = Some(ModelUpgrade {
         id: "missing-target".to_string(),
-        reasoning_effort_mapping: None,
         migration_config_key: HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG.to_string(),
         model_link: None,
         upgrade_copy: None,

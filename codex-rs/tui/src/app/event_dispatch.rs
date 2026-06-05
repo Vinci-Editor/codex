@@ -3,7 +3,12 @@
 //! This module contains the exhaustive `AppEvent` dispatcher and exit-mode handling. Large domain
 //! actions are delegated to focused app submodules so the central match remains the routing layer.
 
+use super::resize_reflow::trailing_run_start;
 use super::*;
+#[cfg(target_os = "windows")]
+use codex_config::types::WindowsSandboxModeToml;
+
+const SHUTDOWN_FIRST_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
 
 impl App {
     pub(super) async fn handle_event(
@@ -20,6 +25,10 @@ impl App {
                 )
                 .await;
             }
+            AppEvent::StartupThreadStarted { result } => {
+                self.handle_startup_thread_started(app_server, result)
+                    .await?;
+            }
             AppEvent::ClearUi => {
                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
                 self.reset_app_ui_state_after_clear();
@@ -31,6 +40,9 @@ impl App {
                     /*initial_user_message*/ None,
                 )
                 .await;
+            }
+            AppEvent::RawOutputModeChanged { enabled } => {
+                self.apply_raw_output_mode(tui, enabled, /*notify*/ false);
             }
             AppEvent::ClearUiAndSubmitUserMessage { text } => {
                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
@@ -51,13 +63,8 @@ impl App {
             AppEvent::OpenResumePicker => {
                 let picker_app_server = match crate::start_app_server_for_picker(
                     &self.config,
-                    &match self.remote_app_server_url.clone() {
-                        Some(websocket_url) => crate::AppServerTarget::Remote {
-                            websocket_url,
-                            auth_token: self.remote_app_server_auth_token.clone(),
-                        },
-                        None => crate::AppServerTarget::Embedded,
-                    },
+                    &self.app_server_target,
+                    self.state_db.clone(),
                     self.environment_manager.clone(),
                 )
                 .await
@@ -70,7 +77,7 @@ impl App {
                         return Ok(AppRunControl::Continue);
                     }
                 };
-                match crate::resume_picker::run_resume_picker_with_app_server(
+                match crate::resume_picker::run_resume_picker_from_existing_session_with_app_server(
                     tui,
                     &self.config,
                     /*show_all*/ false,
@@ -90,9 +97,13 @@ impl App {
                             }
                         }
                     }
-                    SessionSelection::Exit
-                    | SessionSelection::StartFresh
-                    | SessionSelection::Fork(_) => {}
+                    SessionSelection::Exit | SessionSelection::StartFresh => {
+                        self.refresh_in_memory_config_from_disk_best_effort(
+                            "closing the session picker",
+                        )
+                        .await;
+                    }
+                    SessionSelection::Fork(_) => {}
                 }
 
                 // Leaving alt-screen may blank the inline viewport; force a redraw either way.
@@ -111,6 +122,9 @@ impl App {
                         ));
                     }
                 }
+            }
+            AppEvent::ArchiveCurrentThread => {
+                return Ok(self.archive_current_thread(app_server).await);
             }
             AppEvent::ForkCurrentSession => {
                 self.session_telemetry.counter(
@@ -144,7 +158,7 @@ impl App {
                                         if let Some(usage_line) = summary.usage_line {
                                             lines.push(usage_line.into());
                                         }
-                                        if let Some(command) = summary.resume_command {
+                                        if let Some(command) = summary.resume_hint {
                                             let spans = vec![
                                                 "To continue this session, run ".into(),
                                                 command.cyan(),
@@ -176,6 +190,12 @@ impl App {
 
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::BeginInitialHistoryReplayBuffer => {
+                self.begin_initial_history_replay_buffer();
+            }
+            AppEvent::BeginThreadSwitchHistoryReplayBuffer => {
+                self.begin_thread_switch_history_replay_buffer();
+            }
             AppEvent::InsertHistoryCell(cell) => {
                 let cell: Arc<dyn HistoryCell> = cell.into();
                 if let Some(Overlay::Transcript(t)) = &mut self.overlay {
@@ -183,23 +203,75 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
                 self.transcript_cells.push(cell.clone());
-                let mut display = cell.display_lines(tui.terminal.last_known_screen_size.width);
-                if !display.is_empty() {
-                    // Only insert a separating blank line for new cells that are not
-                    // part of an ongoing stream. Streaming continuations should not
-                    // accrue extra blank lines between chunks.
-                    if !cell.is_stream_continuation() {
-                        if self.has_emitted_history_lines {
-                            display.insert(0, Line::from(""));
-                        } else {
-                            self.has_emitted_history_lines = true;
-                        }
+                if self.initial_history_replay_buffer.as_ref().is_some() {
+                    self.insert_history_cell_lines_with_initial_replay_buffer(
+                        tui,
+                        cell.as_ref(),
+                        self.chat_widget
+                            .history_wrap_width(tui.terminal.last_known_screen_size.width),
+                    );
+                } else {
+                    self.insert_history_cell_lines(
+                        tui,
+                        cell.as_ref(),
+                        self.chat_widget
+                            .history_wrap_width(tui.terminal.last_known_screen_size.width),
+                    );
+                }
+            }
+            AppEvent::EndInitialHistoryReplayBuffer => {
+                self.finish_initial_history_replay_buffer(tui);
+            }
+            AppEvent::ConsolidateAgentMessage {
+                source,
+                cwd,
+                scrollback_reflow,
+                deferred_history_cell,
+            } => {
+                self.handle_consolidate_agent_message(
+                    tui,
+                    source,
+                    cwd,
+                    scrollback_reflow,
+                    deferred_history_cell,
+                )?;
+            }
+            AppEvent::ConsolidateProposedPlan(source) => {
+                if !self.terminal_resize_reflow_enabled() {
+                    self.transcript_reflow.clear();
+                    return Ok(AppRunControl::Continue);
+                }
+                let end = self.transcript_cells.len();
+                let start = trailing_run_start::<history_cell::ProposedPlanStreamCell>(
+                    &self.transcript_cells,
+                );
+                let consolidated: Arc<dyn HistoryCell> =
+                    Arc::new(history_cell::new_proposed_plan(source, &self.config.cwd));
+
+                if start < end {
+                    self.transcript_cells
+                        .splice(start..end, std::iter::once(consolidated.clone()));
+
+                    if let Some(Overlay::Transcript(t)) = &mut self.overlay {
+                        t.consolidate_cells(start..end, consolidated.clone());
+                        tui.frame_requester().schedule_frame();
                     }
-                    if self.overlay.is_some() {
-                        self.deferred_history_lines.extend(display);
-                    } else {
-                        tui.insert_history_lines(display);
+
+                    self.finish_required_stream_reflow(tui)?;
+                } else {
+                    self.transcript_cells.push(consolidated.clone());
+                    if let Some(Overlay::Transcript(t)) = &mut self.overlay {
+                        t.insert_cell(consolidated.clone());
+                        tui.frame_requester().schedule_frame();
                     }
+                    self.insert_history_cell_lines(
+                        tui,
+                        consolidated.as_ref(),
+                        self.chat_widget
+                            .history_wrap_width(tui.terminal.last_known_screen_size.width),
+                    );
+
+                    self.maybe_finish_stream_reflow(tui)?;
                 }
             }
             AppEvent::ApplyThreadRollback { num_turns } => {
@@ -230,10 +302,14 @@ impl App {
                 self.chat_widget.on_commit_tick();
             }
             AppEvent::Exit(mode) => {
+                if mode == ExitMode::ShutdownFirst {
+                    self.show_shutdown_feedback(tui)?;
+                }
                 return Ok(self.handle_exit_mode(app_server, mode).await);
             }
             AppEvent::Logout => match app_server.logout_account().await {
                 Ok(()) => {
+                    self.show_shutdown_feedback(tui)?;
                     return Ok(self
                         .handle_exit_mode(app_server, ExitMode::ShutdownFirst)
                         .await);
@@ -248,11 +324,37 @@ impl App {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
             AppEvent::CodexOp(op) => {
-                self.submit_active_thread_op(app_server, op.into()).await?;
+                self.chat_widget.prepare_local_op_submission(&op);
+                self.submit_active_thread_op(app_server, op).await?;
+            }
+            AppEvent::RestoreCancelledTurn(prompt) => {
+                self.apply_cancelled_turn_edit(prompt);
+            }
+            AppEvent::AppendMessageHistoryEntry { thread_id, text } => {
+                self.append_message_history_entry(thread_id, text);
+            }
+            AppEvent::SyncThreadGitBranch { thread_id, branch } => {
+                if let Err(err) = app_server
+                    .thread_metadata_update_branch(thread_id, branch)
+                    .await
+                {
+                    tracing::warn!("failed to sync thread git branch from directive: {err}");
+                }
+            }
+            AppEvent::LookupMessageHistoryEntry {
+                thread_id,
+                offset,
+                log_id,
+            } => {
+                self.lookup_message_history_entry(thread_id, offset, log_id)
+                    .await?;
+            }
+            AppEvent::ApproveRecentAutoReviewDenial { thread_id, id } => {
+                self.chat_widget
+                    .approve_recent_auto_review_denial(thread_id, id);
             }
             AppEvent::SubmitThreadOp { thread_id, op } => {
-                self.submit_thread_op(app_server, thread_id, op.into())
-                    .await?;
+                self.submit_thread_op(app_server, thread_id, op).await?;
             }
             AppEvent::ThreadHistoryEntryResponse { thread_id, event } => {
                 self.enqueue_thread_history_entry_response(thread_id, event)
@@ -271,6 +373,7 @@ impl App {
                 self.overlay = Some(Overlay::new_static_with_lines(
                     pager_lines,
                     "D I F F".to_string(),
+                    self.keymap.pager.clone(),
                 ));
                 tui.frame_requester().schedule_frame();
             }
@@ -300,8 +403,38 @@ impl App {
             AppEvent::OpenUrlInBrowser { url } => {
                 self.open_url_in_browser(url);
             }
+            AppEvent::OpenDesktopThread { thread_id } => {
+                self.open_desktop_thread(thread_id);
+            }
+            AppEvent::PetSelected { pet_id } => {
+                self.handle_pet_selected(tui, pet_id);
+            }
+            AppEvent::PetDisabled => {
+                self.handle_pet_disabled(tui).await;
+            }
+            AppEvent::PetPreviewRequested { pet_id } => {
+                self.chat_widget.start_pet_picker_preview(pet_id);
+            }
+            AppEvent::PetPreviewLoaded { request_id, result } => {
+                self.handle_pet_preview_loaded(tui, request_id, result);
+            }
+            AppEvent::PetSelectionLoaded {
+                request_id,
+                pet_id,
+                result,
+            } => {
+                return self
+                    .handle_pet_selection_loaded(tui, request_id, pet_id, result)
+                    .await;
+            }
+            AppEvent::ConfiguredPetLoaded { pet_id, result } => {
+                self.handle_configured_pet_loaded(tui, pet_id, result);
+            }
             AppEvent::RefreshConnectors { force_refetch } => {
                 self.chat_widget.refresh_connectors(force_refetch);
+            }
+            AppEvent::FetchConnectorsList { force_refetch } => {
+                self.fetch_connectors_list(app_server, force_refetch);
             }
             AppEvent::PluginInstallAuthAdvance { refresh_connectors } => {
                 if refresh_connectors {
@@ -314,6 +447,34 @@ impl App {
             }
             AppEvent::FetchPluginsList { cwd } => {
                 self.fetch_plugins_list(app_server, cwd);
+            }
+            AppEvent::FetchHooksList { cwd } => {
+                self.fetch_hooks_list(app_server, cwd);
+            }
+            AppEvent::OpenMarketplaceAddPrompt => {
+                self.chat_widget.open_marketplace_add_prompt();
+            }
+            AppEvent::OpenMarketplaceAddLoading { source } => {
+                self.chat_widget.open_marketplace_add_loading_popup(&source);
+            }
+            AppEvent::OpenMarketplaceRemoveConfirm {
+                marketplace_name,
+                marketplace_display_name,
+            } => {
+                self.chat_widget.open_marketplace_remove_confirmation(
+                    marketplace_name,
+                    marketplace_display_name,
+                );
+            }
+            AppEvent::OpenMarketplaceRemoveLoading {
+                marketplace_display_name,
+            } => {
+                self.chat_widget
+                    .open_marketplace_remove_loading_popup(&marketplace_display_name);
+            }
+            AppEvent::OpenMarketplaceUpgradeLoading { marketplace_name } => {
+                self.chat_widget
+                    .open_marketplace_upgrade_loading_popup(marketplace_name.as_deref());
             }
             AppEvent::OpenPluginDetailLoading {
                 plugin_display_name,
@@ -335,6 +496,73 @@ impl App {
             }
             AppEvent::PluginsLoaded { cwd, result } => {
                 self.chat_widget.on_plugins_loaded(cwd, result);
+            }
+            AppEvent::HooksLoaded { cwd, result } => {
+                self.chat_widget.on_hooks_loaded(cwd, result);
+            }
+            AppEvent::FetchMarketplaceAdd { cwd, source } => {
+                self.fetch_marketplace_add(app_server, cwd, source);
+            }
+            AppEvent::FetchMarketplaceUpgrade {
+                cwd,
+                marketplace_name,
+            } => {
+                self.fetch_marketplace_upgrade(app_server, cwd, marketplace_name);
+            }
+            AppEvent::MarketplaceAddLoaded {
+                cwd,
+                source,
+                result,
+            } => {
+                let add_succeeded = result.is_ok();
+                self.chat_widget
+                    .on_marketplace_add_loaded(cwd.clone(), source, result);
+                if add_succeeded && self.chat_widget.config_ref().cwd.as_path() == cwd.as_path() {
+                    self.fetch_plugins_list(app_server, cwd);
+                }
+            }
+            AppEvent::MarketplaceUpgradeLoaded { cwd, result } => {
+                let marketplace_contents_changed =
+                    matches!(&result, Ok(response) if !response.upgraded_roots.is_empty());
+                if marketplace_contents_changed {
+                    self.refresh_plugin_mentions_after_config_write();
+                }
+                self.chat_widget
+                    .on_marketplace_upgrade_loaded(cwd.clone(), result);
+                if self.chat_widget.config_ref().cwd.as_path() == cwd.as_path() {
+                    self.fetch_plugins_list(app_server, cwd);
+                }
+            }
+            AppEvent::FetchMarketplaceRemove {
+                cwd,
+                marketplace_name,
+                marketplace_display_name,
+            } => {
+                self.fetch_marketplace_remove(
+                    app_server,
+                    cwd,
+                    marketplace_name,
+                    marketplace_display_name,
+                );
+            }
+            AppEvent::MarketplaceRemoveLoaded {
+                cwd,
+                marketplace_name,
+                marketplace_display_name,
+                result,
+            } => {
+                let remove_succeeded = result.is_ok();
+                self.chat_widget.on_marketplace_remove_loaded(
+                    cwd.clone(),
+                    marketplace_name,
+                    marketplace_display_name,
+                    result,
+                );
+                if remove_succeeded && self.chat_widget.config_ref().cwd.as_path() == cwd.as_path()
+                {
+                    self.refresh_plugin_mentions_after_config_write();
+                    self.fetch_plugins_list(app_server, cwd);
+                }
             }
             AppEvent::FetchPluginDetail { cwd, params } => {
                 self.fetch_plugin_detail(app_server, cwd, params);
@@ -379,11 +607,7 @@ impl App {
             } => {
                 let install_succeeded = result.is_ok();
                 if install_succeeded {
-                    if let Err(err) = self.refresh_in_memory_config_from_disk().await {
-                        tracing::warn!(error = %err, "failed to refresh config after plugin install");
-                    }
-                    self.chat_widget.refresh_plugin_mentions();
-                    self.chat_widget.submit_op(AppCommand::reload_user_config());
+                    self.refresh_plugin_mentions_after_config_write();
                 }
                 let should_refresh_plugin_detail = self.chat_widget.on_plugin_install_loaded(
                     cwd.clone(),
@@ -435,24 +659,21 @@ impl App {
                     self.pending_plugin_enabled_writes.remove(&plugin_id);
                     let update_succeeded = result.is_ok();
                     if update_succeeded {
-                        if let Err(err) = self.refresh_in_memory_config_from_disk().await {
-                            tracing::warn!(
-                                error = %err,
-                                "failed to refresh config after plugin toggle"
-                            );
-                        }
-                        self.chat_widget.refresh_plugin_mentions();
-                        self.chat_widget.submit_op(AppCommand::reload_user_config());
+                        self.refresh_plugin_mentions_after_config_write();
                     }
                     self.chat_widget
                         .on_plugin_enabled_set(cwd, plugin_id, enabled, result);
                 }
             }
-            AppEvent::FetchMcpInventory { detail } => {
-                self.fetch_mcp_inventory(app_server, detail);
+            AppEvent::FetchMcpInventory { detail, thread_id } => {
+                self.fetch_mcp_inventory(app_server, detail, thread_id);
             }
-            AppEvent::McpInventoryLoaded { result, detail } => {
-                self.handle_mcp_inventory_result(result, detail);
+            AppEvent::McpInventoryLoaded {
+                result,
+                detail,
+                thread_id,
+            } => {
+                self.handle_mcp_inventory_result(result, detail, thread_id);
             }
             AppEvent::SkillsListLoaded { result } => {
                 self.handle_skills_list_result(
@@ -468,6 +689,27 @@ impl App {
             }
             AppEvent::RefreshRateLimits { origin } => {
                 self.refresh_rate_limits(app_server, origin);
+            }
+            AppEvent::OpenThreadGoalMenu { thread_id } => {
+                self.open_thread_goal_menu(app_server, thread_id).await;
+            }
+            AppEvent::OpenThreadGoalEditor { thread_id } => {
+                self.open_thread_goal_editor(app_server, thread_id).await;
+            }
+            AppEvent::SetThreadGoalObjective {
+                thread_id,
+                objective,
+                mode,
+            } => {
+                self.set_thread_goal_objective(app_server, thread_id, objective, mode)
+                    .await;
+            }
+            AppEvent::SetThreadGoalStatus { thread_id, status } => {
+                self.set_thread_goal_status(app_server, thread_id, status)
+                    .await;
+            }
+            AppEvent::ClearThreadGoal { thread_id } => {
+                self.clear_thread_goal(app_server, thread_id).await;
             }
             AppEvent::SendAddCreditsNudgeEmail { credit_type } => {
                 if self
@@ -508,16 +750,21 @@ impl App {
                 self.chat_widget.on_connectors_loaded(result, is_final);
             }
             AppEvent::UpdateReasoningEffort(effort) => {
-                self.on_update_reasoning_effort(effort);
+                self.on_update_reasoning_effort(effort.clone());
+                self.sync_active_thread_reasoning_setting(app_server, effort)
+                    .await;
             }
             AppEvent::UpdateModel(model) => {
                 self.chat_widget.set_model(&model);
-            }
-            AppEvent::UpdateCollaborationMode(mask) => {
-                self.chat_widget.set_collaboration_mask(mask);
+                self.sync_active_thread_model_setting(app_server, model)
+                    .await;
+                self.sync_active_thread_service_tier_to_cached_session()
+                    .await;
             }
             AppEvent::UpdatePersonality(personality) => {
                 self.on_update_personality(personality);
+                self.sync_active_thread_personality_setting(app_server, personality)
+                    .await;
             }
             AppEvent::OpenRealtimeAudioDeviceSelection { kind } => {
                 self.chat_widget.open_realtime_audio_device_selection(kind);
@@ -544,18 +791,24 @@ impl App {
             AppEvent::OpenFullAccessConfirmation {
                 preset,
                 return_to_permissions,
+                profile_selection,
             } => {
-                self.chat_widget
-                    .open_full_access_confirmation(preset, return_to_permissions);
+                self.chat_widget.open_full_access_confirmation(
+                    preset,
+                    return_to_permissions,
+                    profile_selection,
+                );
             }
             AppEvent::OpenWorldWritableWarningConfirmation {
                 preset,
+                profile_selection,
                 sample_paths,
                 extra_count,
                 failed_scan,
             } => {
                 self.chat_widget.open_world_writable_warning_confirmation(
                     preset,
+                    profile_selection,
                     sample_paths,
                     extra_count,
                     failed_scan,
@@ -592,10 +845,17 @@ impl App {
                     self.launch_external_editor(tui).await;
                 }
             }
-            AppEvent::OpenWindowsSandboxEnablePrompt { preset } => {
-                self.chat_widget.open_windows_sandbox_enable_prompt(preset);
+            AppEvent::OpenWindowsSandboxEnablePrompt {
+                preset,
+                profile_selection,
+            } => {
+                self.chat_widget
+                    .open_windows_sandbox_enable_prompt(preset, profile_selection);
             }
-            AppEvent::OpenWindowsSandboxFallbackPrompt { preset } => {
+            AppEvent::OpenWindowsSandboxFallbackPrompt {
+                preset,
+                profile_selection,
+            } => {
                 self.session_telemetry.counter(
                     "codex.windows_sandbox.fallback_prompt_shown",
                     /*inc*/ 1,
@@ -610,14 +870,46 @@ impl App {
                     );
                 }
                 self.chat_widget
-                    .open_windows_sandbox_fallback_prompt(preset);
+                    .open_windows_sandbox_fallback_prompt(preset, profile_selection);
             }
-            AppEvent::BeginWindowsSandboxElevatedSetup { preset } => {
+            AppEvent::BeginWindowsSandboxElevatedSetup {
+                preset,
+                profile_selection,
+            } => {
+                #[cfg(any(target_os = "windows", test))]
+                if !self.chat_widget.windows_sandbox_mode_allowed(
+                    codex_config::types::WindowsSandboxModeToml::Elevated,
+                ) {
+                    tracing::warn!(
+                        "refusing to set up elevated Windows sandbox mode disallowed by requirements"
+                    );
+                    self.chat_widget.add_info_message(
+                        "That Windows sandbox option is disallowed by requirements.".to_string(),
+                        /*hint*/ None,
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
                 #[cfg(target_os = "windows")]
                 {
-                    let policy = preset.sandbox.clone();
-                    let policy_cwd = self.config.cwd.clone();
-                    let command_cwd = policy_cwd.clone();
+                    let setup_permissions = match self
+                        .windows_setup_permissions(&preset, profile_selection.as_ref())
+                        .await
+                    {
+                        Ok(setup_permissions) => setup_permissions,
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "failed to resolve permission profile for elevated Windows sandbox setup"
+                            );
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to prepare Windows sandbox for the selected permission profile: {err}"
+                            ));
+                            return Ok(AppRunControl::Continue);
+                        }
+                    };
+                    let permission_profile = setup_permissions.permission_profile;
+                    let workspace_roots = setup_permissions.workspace_roots;
+                    let command_cwd = self.config.cwd.clone();
                     let env_map: std::collections::HashMap<String, String> =
                         std::env::vars().collect();
                     let codex_home = self.config.codex_home.clone();
@@ -631,6 +923,7 @@ impl App {
                         tx.send(AppEvent::EnableWindowsSandboxForAgentMode {
                             preset,
                             mode: WindowsSandboxEnableMode::Elevated,
+                            profile_selection,
                         });
                         return Ok(AppRunControl::Continue);
                     }
@@ -640,8 +933,8 @@ impl App {
                     let session_telemetry = self.session_telemetry.clone();
                     tokio::task::spawn_blocking(move || {
                         let result = crate::legacy_core::windows_sandbox::run_elevated_setup(
-                            &policy,
-                            policy_cwd.as_path(),
+                            &permission_profile,
+                            workspace_roots.as_slice(),
                             command_cwd.as_path(),
                             &env_map,
                             codex_home.as_path(),
@@ -656,6 +949,7 @@ impl App {
                                 AppEvent::EnableWindowsSandboxForAgentMode {
                                     preset: preset.clone(),
                                     mode: WindowsSandboxEnableMode::Elevated,
+                                    profile_selection: profile_selection.clone(),
                                 }
                             }
                             Err(err) => {
@@ -687,7 +981,10 @@ impl App {
                                     error = %err,
                                     "failed to run elevated Windows sandbox setup"
                                 );
-                                AppEvent::OpenWindowsSandboxFallbackPrompt { preset }
+                                AppEvent::OpenWindowsSandboxFallbackPrompt {
+                                    preset,
+                                    profile_selection,
+                                }
                             }
                         };
                         tx.send(event);
@@ -695,15 +992,47 @@ impl App {
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
-                    let _ = preset;
+                    let _ = (preset, profile_selection);
                 }
             }
-            AppEvent::BeginWindowsSandboxLegacySetup { preset } => {
+            AppEvent::BeginWindowsSandboxLegacySetup {
+                preset,
+                profile_selection,
+            } => {
+                #[cfg(any(target_os = "windows", test))]
+                if !self.chat_widget.windows_sandbox_mode_allowed(
+                    codex_config::types::WindowsSandboxModeToml::Unelevated,
+                ) {
+                    tracing::warn!(
+                        "refusing to set up unelevated Windows sandbox mode disallowed by requirements"
+                    );
+                    self.chat_widget.add_info_message(
+                        "That Windows sandbox option is disallowed by requirements.".to_string(),
+                        /*hint*/ None,
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
                 #[cfg(target_os = "windows")]
                 {
-                    let policy = preset.sandbox.clone();
-                    let policy_cwd = self.config.cwd.clone();
-                    let command_cwd = policy_cwd.clone();
+                    let setup_permissions = match self
+                        .windows_setup_permissions(&preset, profile_selection.as_ref())
+                        .await
+                    {
+                        Ok(setup_permissions) => setup_permissions,
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "failed to resolve permission profile for legacy Windows sandbox setup"
+                            );
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to prepare Windows sandbox for the selected permission profile: {err}"
+                            ));
+                            return Ok(AppRunControl::Continue);
+                        }
+                    };
+                    let permission_profile = setup_permissions.permission_profile;
+                    let workspace_roots = setup_permissions.workspace_roots;
+                    let command_cwd = self.config.cwd.clone();
                     let env_map: std::collections::HashMap<String, String> =
                         std::env::vars().collect();
                     let codex_home = self.config.codex_home.clone();
@@ -714,8 +1043,8 @@ impl App {
                     tokio::task::spawn_blocking(move || {
                         if let Err(err) =
                             crate::legacy_core::windows_sandbox::run_legacy_setup_preflight(
-                                &policy,
-                                policy_cwd.as_path(),
+                                &permission_profile,
+                                workspace_roots.as_slice(),
                                 command_cwd.as_path(),
                                 &env_map,
                                 codex_home.as_path(),
@@ -734,12 +1063,13 @@ impl App {
                         tx.send(AppEvent::EnableWindowsSandboxForAgentMode {
                             preset,
                             mode: WindowsSandboxEnableMode::Legacy,
+                            profile_selection,
                         });
                     });
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
-                    let _ = preset;
+                    let _ = (preset, profile_selection);
                 }
             }
             AppEvent::BeginWindowsSandboxGrantReadRoot { path } => {
@@ -751,8 +1081,8 @@ impl App {
                             /*hint*/ None,
                         ));
 
-                    let policy = self.config.permissions.sandbox_policy.get().clone();
-                    let policy_cwd = self.config.cwd.clone();
+                    let permission_profile = self.config.permissions.effective_permission_profile();
+                    let workspace_roots = self.config.effective_workspace_roots();
                     let command_cwd = self.config.cwd.clone();
                     let env_map: std::collections::HashMap<String, String> =
                         std::env::vars().collect();
@@ -762,8 +1092,8 @@ impl App {
                     tokio::task::spawn_blocking(move || {
                         let requested_path = PathBuf::from(path);
                         let event = match crate::legacy_core::grant_read_root_non_elevated(
-                            &policy,
-                            policy_cwd.as_path(),
+                            &permission_profile,
+                            workspace_roots.as_slice(),
                             command_cwd.as_path(),
                             &env_map,
                             codex_home.as_path(),
@@ -799,7 +1129,11 @@ impl App {
                         ));
                 }
             },
-            AppEvent::EnableWindowsSandboxForAgentMode { preset, mode } => {
+            AppEvent::EnableWindowsSandboxForAgentMode {
+                preset,
+                mode,
+                profile_selection,
+            } => {
                 #[cfg(target_os = "windows")]
                 {
                     self.chat_widget.clear_windows_sandbox_setup_status();
@@ -810,18 +1144,36 @@ impl App {
                             &[("result", "success")],
                         );
                     }
-                    let profile = self.active_profile.as_deref();
-                    let elevated_enabled = matches!(mode, WindowsSandboxEnableMode::Elevated);
-                    let builder = ConfigEditsBuilder::new(&self.config.codex_home)
-                        .with_profile(profile)
-                        .set_windows_sandbox_mode(if elevated_enabled {
-                            "elevated"
-                        } else {
-                            "unelevated"
-                        })
-                        .clear_legacy_windows_sandbox_keys();
-                    match builder.apply().await {
-                        Ok(()) => {
+                    let selected_mode = match mode {
+                        WindowsSandboxEnableMode::Elevated => WindowsSandboxModeToml::Elevated,
+                        WindowsSandboxEnableMode::Legacy => WindowsSandboxModeToml::Unelevated,
+                    };
+                    let elevated_enabled = selected_mode == WindowsSandboxModeToml::Elevated;
+                    if !self.chat_widget.windows_sandbox_mode_allowed(selected_mode) {
+                        tracing::warn!(
+                            ?selected_mode,
+                            "refusing to persist Windows sandbox mode disallowed by requirements"
+                        );
+                        self.chat_widget.add_info_message(
+                            "That Windows sandbox option is disallowed by requirements."
+                                .to_string(),
+                            /*hint*/ None,
+                        );
+                        return Ok(AppRunControl::Continue);
+                    }
+                    let edits =
+                        crate::config_update::build_windows_sandbox_mode_edits(elevated_enabled);
+                    match crate::config_update::write_config_batch(
+                        app_server.request_handle(),
+                        edits,
+                    )
+                    .await
+                    {
+                        Ok(response) if response.status == WriteStatus::OkOverridden => {
+                            self.sync_windows_sandbox_after_overridden_write(app_server, &response)
+                                .await;
+                        }
+                        Ok(_) => {
                             if elevated_enabled {
                                 self.config.set_windows_sandbox_enabled(/*value*/ false);
                                 self.config
@@ -844,7 +1196,8 @@ impl App {
                                         /*cwd*/ None,
                                         /*approval_policy*/ None,
                                         /*approvals_reviewer*/ None,
-                                        /*sandbox_policy*/ None,
+                                        /*permission_profile*/ None,
+                                        /*active_permission_profile*/ None,
                                         #[cfg(target_os = "windows")]
                                         Some(windows_sandbox_level),
                                         /*model*/ None,
@@ -853,24 +1206,25 @@ impl App {
                                         /*service_tier*/ None,
                                         /*collaboration_mode*/ None,
                                         /*personality*/ None,
-                                    )
-                                    .into(),
+                                    ),
                                 ));
                                 self.app_event_tx.send(
                                     AppEvent::OpenWorldWritableWarningConfirmation {
                                         preset: Some(preset.clone()),
+                                        profile_selection: profile_selection.clone(),
                                         sample_paths,
                                         extra_count,
                                         failed_scan,
                                     },
                                 );
-                            } else {
+                            } else if let Some(selection) = profile_selection {
                                 self.app_event_tx.send(AppEvent::CodexOp(
                                     AppCommand::override_turn_context(
                                         /*cwd*/ None,
-                                        Some(preset.approval),
-                                        Some(self.config.approvals_reviewer),
-                                        Some(preset.sandbox.clone()),
+                                        /*approval_policy*/ None,
+                                        /*approvals_reviewer*/ None,
+                                        /*permission_profile*/ None,
+                                        /*active_permission_profile*/ None,
                                         #[cfg(target_os = "windows")]
                                         Some(windows_sandbox_level),
                                         /*model*/ None,
@@ -879,14 +1233,44 @@ impl App {
                                         /*service_tier*/ None,
                                         /*collaboration_mode*/ None,
                                         /*personality*/ None,
-                                    )
-                                    .into(),
+                                    ),
+                                ));
+                                if self.apply_permission_profile_selection(selection).await {
+                                    self.chat_widget.submit_initial_user_message_if_pending();
+                                }
+                                self.chat_widget.add_plain_history_lines(vec![
+                                    Line::from(vec!["• ".dim(), "Sandbox ready".into()]),
+                                    Line::from(vec![
+                                        "  ".into(),
+                                        "Codex can now safely edit files and execute commands in your computer"
+                                            .dark_gray(),
+                                    ]),
+                                ]);
+                            } else {
+                                self.app_event_tx.send(AppEvent::CodexOp(
+                                    AppCommand::override_turn_context(
+                                        /*cwd*/ None,
+                                        Some(AskForApproval::from(preset.approval)),
+                                        Some(self.config.approvals_reviewer),
+                                        Some(preset.permission_profile.clone()),
+                                        Some(preset.active_permission_profile.clone()),
+                                        #[cfg(target_os = "windows")]
+                                        Some(windows_sandbox_level),
+                                        /*model*/ None,
+                                        /*effort*/ None,
+                                        /*summary*/ None,
+                                        /*service_tier*/ None,
+                                        /*collaboration_mode*/ None,
+                                        /*personality*/ None,
+                                    ),
+                                ));
+                                self.app_event_tx.send(AppEvent::UpdateAskForApprovalPolicy(
+                                    AskForApproval::from(preset.approval),
                                 ));
                                 self.app_event_tx
-                                    .send(AppEvent::UpdateAskForApprovalPolicy(preset.approval));
-                                self.app_event_tx
-                                    .send(AppEvent::UpdateSandboxPolicy(preset.sandbox.clone()));
-                                let _ = mode;
+                                    .send(AppEvent::UpdateActivePermissionProfile(
+                                        preset.active_permission_profile.clone(),
+                                    ));
                                 self.chat_widget.add_plain_history_lines(vec![
                                     Line::from(vec!["• ".dim(), "Sandbox ready".into()]),
                                     Line::from(vec![
@@ -910,31 +1294,29 @@ impl App {
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
-                    let _ = (preset, mode);
+                    let _ = (preset, mode, profile_selection);
                 }
             }
             AppEvent::PersistModelSelection { model, effort } => {
-                let profile = self.active_profile.as_deref();
-                match ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_profile(profile)
-                    .set_model(Some(model.as_str()), effort)
-                    .apply()
-                    .await
+                match crate::config_update::write_config_batch(
+                    app_server.request_handle(),
+                    crate::config_update::build_model_selection_edits(
+                        model.as_str(),
+                        effort.as_ref(),
+                    ),
+                )
+                .await
                 {
-                    Ok(()) => {
+                    Ok(_) => {
                         let effort_label = effort
-                            .map(|selected_effort| selected_effort.to_string())
+                            .as_ref()
+                            .map(std::string::ToString::to_string)
                             .unwrap_or_else(|| "default".to_string());
                         tracing::info!("Selected model: {model}, Selected effort: {effort_label}");
                         let mut message = format!("Model changed to {model}");
-                        if let Some(label) = Self::reasoning_label_for(&model, effort) {
+                        if let Some(label) = Self::reasoning_label_for(&model, effort.as_ref()) {
                             message.push(' ');
-                            message.push_str(label);
-                        }
-                        if let Some(profile) = profile {
-                            message.push_str(" for ");
-                            message.push_str(profile);
-                            message.push_str(" profile");
+                            message.push_str(&label);
                         }
                         self.chat_widget.add_info_message(message, /*hint*/ None);
                     }
@@ -943,14 +1325,8 @@ impl App {
                             error = %err,
                             "failed to persist model selection"
                         );
-                        if let Some(profile) = profile {
-                            self.chat_widget.add_error_message(format!(
-                                "Failed to save model for profile `{profile}`: {err}"
-                            ));
-                        } else {
-                            self.chat_widget
-                                .add_error_message(format!("Failed to save default model: {err}"));
-                        }
+                        self.chat_widget
+                            .add_error_message(format!("Failed to save default model: {err}"));
                     }
                 }
             }
@@ -962,14 +1338,7 @@ impl App {
             } => {
                 let uninstall_succeeded = result.is_ok();
                 if uninstall_succeeded {
-                    if let Err(err) = self.refresh_in_memory_config_from_disk().await {
-                        tracing::warn!(
-                            error = %err,
-                            "failed to refresh config after plugin uninstall"
-                        );
-                    }
-                    self.chat_widget.refresh_plugin_mentions();
-                    self.chat_widget.submit_op(AppCommand::reload_user_config());
+                    self.refresh_plugin_mentions_after_config_write();
                 }
                 self.chat_widget.on_plugin_uninstall_loaded(
                     cwd.clone(),
@@ -983,7 +1352,7 @@ impl App {
                 }
             }
             AppEvent::RefreshPluginMentions => {
-                self.refresh_plugin_mentions();
+                self.refresh_plugin_mentions(app_server);
             }
             AppEvent::PluginMentionsLoaded { mut plugins } => {
                 if !self.config.features.enabled(Feature::Plugins) {
@@ -992,21 +1361,18 @@ impl App {
                 self.chat_widget.on_plugin_mentions_loaded(plugins);
             }
             AppEvent::PersistPersonalitySelection { personality } => {
-                let profile = self.active_profile.as_deref();
-                match ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_profile(profile)
-                    .set_personality(Some(personality))
-                    .apply()
-                    .await
+                match crate::config_update::write_config_batch(
+                    app_server.request_handle(),
+                    vec![crate::config_update::replace_config_value(
+                        "personality",
+                        serde_json::json!(personality.to_string()),
+                    )],
+                )
+                .await
                 {
-                    Ok(()) => {
+                    Ok(_) => {
                         let label = Self::personality_label(personality);
-                        let mut message = format!("Personality set to {label}");
-                        if let Some(profile) = profile {
-                            message.push_str(" for ");
-                            message.push_str(profile);
-                            message.push_str(" profile");
-                        }
+                        let message = format!("Personality set to {label}");
                         self.chat_widget.add_info_message(message, /*hint*/ None);
                     }
                     Err(err) => {
@@ -1014,59 +1380,47 @@ impl App {
                             error = %err,
                             "failed to persist personality selection"
                         );
-                        if let Some(profile) = profile {
-                            self.chat_widget.add_error_message(format!(
-                                "Failed to save personality for profile `{profile}`: {err}"
-                            ));
-                        } else {
-                            self.chat_widget.add_error_message(format!(
-                                "Failed to save default personality: {err}"
-                            ));
-                        }
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to save default personality: {err}"
+                        ));
                     }
                 }
             }
             AppEvent::PersistServiceTierSelection { service_tier } => {
                 self.refresh_status_line();
-                let profile = self.active_profile.as_deref();
-                match ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_profile(profile)
-                    .set_service_tier(service_tier)
-                    .apply()
+                self.config.service_tier = service_tier.clone();
+                self.sync_active_thread_service_tier_to_cached_session()
+                    .await;
+                let edits = crate::config_update::build_service_tier_selection_edits(
+                    service_tier.as_deref(),
+                );
+                match crate::config_update::write_config_batch(app_server.request_handle(), edits)
                     .await
                 {
-                    Ok(()) => {
-                        let status = if service_tier.is_some() { "on" } else { "off" };
-                        let mut message = format!("Fast mode set to {status}");
-                        if let Some(profile) = profile {
-                            message.push_str(" for ");
-                            message.push_str(profile);
-                            message.push_str(" profile");
-                        }
+                    Ok(_) => {
+                        let message = if let Some(service_tier) = service_tier {
+                            format!("Service tier set to {service_tier}")
+                        } else {
+                            "Service tier cleared".to_string()
+                        };
                         self.chat_widget.add_info_message(message, /*hint*/ None);
                     }
                     Err(err) => {
-                        tracing::error!(error = %err, "failed to persist fast mode selection");
-                        if let Some(profile) = profile {
-                            self.chat_widget.add_error_message(format!(
-                                "Failed to save Fast mode for profile `{profile}`: {err}"
-                            ));
-                        } else {
-                            self.chat_widget.add_error_message(format!(
-                                "Failed to save default Fast mode: {err}"
-                            ));
-                        }
+                        tracing::error!(error = %err, "failed to persist service tier selection");
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to save default service tier: {err}"
+                        ));
                     }
                 }
             }
             AppEvent::PersistRealtimeAudioDeviceSelection { kind, name } => {
                 let builder = match kind {
                     RealtimeAudioDeviceKind::Microphone => {
-                        ConfigEditsBuilder::new(&self.config.codex_home)
+                        ConfigEditsBuilder::for_config(&self.config)
                             .set_realtime_microphone(name.as_deref())
                     }
                     RealtimeAudioDeviceKind::Speaker => {
-                        ConfigEditsBuilder::new(&self.config.codex_home)
+                        ConfigEditsBuilder::for_config(&self.config)
                             .set_realtime_speaker(name.as_deref())
                     }
                 };
@@ -1120,40 +1474,53 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 }
                 self.config = config;
-                self.runtime_approval_policy_override =
-                    Some(self.config.permissions.approval_policy.value());
-                self.chat_widget
-                    .set_approval_policy(self.config.permissions.approval_policy.value());
+                let approval_policy =
+                    AskForApproval::from(self.config.permissions.approval_policy.value());
+                self.runtime_approval_policy_override = Some(approval_policy);
+                self.chat_widget.set_approval_policy(approval_policy);
+                self.sync_active_thread_permission_settings_to_cached_session()
+                    .await;
             }
-            AppEvent::UpdateSandboxPolicy(policy) => {
-                #[cfg(target_os = "windows")]
-                let policy_is_workspace_write_or_ro = matches!(
-                    &policy,
-                    codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. }
-                        | codex_protocol::protocol::SandboxPolicy::ReadOnly { .. }
-                );
-                let policy_for_chat = policy.clone();
-
+            AppEvent::UpdateActivePermissionProfile(active_permission_profile) => {
                 let mut config = self.config.clone();
-                if !self.try_set_sandbox_policy_on_config(
-                    &mut config,
-                    policy,
-                    "Failed to set sandbox policy",
-                    "failed to set sandbox policy on app config",
-                ) {
+                let Some(permission_profile) = self
+                    .try_set_builtin_active_permission_profile_on_config(
+                        &mut config,
+                        active_permission_profile.clone(),
+                        "Failed to set permission profile",
+                        "failed to set active permission profile on app config",
+                    )
+                else {
                     return Ok(AppRunControl::Continue);
-                }
-                self.config = config;
-                if let Err(err) = self.chat_widget.set_sandbox_policy(policy_for_chat) {
-                    tracing::warn!(%err, "failed to set sandbox policy on chat config");
-                    self.chat_widget
-                        .add_error_message(format!("Failed to set sandbox policy: {err}"));
-                    return Ok(AppRunControl::Continue);
-                }
-                self.runtime_sandbox_policy_override =
-                    Some(self.config.permissions.sandbox_policy.get().clone());
+                };
+                #[cfg(target_os = "windows")]
+                let permission_profile_is_managed_restricted =
+                    managed_filesystem_sandbox_is_restricted(&permission_profile);
+                let permission_profile_for_chat = permission_profile.clone();
 
-                // If sandbox policy becomes workspace-write or read-only, run the Windows world-writable scan.
+                self.config = config;
+                if let Err(err) = self
+                    .chat_widget
+                    .set_permission_profile_from_session_snapshot(
+                        PermissionProfileSnapshot::active(
+                            permission_profile_for_chat,
+                            active_permission_profile,
+                        ),
+                    )
+                {
+                    tracing::warn!(%err, "failed to set permission profile on chat config");
+                    self.chat_widget
+                        .add_error_message(format!("Failed to set permission profile: {err}"));
+                    return Ok(AppRunControl::Continue);
+                }
+                self.runtime_permission_profile_override =
+                    Some(RuntimePermissionProfileOverride::from_config(&self.config));
+                self.sync_active_thread_permission_settings_to_cached_session()
+                    .await;
+                self.chat_widget.submit_initial_user_message_if_pending();
+
+                // If a managed filesystem sandbox is active, run the Windows
+                // world-writable scan.
                 #[cfg(target_os = "windows")]
                 {
                     // One-shot suppression if the user just confirmed continue.
@@ -1164,46 +1531,46 @@ impl App {
 
                     let should_check = WindowsSandboxLevel::from_config(&self.config)
                         != WindowsSandboxLevel::Disabled
-                        && policy_is_workspace_write_or_ro
+                        && permission_profile_is_managed_restricted
                         && !self.chat_widget.world_writable_warning_hidden();
                     if should_check {
                         let cwd = self.config.cwd.clone();
+                        let workspace_roots = self.config.effective_workspace_roots();
                         let env_map: std::collections::HashMap<String, String> =
                             std::env::vars().collect();
                         let tx = self.app_event_tx.clone();
                         let logs_base_dir = self.config.codex_home.clone();
-                        let sandbox_policy = self.config.permissions.sandbox_policy.get().clone();
+                        let permission_profile =
+                            self.config.permissions.effective_permission_profile();
                         Self::spawn_world_writable_scan(
                             cwd,
+                            workspace_roots,
                             env_map,
                             logs_base_dir,
-                            sandbox_policy,
+                            permission_profile,
                             tx,
                         );
                     }
                 }
             }
+            AppEvent::SelectPermissionProfile(selection) => {
+                if self.apply_permission_profile_selection(selection).await {
+                    self.chat_widget.submit_initial_user_message_if_pending();
+                }
+            }
             AppEvent::UpdateApprovalsReviewer(policy) => {
                 self.config.approvals_reviewer = policy;
                 self.chat_widget.set_approvals_reviewer(policy);
-                let profile = self.active_profile.as_deref();
-                let segments = if let Some(profile) = profile {
-                    vec![
-                        "profiles".to_string(),
-                        profile.to_string(),
-                        "approvals_reviewer".to_string(),
-                    ]
-                } else {
-                    vec!["approvals_reviewer".to_string()]
-                };
-                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_profile(profile)
-                    .with_edits([ConfigEdit::SetPath {
-                        segments,
-                        value: policy.to_string().into(),
-                    }])
-                    .apply()
-                    .await
+                self.sync_active_thread_permission_settings_to_cached_session()
+                    .await;
+                if let Err(err) = crate::config_update::write_config_batch(
+                    app_server.request_handle(),
+                    vec![crate::config_update::replace_config_value(
+                        "approvals_reviewer",
+                        serde_json::json!(policy.to_string()),
+                    )],
+                )
+                .await
                 {
                     tracing::error!(
                         error = %err,
@@ -1214,7 +1581,7 @@ impl App {
                 }
             }
             AppEvent::UpdateFeatureFlags { updates } => {
-                self.update_feature_flags(updates).await;
+                self.update_feature_flags(app_server, updates).await;
             }
             AppEvent::UpdateMemorySettings {
                 use_memories,
@@ -1244,11 +1611,13 @@ impl App {
                 self.chat_widget.set_rate_limit_switch_prompt_hidden(hidden);
             }
             AppEvent::UpdatePlanModeReasoningEffort(effort) => {
-                self.config.plan_mode_reasoning_effort = effort;
+                self.config.plan_mode_reasoning_effort = effort.clone();
                 self.chat_widget.set_plan_mode_reasoning_effort(effort);
+                self.sync_active_thread_plan_mode_reasoning_setting(app_server)
+                    .await;
             }
             AppEvent::PersistFullAccessWarningAcknowledged => {
-                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                if let Err(err) = ConfigEditsBuilder::for_config(&self.config)
                     .set_hide_full_access_warning(/*acknowledged*/ true)
                     .apply()
                     .await
@@ -1263,7 +1632,7 @@ impl App {
                 }
             }
             AppEvent::PersistWorldWritableWarningAcknowledged => {
-                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                if let Err(err) = ConfigEditsBuilder::for_config(&self.config)
                     .set_hide_world_writable_warning(/*acknowledged*/ true)
                     .apply()
                     .await
@@ -1278,7 +1647,7 @@ impl App {
                 }
             }
             AppEvent::PersistRateLimitSwitchPromptHidden => {
-                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                if let Err(err) = ConfigEditsBuilder::for_config(&self.config)
                     .set_hide_rate_limit_model_nudge(/*acknowledged*/ true)
                     .apply()
                     .await
@@ -1293,49 +1662,35 @@ impl App {
                 }
             }
             AppEvent::PersistPlanModeReasoningEffort(effort) => {
-                let profile = self.active_profile.as_deref();
-                let segments = if let Some(profile) = profile {
-                    vec![
-                        "profiles".to_string(),
-                        profile.to_string(),
-                        "plan_mode_reasoning_effort".to_string(),
-                    ]
-                } else {
-                    vec!["plan_mode_reasoning_effort".to_string()]
-                };
+                let key_path = "plan_mode_reasoning_effort";
                 let edit = if let Some(effort) = effort {
-                    ConfigEdit::SetPath {
-                        segments,
-                        value: effort.to_string().into(),
-                    }
+                    crate::config_update::replace_config_value(
+                        key_path,
+                        serde_json::json!(effort.to_string()),
+                    )
                 } else {
-                    ConfigEdit::ClearPath { segments }
+                    crate::config_update::clear_config_value(key_path)
                 };
-                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_edits([edit])
-                    .apply()
-                    .await
+                if let Err(err) = crate::config_update::write_config_batch(
+                    app_server.request_handle(),
+                    vec![edit],
+                )
+                .await
                 {
                     tracing::error!(
                         error = %err,
                         "failed to persist plan mode reasoning effort"
                     );
-                    if let Some(profile) = profile {
-                        self.chat_widget.add_error_message(format!(
-                            "Failed to save Plan mode reasoning effort for profile `{profile}`: {err}"
-                        ));
-                    } else {
-                        self.chat_widget.add_error_message(format!(
-                            "Failed to save Plan mode reasoning effort: {err}"
-                        ));
-                    }
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to save Plan mode reasoning effort: {err}"
+                    ));
                 }
             }
             AppEvent::PersistModelMigrationPromptAcknowledged {
                 from_model,
                 to_model,
             } => {
-                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                if let Err(err) = ConfigEditsBuilder::for_config(&self.config)
                     .record_model_migration_seen(from_model.as_str(), to_model.as_str())
                     .apply()
                     .await
@@ -1374,23 +1729,15 @@ impl App {
                 self.chat_widget.open_manage_skills_popup();
             }
             AppEvent::SetSkillEnabled { path, enabled } => {
-                let edits = [ConfigEdit::SetSkillConfig {
-                    path: path.to_path_buf(),
+                match crate::config_update::write_skill_enabled(
+                    app_server.request_handle(),
+                    path.clone(),
                     enabled,
-                }];
-                match ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_edits(edits)
-                    .apply()
-                    .await
+                )
+                .await
                 {
                     Ok(()) => {
                         self.chat_widget.update_skill_enabled(path, enabled);
-                        if let Err(err) = self.refresh_in_memory_config_from_disk().await {
-                            tracing::warn!(
-                                error = %err,
-                                "failed to refresh config after skill toggle"
-                            );
-                        }
                     }
                     Err(err) => {
                         let path_display = path.display();
@@ -1403,50 +1750,74 @@ impl App {
             AppEvent::SetAppEnabled { id, enabled } => {
                 let edits = if enabled {
                     vec![
-                        ConfigEdit::ClearPath {
-                            segments: vec!["apps".to_string(), id.clone(), "enabled".to_string()],
-                        },
-                        ConfigEdit::ClearPath {
-                            segments: vec![
-                                "apps".to_string(),
-                                id.clone(),
-                                "disabled_reason".to_string(),
-                            ],
-                        },
+                        crate::config_update::clear_config_value(
+                            crate::config_update::app_scoped_key_path(&id, "enabled"),
+                        ),
+                        crate::config_update::clear_config_value(
+                            crate::config_update::app_scoped_key_path(&id, "disabled_reason"),
+                        ),
                     ]
                 } else {
                     vec![
-                        ConfigEdit::SetPath {
-                            segments: vec!["apps".to_string(), id.clone(), "enabled".to_string()],
-                            value: false.into(),
-                        },
-                        ConfigEdit::SetPath {
-                            segments: vec![
-                                "apps".to_string(),
-                                id.clone(),
-                                "disabled_reason".to_string(),
-                            ],
-                            value: "user".into(),
-                        },
+                        crate::config_update::replace_config_value(
+                            crate::config_update::app_scoped_key_path(&id, "enabled"),
+                            serde_json::json!(false),
+                        ),
+                        crate::config_update::replace_config_value(
+                            crate::config_update::app_scoped_key_path(&id, "disabled_reason"),
+                            serde_json::json!("user"),
+                        ),
                     ]
                 };
-                match ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_edits(edits)
-                    .apply()
+                match crate::config_update::write_config_batch(app_server.request_handle(), edits)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(_) => {
                         self.chat_widget.update_connector_enabled(&id, enabled);
-                        if let Err(err) = self.refresh_in_memory_config_from_disk().await {
-                            tracing::warn!(error = %err, "failed to refresh config after app toggle");
-                        }
-                        self.chat_widget.submit_op(AppCommand::reload_user_config());
                     }
                     Err(err) => {
                         self.chat_widget.add_error_message(format!(
                             "Failed to update app config for {id}: {err}"
                         ));
                     }
+                }
+            }
+            AppEvent::SetHookEnabled { key, enabled } => {
+                self.set_hook_enabled(app_server, key, enabled);
+            }
+            AppEvent::TrustHook { key, current_hash } => {
+                self.trust_hook(app_server, key, current_hash);
+            }
+            AppEvent::TrustHooks { updates } => {
+                self.trust_hooks(app_server, updates);
+            }
+            AppEvent::HookEnabledSet {
+                key,
+                enabled,
+                result,
+            } => {
+                let queued_enabled = self
+                    .pending_hook_enabled_writes
+                    .get_mut(&key)
+                    .and_then(Option::take);
+                let should_apply_result = if let Some(queued_enabled) = queued_enabled
+                    && (result.is_err() || queued_enabled != enabled)
+                {
+                    self.spawn_hook_enabled_write(app_server, key.clone(), queued_enabled);
+                    false
+                } else {
+                    true
+                };
+                if should_apply_result {
+                    self.pending_hook_enabled_writes.remove(&key);
+                    if let Err(err) = result {
+                        self.chat_widget.add_error_message(err);
+                    }
+                }
+            }
+            AppEvent::HookTrusted { result } => {
+                if let Err(err) = result {
+                    self.chat_widget.add_error_message(err);
                 }
             }
             AppEvent::OpenPermissionsPopup => {
@@ -1478,6 +1849,7 @@ impl App {
                     self.overlay = Some(Overlay::new_static_with_renderables(
                         vec![diff_summary.into()],
                         "P A T C H".to_string(),
+                        self.keymap.pager.clone(),
                     ));
                 }
                 ApprovalRequest::Exec { command, .. } => {
@@ -1487,15 +1859,24 @@ impl App {
                     self.overlay = Some(Overlay::new_static_with_lines(
                         full_cmd_lines,
                         "E X E C".to_string(),
+                        self.keymap.pager.clone(),
                     ));
                 }
                 ApprovalRequest::Permissions {
+                    environment_id,
                     permissions,
                     reason,
                     ..
                 } => {
                     let _ = tui.enter_alt_screen();
                     let mut lines = Vec::new();
+                    if let Some(environment_id) = environment_id {
+                        lines.push(Line::from(vec![
+                            "Environment: ".into(),
+                            environment_id.bold(),
+                        ]));
+                        lines.push(Line::from(""));
+                    }
                     if let Some(reason) = reason {
                         lines.push(Line::from(vec!["Reason: ".into(), reason.italic()]));
                         lines.push(Line::from(""));
@@ -1511,6 +1892,7 @@ impl App {
                     self.overlay = Some(Overlay::new_static_with_renderables(
                         vec![Box::new(Paragraph::new(lines).wrap(Wrap { trim: false }))],
                         "P E R M I S S I O N S".to_string(),
+                        self.keymap.pager.clone(),
                     ));
                 }
                 ApprovalRequest::McpElicitation {
@@ -1528,6 +1910,7 @@ impl App {
                     self.overlay = Some(Overlay::new_static_with_renderables(
                         vec![Box::new(paragraph)],
                         "E L I C I T A T I O N".to_string(),
+                        self.keymap.pager.clone(),
                     ));
                 }
             },
@@ -1543,27 +1926,38 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
             }
-            AppEvent::StatusLineSetup { items } => {
+            AppEvent::StatusLineSetup {
+                items,
+                use_theme_colors,
+            } => {
                 let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
-                let edit = crate::legacy_core::config::edit::status_line_items_edit(&ids);
-                let apply_result = ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_edits([edit])
+                let items_edit = crate::legacy_core::config::edit::status_line_items_edit(&ids);
+                let colors_edit =
+                    crate::legacy_core::config::edit::status_line_use_colors_edit(use_theme_colors);
+                let apply_result = ConfigEditsBuilder::for_config(&self.config)
+                    .with_edits([items_edit, colors_edit])
                     .apply()
                     .await;
                 match apply_result {
                     Ok(()) => {
                         self.config.tui_status_line = Some(ids.clone());
-                        self.chat_widget.setup_status_line(items);
+                        self.config.tui_status_line_use_colors = use_theme_colors;
+                        self.chat_widget.setup_status_line(items, use_theme_colors);
                     }
                     Err(err) => {
-                        tracing::error!(error = %err, "failed to persist status line items; keeping previous selection");
-                        self.chat_widget
-                            .add_error_message(format!("Failed to save status line items: {err}"));
+                        tracing::error!(error = %err, "failed to persist status line settings; keeping previous selection");
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to save status line settings: {err}"
+                        ));
                     }
                 }
             }
             AppEvent::StatusLineBranchUpdated { cwd, branch } => {
                 self.chat_widget.set_status_line_branch(cwd, branch);
+                self.refresh_status_line();
+            }
+            AppEvent::StatusLineGitSummaryUpdated { cwd, summary } => {
+                self.chat_widget.set_status_line_git_summary(cwd, summary);
                 self.refresh_status_line();
             }
             AppEvent::StatusLineSetupCancelled => {
@@ -1572,7 +1966,7 @@ impl App {
             AppEvent::TerminalTitleSetup { items } => {
                 let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
                 let edit = crate::legacy_core::config::edit::terminal_title_items_edit(&ids);
-                let apply_result = ConfigEditsBuilder::new(&self.config.codex_home)
+                let apply_result = ConfigEditsBuilder::for_config(&self.config)
                     .with_edits([edit])
                     .apply()
                     .await;
@@ -1598,7 +1992,7 @@ impl App {
             }
             AppEvent::SyntaxThemeSelected { name } => {
                 let edit = crate::legacy_core::config::edit::syntax_theme_edit(&name);
-                let apply_result = ConfigEditsBuilder::new(&self.config.codex_home)
+                let apply_result = ConfigEditsBuilder::for_config(&self.config)
                     .with_edits([edit])
                     .apply()
                     .await;
@@ -1615,17 +2009,174 @@ impl App {
                             crate::render::highlight::set_syntax_theme(theme);
                         }
                         self.sync_tui_theme_selection(name);
+                        self.refresh_status_line();
                     }
                     Err(err) => {
                         self.restore_runtime_theme_from_config();
+                        self.refresh_status_line();
                         tracing::error!(error = %err, "failed to persist theme selection");
                         self.chat_widget
                             .add_error_message(format!("Failed to save theme: {err}"));
                     }
                 }
             }
+            AppEvent::SyntaxThemePreviewed => {
+                self.refresh_status_line();
+            }
+            AppEvent::OpenKeymapActionMenu { context, action } => {
+                self.chat_widget
+                    .open_keymap_action_menu(context, action, &self.keymap);
+            }
+            AppEvent::OpenKeymapReplaceBindingMenu { context, action } => {
+                self.chat_widget
+                    .open_keymap_replace_binding_menu(context, action, &self.keymap);
+            }
+            AppEvent::OpenKeymapCapture {
+                context,
+                action,
+                intent,
+            } => {
+                self.chat_widget
+                    .open_keymap_capture(context, action, intent, &self.keymap);
+            }
+            AppEvent::OpenKeymapDebug => {
+                self.chat_widget.open_keymap_debug(&self.keymap);
+            }
+            AppEvent::KeymapCaptured {
+                context,
+                action,
+                key,
+                intent,
+            } => {
+                self.apply_keymap_capture(context, action, key, intent)
+                    .await;
+            }
+            AppEvent::KeymapCleared { context, action } => {
+                self.apply_keymap_clear(context, action).await;
+            }
         }
         Ok(AppRunControl::Continue)
+    }
+
+    async fn apply_keymap_capture(
+        &mut self,
+        context: String,
+        action: String,
+        key: String,
+        intent: crate::app_event::KeymapEditIntent,
+    ) {
+        let outcome = match crate::keymap_setup::keymap_with_edit(
+            &self.config.tui_keymap,
+            &self.keymap,
+            &context,
+            &action,
+            &key,
+            &intent,
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.chat_widget.add_error_message(err);
+                return;
+            }
+        };
+        let (keymap_config, bindings, message) = match outcome {
+            crate::keymap_setup::KeymapEditOutcome::Updated {
+                keymap_config,
+                bindings,
+                message,
+            } => (*keymap_config, bindings, message),
+            crate::keymap_setup::KeymapEditOutcome::Unchanged { message } => {
+                self.chat_widget.add_info_message(message, /*hint*/ None);
+                return;
+            }
+        };
+
+        let runtime_keymap = match RuntimeKeymap::from_config(&keymap_config) {
+            Ok(runtime_keymap) => runtime_keymap,
+            Err(err) => {
+                let params = crate::keymap_setup::build_keymap_conflict_params(
+                    context, action, key, intent, err,
+                );
+                self.chat_widget.show_selection_view(params);
+                return;
+            }
+        };
+
+        let edit =
+            crate::legacy_core::config::edit::keymap_bindings_edit(&context, &action, &bindings);
+        match ConfigEditsBuilder::for_config(&self.config)
+            .with_edits([edit])
+            .apply()
+            .await
+        {
+            Ok(()) => {
+                self.config.tui_keymap = keymap_config.clone();
+                self.keymap = runtime_keymap.clone();
+                self.chat_widget
+                    .apply_keymap_update(keymap_config, &runtime_keymap);
+                self.chat_widget
+                    .return_to_keymap_picker(&context, &action, &runtime_keymap);
+                self.chat_widget.add_info_message(message, /*hint*/ None);
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to persist keymap binding");
+                self.chat_widget
+                    .add_error_message(format!("Failed to save shortcut: {err}"));
+            }
+        }
+    }
+
+    fn refresh_plugin_mentions_after_config_write(&mut self) {
+        self.chat_widget.refresh_plugin_mentions();
+        self.chat_widget.submit_op(AppCommand::reload_user_config());
+    }
+
+    async fn apply_keymap_clear(&mut self, context: String, action: String) {
+        let keymap_config = match crate::keymap_setup::keymap_without_custom_binding(
+            &self.config.tui_keymap,
+            &context,
+            &action,
+        ) {
+            Ok(keymap_config) => keymap_config,
+            Err(err) => {
+                self.chat_widget.add_error_message(err);
+                return;
+            }
+        };
+
+        let runtime_keymap = match RuntimeKeymap::from_config(&keymap_config) {
+            Ok(runtime_keymap) => runtime_keymap,
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to refresh shortcuts: {err}"));
+                return;
+            }
+        };
+
+        let edit = crate::legacy_core::config::edit::keymap_binding_clear_edit(&context, &action);
+        match ConfigEditsBuilder::for_config(&self.config)
+            .with_edits([edit])
+            .apply()
+            .await
+        {
+            Ok(()) => {
+                self.config.tui_keymap = keymap_config.clone();
+                self.keymap = runtime_keymap.clone();
+                self.chat_widget
+                    .apply_keymap_update(keymap_config, &runtime_keymap);
+                self.chat_widget
+                    .return_to_keymap_picker(&context, &action, &runtime_keymap);
+                self.chat_widget.add_info_message(
+                    format!("Removed custom shortcut for `{context}.{action}`."),
+                    /*hint*/ None,
+                );
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to clear keymap binding");
+                self.chat_widget
+                    .add_error_message(format!("Failed to remove shortcut: {err}"));
+            }
+        }
     }
 
     pub(super) async fn handle_exit_mode(
@@ -1640,7 +2191,20 @@ impl App {
                 self.pending_shutdown_exit_thread_id =
                     self.active_thread_id.or(self.chat_widget.thread_id());
                 if self.pending_shutdown_exit_thread_id.is_some() {
-                    self.shutdown_current_thread(app_server).await;
+                    // This is a UI escape-hatch budget, not a protocol
+                    // deadline. A healthy local thread/unsubscribe round trip
+                    // should finish comfortably inside two seconds, while a
+                    // longer wait makes Ctrl+C feel broken when the app-server
+                    // is already wedged.
+                    if tokio::time::timeout(
+                        SHUTDOWN_FIRST_EXIT_TIMEOUT,
+                        self.shutdown_current_thread(app_server),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!("timed out waiting for app-server thread shutdown");
+                    }
                 }
                 self.pending_shutdown_exit_thread_id = None;
                 AppRunControl::Exit(ExitReason::UserRequested)
@@ -1648,6 +2212,33 @@ impl App {
             ExitMode::Immediate => {
                 self.pending_shutdown_exit_thread_id = None;
                 AppRunControl::Exit(ExitReason::UserRequested)
+            }
+        }
+    }
+
+    pub(super) async fn archive_current_thread(
+        &mut self,
+        app_server: &mut AppServerSession,
+    ) -> AppRunControl {
+        let Some(thread_id) = self.active_thread_id.or(self.chat_widget.thread_id()) else {
+            self.chat_widget
+                .add_error_message("A thread must start before it can be archived.".to_string());
+            return AppRunControl::Continue;
+        };
+        if self.side_threads.contains_key(&thread_id) {
+            self.chat_widget.add_error_message(
+                "'/archive' is unavailable in side conversations. Press Ctrl+C to return to the main thread first."
+                    .to_string(),
+            );
+            return AppRunControl::Continue;
+        }
+
+        match app_server.thread_archive(thread_id).await {
+            Ok(()) => AppRunControl::Exit(ExitReason::UserRequested),
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to archive current thread: {err}"));
+                AppRunControl::Continue
             }
         }
     }

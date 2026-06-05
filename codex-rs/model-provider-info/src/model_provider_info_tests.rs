@@ -225,6 +225,7 @@ base_url = "https://bedrock.example.com/v1"
 
 [aws]
 profile = "codex-bedrock"
+region = "us-west-2"
         "#;
 
     let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
@@ -233,6 +234,7 @@ profile = "codex-bedrock"
         provider.aws,
         Some(ModelProviderAwsAuthInfo {
             profile: Some("codex-bedrock".to_string()),
+            region: Some("us-west-2".to_string()),
         })
     );
 }
@@ -243,15 +245,21 @@ fn test_create_amazon_bedrock_provider() {
         ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None),
         ModelProviderInfo {
             name: "Amazon Bedrock".to_string(),
-            base_url: Some("https://bedrock-mantle.us-east-1.api.aws/v1".to_string()),
+            base_url: Some("https://bedrock-mantle.us-east-1.api.aws/openai/v1".to_string()),
             env_key: None,
             env_key_instructions: None,
             experimental_bearer_token: None,
             auth: None,
-            aws: Some(ModelProviderAwsAuthInfo { profile: None }),
+            aws: Some(ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+            }),
             wire_api: WireApi::Responses,
             query_params: None,
-            http_headers: None,
+            http_headers: Some(maplit::hashmap! {
+                AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string() =>
+                    AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE.to_string(),
+            }),
             env_http_headers: None,
             request_max_retries: None,
             stream_max_retries: None,
@@ -260,6 +268,21 @@ fn test_create_amazon_bedrock_provider() {
             requires_openai_auth: false,
             supports_websockets: false,
         }
+    );
+}
+
+#[test]
+fn test_amazon_bedrock_provider_adds_mantle_client_agent_header() {
+    let api_provider = ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None)
+        .to_api_provider(/*auth_mode*/ None)
+        .expect("Amazon Bedrock provider should build API provider");
+
+    assert_eq!(
+        api_provider
+            .headers
+            .get(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE)
     );
 }
 
@@ -304,6 +327,7 @@ fn test_merge_configured_model_providers_applies_amazon_bedrock_profile_override
         ModelProviderInfo {
             aws: Some(ModelProviderAwsAuthInfo {
                 profile: Some("codex-bedrock".to_string()),
+                region: Some("us-west-2".to_string()),
             }),
             ..ModelProviderInfo::default()
         },
@@ -315,6 +339,7 @@ fn test_merge_configured_model_providers_applies_amazon_bedrock_profile_override
         .expect("Amazon Bedrock provider should be built in")
         .aws = Some(ModelProviderAwsAuthInfo {
         profile: Some("codex-bedrock".to_string()),
+        region: Some("us-west-2".to_string()),
     });
 
     assert_eq!(
@@ -334,6 +359,7 @@ fn test_merge_configured_model_providers_rejects_amazon_bedrock_non_default_fiel
             name: "Custom Bedrock".to_string(),
             aws: Some(ModelProviderAwsAuthInfo {
                 profile: Some("codex-bedrock".to_string()),
+                region: None,
             }),
             ..ModelProviderInfo::default()
         },
@@ -345,7 +371,7 @@ fn test_merge_configured_model_providers_rejects_amazon_bedrock_non_default_fiel
             configured_model_providers,
         ),
         Err(
-            "model_providers.amazon-bedrock only supports changing `aws.profile`; other non-default provider fields are not supported"
+            "model_providers.amazon-bedrock only supports changing `aws.profile` and `aws.region`; other non-default provider fields are not supported"
                 .to_string()
         )
     );
@@ -356,7 +382,10 @@ fn test_merge_configured_model_providers_allows_amazon_bedrock_default_fields() 
     let configured_model_providers = std::collections::HashMap::from([(
         AMAZON_BEDROCK_PROVIDER_ID.to_string(),
         ModelProviderInfo {
-            aws: Some(ModelProviderAwsAuthInfo { profile: None }),
+            aws: Some(ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+            }),
             wire_api: WireApi::Responses,
             ..ModelProviderInfo::default()
         },
@@ -374,7 +403,10 @@ fn test_merge_configured_model_providers_allows_amazon_bedrock_default_fields() 
 #[test]
 fn test_validate_provider_aws_rejects_conflicting_auth() {
     let provider = ModelProviderInfo {
-        aws: Some(ModelProviderAwsAuthInfo { profile: None }),
+        aws: Some(ModelProviderAwsAuthInfo {
+            profile: None,
+            region: None,
+        }),
         env_key: Some("AWS_BEARER_TOKEN_BEDROCK".to_string()),
         supports_websockets: false,
         ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)
@@ -389,7 +421,10 @@ fn test_validate_provider_aws_rejects_conflicting_auth() {
 #[test]
 fn test_validate_provider_aws_rejects_websockets() {
     let provider = ModelProviderInfo {
-        aws: Some(ModelProviderAwsAuthInfo { profile: None }),
+        aws: Some(ModelProviderAwsAuthInfo {
+            profile: None,
+            region: None,
+        }),
         requires_openai_auth: false,
         supports_websockets: true,
         ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)

@@ -1,6 +1,7 @@
 use super::RuntimeState;
 use super::callbacks::clear_timeout_callback;
 use super::callbacks::exit_callback;
+use super::callbacks::generated_image_callback;
 use super::callbacks::image_callback;
 use super::callbacks::load_callback;
 use super::callbacks::notify_callback;
@@ -12,11 +13,10 @@ use super::callbacks::yield_control_callback;
 
 pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
     let global = scope.get_current_context().global(scope);
-    let console = v8::String::new(scope, "console")
-        .ok_or_else(|| "failed to allocate global `console`".to_string())?;
-    if global.delete(scope, console.into()) != Some(true) {
-        return Err("failed to remove global `console`".to_string());
-    }
+    delete_global(scope, global, "console")?;
+    delete_global(scope, global, "Atomics")?;
+    delete_global(scope, global, "SharedArrayBuffer")?;
+    delete_global(scope, global, "WebAssembly")?;
 
     let tools = build_tools_object(scope)?;
     let all_tools = build_all_tools_value(scope)?;
@@ -24,6 +24,7 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     let set_timeout = helper_function(scope, "setTimeout", set_timeout_callback)?;
     let text = helper_function(scope, "text", text_callback)?;
     let image = helper_function(scope, "image", image_callback)?;
+    let generated_image = helper_function(scope, "generatedImage", generated_image_callback)?;
     let store = helper_function(scope, "store", store_callback)?;
     let load = helper_function(scope, "load", load_callback)?;
     let notify = helper_function(scope, "notify", notify_callback)?;
@@ -36,6 +37,7 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "setTimeout", set_timeout.into())?;
     set_global(scope, global, "text", text.into())?;
     set_global(scope, global, "image", image.into())?;
+    set_global(scope, global, "generatedImage", generated_image.into())?;
     set_global(scope, global, "store", store.into())?;
     set_global(scope, global, "load", load.into())?;
     set_global(scope, global, "notify", notify.into())?;
@@ -140,5 +142,19 @@ fn set_global<'s>(
         Ok(())
     } else {
         Err(format!("failed to set global `{name}`"))
+    }
+}
+
+fn delete_global<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    global: v8::Local<'s, v8::Object>,
+    name: &str,
+) -> Result<(), String> {
+    let key = v8::String::new(scope, name)
+        .ok_or_else(|| format!("failed to allocate global `{name}`"))?;
+    if global.delete(scope, key.into()) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!("failed to remove global `{name}`"))
     }
 }

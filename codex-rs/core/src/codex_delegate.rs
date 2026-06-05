@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use async_channel::Receiver;
 use async_channel::Sender;
+use codex_analytics::GuardianApprovalRequestSource;
 use codex_async_utils::OrCancelExt;
-use codex_exec_server::EnvironmentManager;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -16,6 +16,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::Submission;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionsArgs;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
@@ -33,6 +34,7 @@ use crate::config::Config;
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::new_guardian_review_id;
 use crate::guardian::routes_approval_to_guardian;
+use crate::guardian::routes_approval_to_guardian_with_reviewer;
 use crate::guardian::spawn_approval_request_review;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_ACCEPT;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION;
@@ -40,6 +42,7 @@ use crate::mcp_tool_call::MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC;
 use crate::mcp_tool_call::build_guardian_mcp_tool_review_request;
 use crate::mcp_tool_call::is_mcp_tool_approval_question_id;
 use crate::mcp_tool_call::lookup_mcp_tool_metadata;
+use crate::mcp_tool_call::mcp_approvals_reviewer;
 use crate::session::Codex;
 use crate::session::CodexSpawnArgs;
 use crate::session::CodexSpawnOk;
@@ -48,9 +51,10 @@ use crate::session::emit_subagent_session_started;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use codex_login::AuthManager;
-use codex_models_manager::manager::ModelsManager;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::MultiAgentVersion;
 
 #[cfg(test)]
 use crate::session::completed_session_loop_termination;
@@ -64,7 +68,7 @@ use crate::session::completed_session_loop_termination;
 pub(crate) async fn run_codex_thread_interactive(
     config: Config,
     auth_manager: Arc<AuthManager>,
-    models_manager: Arc<ModelsManager>,
+    models_manager: SharedModelsManager,
     parent_session: Arc<Session>,
     parent_ctx: Arc<TurnContext>,
     cancel_token: CancellationToken,
@@ -73,43 +77,50 @@ pub(crate) async fn run_codex_thread_interactive(
 ) -> Result<Codex, CodexErr> {
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
-
+    let conversation_history = initial_history.unwrap_or(InitialHistory::New);
+    let forked_from_thread_id = conversation_history.forked_from_id();
     let CodexSpawnOk { codex, .. } = Box::pin(Codex::spawn(CodexSpawnArgs {
         config,
+        installation_id: parent_session.installation_id.clone(),
         auth_manager,
         models_manager,
-        environment_manager: Arc::new(EnvironmentManager::from_environment(
-            parent_ctx.environment.as_deref(),
-        )),
+        environment_manager: Arc::clone(&parent_session.services.environment_manager),
         skills_manager: Arc::clone(&parent_session.services.skills_manager),
         plugins_manager: Arc::clone(&parent_session.services.plugins_manager),
         mcp_manager: Arc::clone(&parent_session.services.mcp_manager),
-        skills_watcher: Arc::clone(&parent_session.services.skills_watcher),
-        conversation_history: initial_history.unwrap_or(InitialHistory::New),
+        extensions: Arc::clone(&parent_session.services.extensions),
+        conversation_history,
         session_source: SessionSource::SubAgent(subagent_source.clone()),
+        forked_from_thread_id,
+        parent_thread_id: Some(parent_session.thread_id),
+        thread_source: Some(ThreadSource::Subagent),
         agent_control: parent_session.services.agent_control.clone(),
         dynamic_tools: Vec::new(),
-        persist_extended_history: false,
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         user_shell_override: None,
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
+        parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         parent_trace: None,
+        environment_selections: parent_ctx.environments.clone(),
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
+        thread_store: Arc::clone(&parent_session.services.thread_store),
+        attestation_provider: parent_session.services.attestation_provider.clone(),
+        inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
     }))
-    .await?;
-    if parent_session.enabled(codex_features::Feature::GeneralAnalytics) {
-        let thread_config = codex.thread_config_snapshot().await;
-        let client_metadata = parent_session.app_server_client_metadata().await;
-        emit_subagent_session_started(
-            &parent_session.services.analytics_events_client,
-            client_metadata,
-            codex.session.conversation_id,
-            Some(parent_session.conversation_id),
-            thread_config,
-            subagent_source,
-        );
-    }
+    .or_cancel(&cancel_token)
+    .await??;
+    let thread_config = codex.thread_config_snapshot().await;
+    let client_metadata = parent_session.app_server_client_metadata().await;
+    emit_subagent_session_started(
+        &parent_session.services.analytics_events_client,
+        client_metadata,
+        codex.session.session_id(),
+        codex.session.thread_id,
+        Some(parent_session.thread_id),
+        thread_config,
+        subagent_source,
+    );
     let codex = Arc::new(codex);
 
     // Use a child token so parent cancel cascades but we can scope it to this task
@@ -159,7 +170,7 @@ pub(crate) async fn run_codex_thread_interactive(
 pub(crate) async fn run_codex_thread_one_shot(
     config: Config,
     auth_manager: Arc<AuthManager>,
-    models_manager: Arc<ModelsManager>,
+    models_manager: SharedModelsManager,
     input: Vec<UserInput>,
     parent_session: Arc<Session>,
     parent_ctx: Arc<TurnContext>,
@@ -185,9 +196,12 @@ pub(crate) async fn run_codex_thread_one_shot(
 
     // Send the initial input to kick off the one-shot turn.
     io.submit(Op::UserInput {
+        environments: None,
         items: input,
         final_output_json_schema,
         responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: Default::default(),
     })
     .await?;
 
@@ -210,6 +224,7 @@ pub(crate) async fn run_codex_thread_one_shot(
                     .send(Submission {
                         id: "shutdown".to_string(),
                         op: Op::Shutdown {},
+                        client_user_message_id: None,
                         trace: None,
                     })
                     .await;
@@ -257,11 +272,6 @@ async fn forward_events(
                     Err(_) => break,
                 };
                 match event {
-                    // ignore all legacy delta events
-                    Event {
-                        id: _,
-                        msg: EventMsg::AgentMessageDelta(_) | EventMsg::AgentReasoningDelta(_),
-                    } => {}
                     Event {
                         id: _,
                         msg: EventMsg::TokenCount(_),
@@ -269,10 +279,6 @@ async fn forward_events(
                     Event {
                         id: _,
                         msg: EventMsg::SessionConfigured(_),
-                    } => {}
-                    Event {
-                        id: _,
-                        msg: EventMsg::ThreadNameUpdated(_),
                     } => {}
                     Event {
                         id,
@@ -473,6 +479,7 @@ async fn handle_exec_approval(
                 justification: None,
             },
             reason,
+            GuardianApprovalRequestSource::DelegatedSubagent,
             review_cancel.clone(),
         );
         await_approval_with_cancel(
@@ -534,7 +541,10 @@ async fn handle_patch_approval(
     let guardian_decision = if routes_approval_to_guardian(parent_ctx) {
         let files = changes
             .keys()
-            .map(|path| parent_ctx.cwd.join(path))
+            .map(|path| {
+                #[allow(deprecated)]
+                parent_ctx.cwd.join(path)
+            })
             .collect::<Vec<_>>();
         let review_cancel = cancel_token.child_token();
         let patch = changes
@@ -570,11 +580,13 @@ async fn handle_patch_approval(
             new_guardian_review_id(),
             GuardianApprovalRequest::ApplyPatch {
                 id: approval_id.clone(),
+                #[allow(deprecated)]
                 cwd: parent_ctx.cwd.clone(),
                 files,
                 patch,
             },
             reason.clone(),
+            GuardianApprovalRequestSource::DelegatedSubagent,
             review_cancel.clone(),
         );
         Some(
@@ -622,15 +634,14 @@ async fn handle_request_user_input(
     event: RequestUserInputEvent,
     cancel_token: &CancellationToken,
 ) {
-    if routes_approval_to_guardian(parent_ctx)
-        && let Some(response) = maybe_auto_review_mcp_request_user_input(
-            parent_session,
-            parent_ctx,
-            pending_mcp_invocations,
-            &event,
-            cancel_token,
-        )
-        .await
+    if let Some(response) = maybe_auto_review_mcp_request_user_input(
+        parent_session,
+        parent_ctx,
+        pending_mcp_invocations,
+        &event,
+        cancel_token,
+    )
+    .await
     {
         let _ = codex.submit(Op::UserInputAnswer { id, response }).await;
         return;
@@ -684,6 +695,11 @@ async fn maybe_auto_review_mcp_request_user_input(
         &invocation.tool,
     )
     .await;
+    let approvals_reviewer =
+        mcp_approvals_reviewer(parent_ctx, &invocation.server, metadata.as_ref());
+    if !routes_approval_to_guardian_with_reviewer(parent_ctx, approvals_reviewer) {
+        return None;
+    }
     let review_cancel = cancel_token.child_token();
     let review_rx = spawn_approval_request_review(
         Arc::clone(parent_session),
@@ -691,6 +707,7 @@ async fn maybe_auto_review_mcp_request_user_input(
         new_guardian_review_id(),
         build_guardian_mcp_tool_review_request(&event.call_id, &invocation, metadata.as_ref()),
         /*retry_reason*/ None,
+        GuardianApprovalRequestSource::DelegatedSubagent,
         review_cancel.clone(),
     );
     let decision = await_approval_with_cancel(
@@ -738,10 +755,14 @@ async fn handle_request_permissions(
 ) {
     let call_id = event.call_id;
     let args = RequestPermissionsArgs {
+        environment_id: event.environment_id,
         reason: event.reason,
         permissions: event.permissions,
     };
-    let cwd = event.cwd.unwrap_or_else(|| parent_ctx.cwd.clone());
+    let cwd = event.cwd.unwrap_or_else(|| {
+        #[allow(deprecated)]
+        parent_ctx.cwd.clone()
+    });
     let response_fut = parent_session.request_permissions_for_cwd(
         parent_ctx,
         call_id.clone(),
@@ -801,6 +822,7 @@ where
             let empty = RequestPermissionsResponse {
                 permissions: Default::default(),
                 scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
             };
             parent_session
                 .notify_request_permissions_response(call_id, empty.clone())
@@ -810,6 +832,7 @@ where
         response = fut => response.unwrap_or_else(|| RequestPermissionsResponse {
             permissions: Default::default(),
             scope: PermissionGrantScope::Turn,
+            strict_auto_review: false,
         }),
     }
 }

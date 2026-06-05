@@ -1,9 +1,7 @@
 use super::*;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use codex_git_utils::GhostCommit;
 use codex_protocol::AgentPath;
-use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
@@ -26,6 +24,7 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
 use image::ImageBuffer;
 use image::ImageFormat;
+use image::Luma;
 use image::Rgba;
 use pretty_assertions::assert_eq;
 use regex_lite::Regex;
@@ -41,7 +40,6 @@ fn assistant_msg(text: &str) -> ResponseItem {
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
-        end_turn: None,
         phase: None,
     }
 }
@@ -60,7 +58,6 @@ fn inter_agent_assistant_msg(text: &str) -> ResponseItem {
         content: vec![ContentItem::OutputText {
             text: serde_json::to_string(&communication).unwrap(),
         }],
-        end_turn: None,
         phase: None,
     }
 }
@@ -80,7 +77,6 @@ fn user_msg(text: &str) -> ResponseItem {
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
         }],
-        end_turn: None,
         phase: None,
     }
 }
@@ -92,7 +88,6 @@ fn user_input_text_msg(text: &str) -> ResponseItem {
         content: vec![ContentItem::InputText {
             text: text.to_string(),
         }],
-        end_turn: None,
         phase: None,
     }
 }
@@ -104,7 +99,6 @@ fn developer_msg(text: &str) -> ResponseItem {
         content: vec![ContentItem::InputText {
             text: text.to_string(),
         }],
-        end_turn: None,
         phase: None,
     }
 }
@@ -119,7 +113,6 @@ fn developer_msg_with_fragments(texts: &[&str]) -> ResponseItem {
                 text: (*text).to_string(),
             })
             .collect(),
-        end_turn: None,
         phase: None,
     }
 }
@@ -127,24 +120,22 @@ fn developer_msg_with_fragments(texts: &[&str]) -> ResponseItem {
 fn reference_context_item() -> TurnContextItem {
     TurnContextItem {
         turn_id: Some("reference-turn".to_string()),
-        trace_id: None,
         cwd: PathBuf::from("/tmp/reference-cwd"),
+        workspace_roots: None,
         current_date: Some("2026-03-23".to_string()),
         timezone: Some("America/Los_Angeles".to_string()),
         approval_policy: AskForApproval::OnRequest,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: "gpt-test".to_string(),
         personality: None,
         collaboration_mode: None,
+        multi_agent_version: None,
         realtime_active: Some(false),
         effort: None,
-        summary: ReasoningSummary::Auto,
-        user_instructions: None,
-        developer_instructions: None,
-        final_output_json_schema: None,
-        truncation_policy: Some(codex_protocol::protocol::TruncationPolicy::Tokens(10_000)),
+        summary: codex_protocol::config_types::ReasoningSummary::Auto,
     }
 }
 
@@ -199,7 +190,6 @@ fn filters_non_api_messages() {
         content: vec![ContentItem::OutputText {
             text: "ignored".to_string(),
         }],
-        end_turn: None,
         phase: None,
     };
     let reasoning = reasoning_msg("thinking...");
@@ -230,7 +220,6 @@ fn filters_non_api_messages() {
                 content: vec![ContentItem::OutputText {
                     text: "hi".to_string()
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::Message {
@@ -239,7 +228,6 @@ fn filters_non_api_messages() {
                 content: vec![ContentItem::OutputText {
                     text: "hello".to_string()
                 }],
-                end_turn: None,
                 phase: None,
             }
         ]
@@ -389,7 +377,6 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
                     text: "caption".to_string(),
                 },
             ],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::FunctionCall {
@@ -452,7 +439,6 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
                     text: "caption".to_string(),
                 },
             ],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::FunctionCall {
@@ -511,7 +497,6 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ],
-        end_turn: None,
         phase: None,
     }]);
     let preserved = with_images.for_prompt(&modalities);
@@ -539,7 +524,6 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
             content: vec![ContentItem::InputText {
                 text: "hi".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
     ]);
@@ -559,7 +543,6 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
                 content: vec![ContentItem::InputText {
                     text: "hi".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             }
         ]
@@ -575,7 +558,6 @@ fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
             content: vec![ContentItem::InputText {
                 text: "generate a lobster".to_string(),
             }],
-            end_turn: None,
             phase: None,
         },
         ResponseItem::ImageGenerationCall {
@@ -595,7 +577,6 @@ fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
                 content: vec![ContentItem::InputText {
                     text: "generate a lobster".to_string(),
                 }],
-                end_turn: None,
                 phase: None,
             },
             ResponseItem::ImageGenerationCall {
@@ -606,22 +587,6 @@ fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
             },
         ]
     );
-}
-
-#[test]
-fn get_history_for_prompt_drops_ghost_commits() {
-    let items = vec![ResponseItem::GhostSnapshot {
-        ghost_commit: GhostCommit::new(
-            "ghost-1".to_string(),
-            /*parent*/ None,
-            Vec::new(),
-            Vec::new(),
-        ),
-    }];
-    let history = create_history_with_items(items);
-    let modalities = default_input_modalities();
-    let filtered = history.for_prompt(&modalities);
-    assert_eq!(filtered, vec![]);
 }
 
 #[test]
@@ -687,28 +652,6 @@ fn remove_first_item_removes_matching_call_for_output() {
 }
 
 #[test]
-fn remove_last_item_removes_matching_call_for_output() {
-    let items = vec![
-        user_msg("before tool call"),
-        ResponseItem::FunctionCall {
-            id: None,
-            name: "do_it".to_string(),
-            namespace: None,
-            arguments: "{}".to_string(),
-            call_id: "call-delete-last".to_string(),
-        },
-        ResponseItem::FunctionCallOutput {
-            call_id: "call-delete-last".to_string(),
-            output: FunctionCallOutputPayload::from_text("ok".to_string()),
-        },
-    ];
-    let mut h = create_history_with_items(items);
-
-    assert!(h.remove_last_item());
-    assert_eq!(h.raw_items(), vec![user_msg("before tool call")]);
-}
-
-#[test]
 fn replace_last_turn_images_replaces_tool_output_images() {
     let items = vec![
         user_input_text_msg("hi"),
@@ -757,7 +700,6 @@ fn replace_last_turn_images_does_not_touch_user_images() {
             image_url: "data:image/png;base64,AAA".to_string(),
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }],
-        end_turn: None,
         phase: None,
     }];
     let mut history = create_history_with_items(items.clone());
@@ -1689,7 +1631,6 @@ fn image_data_url_payload_does_not_dominate_message_estimate() {
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ],
-        end_turn: None,
         phase: None,
     };
     let text_only_item = ResponseItem::Message {
@@ -1698,7 +1639,6 @@ fn image_data_url_payload_does_not_dominate_message_estimate() {
         content: vec![ContentItem::InputText {
             text: "Here is the screenshot".to_string(),
         }],
-        end_turn: None,
         phase: None,
     };
 
@@ -1772,7 +1712,6 @@ fn non_base64_image_urls_are_unchanged() {
             image_url: "https://example.com/foo.png".to_string(),
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }],
-        end_turn: None,
         phase: None,
     };
     let function_output_item = ResponseItem::FunctionCallOutput {
@@ -1796,6 +1735,26 @@ fn non_base64_image_urls_are_unchanged() {
 }
 
 #[test]
+fn encrypted_function_output_uses_plaintext_byte_estimate() {
+    let encrypted_content = "A".repeat(1_868);
+    let item = ResponseItem::FunctionCallOutput {
+        call_id: "call-encrypted".to_string(),
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::EncryptedContent {
+                encrypted_content: encrypted_content.clone(),
+            },
+        ]),
+    };
+
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+    let expected = raw_len - encrypted_content.len() as i64
+        + estimate_encrypted_function_output_length(encrypted_content.len()) as i64;
+
+    assert_eq!(estimated, expected);
+}
+
+#[test]
 fn data_url_without_base64_marker_is_unchanged() {
     let item = ResponseItem::Message {
         id: None,
@@ -1804,7 +1763,6 @@ fn data_url_without_base64_marker_is_unchanged() {
             image_url: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>".to_string(),
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }],
-        end_turn: None,
         phase: None,
     };
 
@@ -1845,7 +1803,6 @@ fn mixed_case_data_url_markers_are_adjusted() {
             image_url,
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }],
-        end_turn: None,
         phase: None,
     };
 
@@ -1878,7 +1835,6 @@ fn multiple_inline_images_apply_multiple_fixed_costs() {
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ],
-        end_turn: None,
         phase: None,
     };
 
@@ -1923,6 +1879,38 @@ fn original_detail_images_scale_with_dimensions() {
 }
 
 #[test]
+fn original_detail_images_are_capped_at_max_patch_count() {
+    // 3201x3201 at 32px patches yields 101 * 101 = 10,201 patches,
+    // which exceeds the original-detail patch budget.
+    let width = 3201;
+    let height = 3201;
+    let image = ImageBuffer::from_pixel(width, height, Luma([12u8]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, ImageFormat::Png)
+        .expect("encode png");
+    let payload = BASE64_STANDARD.encode(bytes.get_ref());
+    let image_url = format!("data:image/png;base64,{payload}");
+    let item = ResponseItem::FunctionCallOutput {
+        call_id: "call-original-capped".to_string(),
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputImage {
+                image_url,
+                detail: Some(ImageDetail::Original),
+            },
+        ]),
+    };
+
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+    let capped_original_detail_image_bytes =
+        i64::try_from(approx_bytes_for_tokens(ORIGINAL_IMAGE_MAX_PATCHES)).unwrap();
+    let expected = raw_len - payload.len() as i64 + capped_original_detail_image_bytes;
+
+    assert_eq!(estimated, expected);
+}
+
+#[test]
 fn original_detail_webp_images_scale_with_dimensions() {
     // Same dimensions as the PNG case above, so the patch-based replacement cost is the same.
     const EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES: i64 = 7_776;
@@ -1961,7 +1949,6 @@ fn text_only_items_unchanged() {
         content: vec![ContentItem::OutputText {
             text: "Hello world, this is a response.".to_string(),
         }],
-        end_turn: None,
         phase: None,
     };
 

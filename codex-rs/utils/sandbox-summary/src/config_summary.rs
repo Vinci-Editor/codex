@@ -15,13 +15,18 @@ pub fn create_config_summary_entries(config: &Config, model: &str) -> Vec<(&'sta
         ),
         (
             "sandbox",
-            summarize_sandbox_policy(config.permissions.sandbox_policy.get()),
+            summarize_sandbox_policy(
+                &config
+                    .permissions
+                    .legacy_sandbox_policy(config.cwd.as_path()),
+            ),
         ),
     ];
     if config.model_provider.wire_api == WireApi::Responses {
         let reasoning_effort = config
             .model_reasoning_effort
-            .map(|effort| effort.to_string());
+            .as_ref()
+            .map(std::string::ToString::to_string);
         entries.push((
             "reasoning effort",
             reasoning_effort.unwrap_or_else(|| "none".to_string()),

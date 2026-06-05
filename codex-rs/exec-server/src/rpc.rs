@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 
 use crate::connection::JsonRpcConnection;
 use crate::connection::JsonRpcConnectionEvent;
+use crate::connection::JsonRpcTransport;
 
 #[derive(Debug)]
 pub(crate) enum RpcCallError {
@@ -36,8 +37,9 @@ pub(crate) enum RpcCallError {
 
 type PendingRequest = oneshot::Sender<Result<Value, RpcCallError>>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
-type RequestRoute<S> =
-    Box<dyn Fn(Arc<S>, JSONRPCRequest) -> BoxFuture<RpcServerOutboundMessage> + Send + Sync>;
+type RequestRoute<S> = Box<
+    dyn Fn(Arc<S>, JSONRPCRequest) -> BoxFuture<Option<RpcServerOutboundMessage>> + Send + Sync,
+>;
 type NotificationRoute<S> =
     Box<dyn Fn(Arc<S>, JSONRPCNotification) -> BoxFuture<Result<(), String>> + Send + Sync>;
 
@@ -57,11 +59,9 @@ pub(crate) enum RpcServerOutboundMessage {
         request_id: RequestId,
         error: JSONRPCErrorError,
     },
-    #[allow(dead_code)]
     Notification(JSONRPCNotification),
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct RpcNotificationSender {
     outgoing_tx: mpsc::Sender<RpcServerOutboundMessage>,
@@ -72,7 +72,17 @@ impl RpcNotificationSender {
         Self { outgoing_tx }
     }
 
-    #[allow(dead_code)]
+    pub(crate) async fn response(
+        &self,
+        request_id: RequestId,
+        result: Value,
+    ) -> Result<(), JSONRPCErrorError> {
+        self.outgoing_tx
+            .send(RpcServerOutboundMessage::Response { request_id, result })
+            .await
+            .map_err(|_| internal_error("RPC connection closed while sending response".into()))
+    }
+
     pub(crate) async fn notify<P: Serialize>(
         &self,
         method: &str,
@@ -131,10 +141,10 @@ where
                     let response = match response {
                         Ok(response) => response.await,
                         Err(error) => {
-                            return RpcServerOutboundMessage::Error { request_id, error };
+                            return Some(RpcServerOutboundMessage::Error { request_id, error });
                         }
                     };
-                    match response {
+                    Some(match response {
                         Ok(result) => match serde_json::to_value(result) {
                             Ok(result) => RpcServerOutboundMessage::Response { request_id, result },
                             Err(err) => RpcServerOutboundMessage::Error {
@@ -143,6 +153,34 @@ where
                             },
                         },
                         Err(error) => RpcServerOutboundMessage::Error { request_id, error },
+                    })
+                })
+            }),
+        );
+    }
+
+    pub(crate) fn request_with_id<P, F, Fut>(&mut self, method: &'static str, handler: F)
+    where
+        P: DeserializeOwned + Send + 'static,
+        F: Fn(Arc<S>, RequestId, P) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), JSONRPCErrorError>> + Send + 'static,
+    {
+        self.request_routes.insert(
+            method,
+            Box::new(move |state, request| {
+                let request_id = request.id;
+                let params = decode_request_params::<P>(request.params)
+                    .map(|params| handler(state, request_id.clone(), params));
+                Box::pin(async move {
+                    let response = match params {
+                        Ok(response) => response.await,
+                        Err(error) => {
+                            return Some(RpcServerOutboundMessage::Error { request_id, error });
+                        }
+                    };
+                    match response {
+                        Ok(()) => None,
+                        Err(error) => Some(RpcServerOutboundMessage::Error { request_id, error }),
                     }
                 })
             }),
@@ -189,43 +227,55 @@ pub(crate) struct RpcClient {
     disconnected_rx: watch::Receiver<bool>,
     next_request_id: AtomicI64,
     transport_tasks: Vec<JoinHandle<()>>,
+    transport: JsonRpcTransport,
     reader_task: JoinHandle<()>,
 }
 
 impl RpcClient {
     pub(crate) fn new(connection: JsonRpcConnection) -> (Self, mpsc::Receiver<RpcClientEvent>) {
-        let (write_tx, mut incoming_rx, disconnected_rx, transport_tasks) = connection.into_parts();
+        let JsonRpcConnection {
+            outgoing_tx: write_tx,
+            mut incoming_rx,
+            disconnected_rx,
+            task_handles: transport_tasks,
+            transport,
+        } = connection;
         let pending = Arc::new(Mutex::new(HashMap::<RequestId, PendingRequest>::new()));
         let (event_tx, event_rx) = mpsc::channel(128);
 
         let pending_for_reader = Arc::clone(&pending);
+        let transport_for_reader = transport.clone();
         let reader_task = tokio::spawn(async move {
-            while let Some(event) = incoming_rx.recv().await {
+            let disconnect_reason = loop {
+                let Some(event) = incoming_rx.recv().await else {
+                    break None;
+                };
                 match event {
                     JsonRpcConnectionEvent::Message(message) => {
                         if let Err(err) =
                             handle_server_message(&pending_for_reader, &event_tx, message).await
                         {
                             let _ = err;
-                            break;
+                            break None;
                         }
                     }
                     JsonRpcConnectionEvent::MalformedMessage { reason } => {
                         let _ = reason;
-                        break;
+                        break None;
                     }
                     JsonRpcConnectionEvent::Disconnected { reason } => {
-                        let _ = event_tx.send(RpcClientEvent::Disconnected { reason }).await;
-                        drain_pending(&pending_for_reader).await;
-                        return;
+                        break reason;
                     }
                 }
-            }
+            };
 
             let _ = event_tx
-                .send(RpcClientEvent::Disconnected { reason: None })
+                .send(RpcClientEvent::Disconnected {
+                    reason: disconnect_reason,
+                })
                 .await;
             drain_pending(&pending_for_reader).await;
+            transport_for_reader.terminate();
         });
 
         (
@@ -235,6 +285,7 @@ impl RpcClient {
                 disconnected_rx,
                 next_request_id: AtomicI64::new(1),
                 transport_tasks,
+                transport,
                 reader_task,
             },
             event_rx,
@@ -259,6 +310,10 @@ impl RpcClient {
                     "JSON-RPC transport closed",
                 ))
             })
+    }
+
+    pub(crate) fn is_disconnected(&self) -> bool {
+        *self.disconnected_rx.borrow()
     }
 
     pub(crate) async fn call<P, T>(&self, method: &str, params: &P) -> Result<T, RpcCallError>
@@ -317,7 +372,6 @@ impl RpcClient {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) async fn pending_request_count(&self) -> usize {
         self.pending.lock().await.len()
     }
@@ -325,6 +379,7 @@ impl RpcClient {
 
 impl Drop for RpcClient {
     fn drop(&mut self) {
+        self.transport.terminate();
         for task in &self.transport_tasks {
             task.abort();
         }
@@ -525,11 +580,9 @@ mod tests {
     async fn rpc_client_matches_out_of_order_responses_by_request_id() {
         let (client_stdin, server_reader) = tokio::io::duplex(4096);
         let (mut server_writer, client_stdout) = tokio::io::duplex(4096);
-        let (client, _events_rx) = RpcClient::new(JsonRpcConnection::from_stdio(
-            client_stdout,
-            client_stdin,
-            "test-rpc".to_string(),
-        ));
+        let connection =
+            JsonRpcConnection::from_stdio(client_stdout, client_stdin, "test-rpc".to_string());
+        let (client, _events_rx) = RpcClient::new(connection);
 
         let server = tokio::spawn(async move {
             let mut lines = BufReader::new(server_reader).lines();

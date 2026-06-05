@@ -18,9 +18,10 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::stdio_server_bin;
+use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
-use core_test_support::wait_for_event_with_timeout;
+use core_test_support::wait_for_mcp_server;
 use tempfile::TempDir;
 use wiremock::MockServer;
 
@@ -72,7 +73,9 @@ fn write_plugin_mcp_plugin(home: &TempDir, command: &str) {
             r#"{{
   "mcpServers": {{
     "sample": {{
-      "command": "{command}"
+      "command": "{command}",
+      "cwd": ".",
+      "startup_timeout_sec": 60.0
     }}
   }}
 }}"#
@@ -96,24 +99,10 @@ fn write_plugin_app_plugin(home: &TempDir) {
     .expect("write plugin app config");
 }
 
-async fn build_plugin_test_codex(
-    server: &MockServer,
-    codex_home: Arc<TempDir>,
-) -> Result<Arc<codex_core::CodexThread>> {
-    let mut builder = test_codex()
-        .with_home(codex_home)
-        .with_auth(CodexAuth::from_api_key("Test API Key"));
-    Ok(builder
-        .build(server)
-        .await
-        .expect("create new conversation")
-        .codex)
-}
-
 async fn build_analytics_plugin_test_codex(
     server: &MockServer,
     codex_home: Arc<TempDir>,
-) -> Result<Arc<codex_core::CodexThread>> {
+) -> Result<TestCodex> {
     let chatgpt_base_url = server.uri();
     let mut builder = test_codex()
         .with_home(codex_home)
@@ -125,15 +114,14 @@ async fn build_analytics_plugin_test_codex(
     Ok(builder
         .build(server)
         .await
-        .expect("create new conversation")
-        .codex)
+        .expect("create new conversation"))
 }
 
 async fn build_apps_enabled_plugin_test_codex(
     server: &MockServer,
     codex_home: Arc<TempDir>,
     chatgpt_base_url: String,
-) -> Result<Arc<codex_core::CodexThread>> {
+) -> Result<TestCodex> {
     let mut builder = test_codex()
         .with_home(codex_home)
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -147,8 +135,7 @@ async fn build_apps_enabled_plugin_test_codex(
     Ok(builder
         .build(server)
         .await
-        .expect("create new conversation")
-        .codex)
+        .expect("create new conversation"))
 }
 
 fn tool_names(body: &serde_json::Value) -> Vec<String> {
@@ -183,21 +170,25 @@ async fn capability_sections_render_in_developer_message_in_order() -> Result<()
     let codex_home = Arc::new(TempDir::new()?);
     write_plugin_skill_plugin(codex_home.as_ref());
     write_plugin_app_plugin(codex_home.as_ref());
-    let codex = build_apps_enabled_plugin_test_codex(
+    let test_codex = build_apps_enabled_plugin_test_codex(
         &server,
         Arc::clone(&codex_home),
         apps_server.chatgpt_base_url,
     )
     .await?;
+    let codex = Arc::clone(&test_codex.codex);
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![codex_protocol::user_input::UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -262,18 +253,23 @@ async fn explicit_plugin_mentions_inject_plugin_guidance() -> Result<()> {
     write_plugin_mcp_plugin(codex_home.as_ref(), &rmcp_test_server_bin);
     write_plugin_app_plugin(codex_home.as_ref());
 
-    let codex =
+    let test_codex =
         build_apps_enabled_plugin_test_codex(&server, codex_home, apps_server.chatgpt_base_url)
             .await?;
+    let codex = Arc::clone(&test_codex.codex);
+    wait_for_mcp_server(&codex, "sample").await?;
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![codex_protocol::user_input::UserInput::Mention {
                 name: "sample".into(),
                 path: format!("plugin://{SAMPLE_PLUGIN_CONFIG_NAME}"),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -307,7 +303,7 @@ async fn explicit_plugin_mentions_inject_plugin_guidance() -> Result<()> {
         "expected plugin app tools to become visible for this turn: {request_tools:?}"
     );
     let echo_tool = request
-        .tool_by_name("mcp__sample__", "echo")
+        .tool_by_name("mcp__sample", "echo")
         .expect("plugin MCP tool should be present");
     let echo_description = echo_tool
         .get("description")
@@ -344,16 +340,20 @@ async fn explicit_plugin_mentions_track_plugin_used_analytics() -> Result<()> {
 
     let codex_home = Arc::new(TempDir::new()?);
     write_plugin_skill_plugin(codex_home.as_ref());
-    let codex = build_analytics_plugin_test_codex(&server, codex_home).await?;
+    let test_codex = build_analytics_plugin_test_codex(&server, codex_home).await?;
+    let codex = Arc::clone(&test_codex.codex);
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![codex_protocol::user_input::UserInput::Mention {
                 name: "sample".into(),
                 path: format!("plugin://{SAMPLE_PLUGIN_CONFIG_NAME}"),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -389,6 +389,10 @@ async fn explicit_plugin_mentions_track_plugin_used_analytics() -> Result<()> {
     assert_eq!(event["event_params"]["has_skills"], true);
     assert_eq!(event["event_params"]["mcp_server_count"], 0);
     assert_eq!(
+        event["event_params"]["mcp_server_names"],
+        serde_json::json!([])
+    );
+    assert_eq!(
         event["event_params"]["connector_ids"],
         serde_json::json!([])
     );
@@ -399,43 +403,6 @@ async fn explicit_plugin_mentions_track_plugin_used_analytics() -> Result<()> {
     assert_eq!(event["event_params"]["model_slug"], "gpt-5.2");
     assert!(event["event_params"]["thread_id"].as_str().is_some());
     assert!(event["event_params"]["turn_id"].as_str().is_some());
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn plugin_mcp_tools_are_listed() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-    let server = start_mock_server().await;
-    let codex_home = Arc::new(TempDir::new()?);
-    let rmcp_test_server_bin = stdio_server_bin()?;
-    write_plugin_mcp_plugin(codex_home.as_ref(), &rmcp_test_server_bin);
-    let codex = build_plugin_test_codex(&server, codex_home).await?;
-
-    let tools_ready_deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        codex.submit(Op::ListMcpTools).await?;
-        let list_event = wait_for_event_with_timeout(
-            &codex,
-            |ev| matches!(ev, EventMsg::McpListToolsResponse(_)),
-            Duration::from_secs(10),
-        )
-        .await;
-        let EventMsg::McpListToolsResponse(tool_list) = list_event else {
-            unreachable!("event guard guarantees McpListToolsResponse");
-        };
-        if tool_list.tools.contains_key("mcp__sample__echo")
-            && tool_list.tools.contains_key("mcp__sample__image")
-        {
-            break;
-        }
-
-        let available_tools: Vec<&str> = tool_list.tools.keys().map(String::as_str).collect();
-        if Instant::now() >= tools_ready_deadline {
-            panic!("timed out waiting for plugin MCP tools; discovered tools: {available_tools:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
 
     Ok(())
 }

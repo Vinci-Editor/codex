@@ -168,7 +168,7 @@ async fn realtime_ws_e2e_session_create_and_event_flow() {
     assert_eq!(
         created,
         RealtimeEvent::SessionUpdated {
-            session_id: "sess_mock".to_string(),
+            realtime_session_id: "sess_mock".to_string(),
             instructions: Some("backend prompt".to_string()),
         }
     );
@@ -275,7 +275,7 @@ async fn realtime_ws_connect_webrtc_sideband_retries_join_until_server_is_availa
     assert_eq!(
         event,
         RealtimeEvent::SessionUpdated {
-            session_id: "sess_joined".to_string(),
+            realtime_session_id: "sess_joined".to_string(),
             instructions: Some("backend prompt".to_string()),
         }
     );
@@ -364,7 +364,7 @@ async fn realtime_ws_e2e_send_while_next_event_waits() {
     assert_eq!(
         next_event,
         RealtimeEvent::SessionUpdated {
-            session_id: "sess_after_send".to_string(),
+            realtime_session_id: "sess_after_send".to_string(),
             instructions: Some("backend prompt".to_string()),
         }
     );
@@ -484,7 +484,7 @@ async fn realtime_ws_e2e_ignores_unknown_text_events() {
     assert_eq!(
         event,
         RealtimeEvent::SessionUpdated {
-            session_id: "sess_after_unknown".to_string(),
+            realtime_session_id: "sess_after_unknown".to_string(),
             instructions: Some("backend prompt".to_string()),
         }
     );

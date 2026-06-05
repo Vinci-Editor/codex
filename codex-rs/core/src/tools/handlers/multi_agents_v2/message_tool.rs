@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::tools::context::FunctionToolOutput;
+use crate::turn_timing::now_unix_timestamp_ms;
 use codex_protocol::protocol::InterAgentCommunication;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,8 +44,6 @@ pub(crate) struct SendMessageArgs {
 pub(crate) struct FollowupTaskArgs {
     pub(crate) target: String,
     pub(crate) message: String,
-    #[serde(default)]
-    pub(crate) interrupt: bool,
 }
 
 fn message_content(message: String) -> Result<String, FunctionCallError> {
@@ -62,25 +61,8 @@ pub(crate) async fn handle_message_string_tool(
     mode: MessageDeliveryMode,
     target: String,
     message: String,
-    interrupt: bool,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
-    handle_message_submission(
-        invocation,
-        mode,
-        target,
-        message_content(message)?,
-        interrupt,
-    )
-    .await
-}
-
-async fn handle_message_submission(
-    invocation: ToolInvocation,
-    mode: MessageDeliveryMode,
-    target: String,
-    prompt: String,
-    interrupt: bool,
-) -> Result<FunctionToolOutput, FunctionCallError> {
+    let prompt = message_content(message)?;
     let ToolInvocation {
         session,
         turn,
@@ -100,23 +82,16 @@ async fn handle_message_submission(
             .is_some_and(AgentPath::is_root)
     {
         return Err(FunctionCallError::RespondToModel(
-            "Tasks can't be assigned to the root agent".to_string(),
+            "Follow-up tasks can't target the root agent".to_string(),
         ));
-    }
-    if interrupt {
-        session
-            .services
-            .agent_control
-            .interrupt_agent(receiver_thread_id)
-            .await
-            .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
     }
     session
         .send_event(
             &turn,
             CollabAgentInteractionBeginEvent {
                 call_id: call_id.clone(),
-                sender_thread_id: session.conversation_id,
+                started_at_ms: now_unix_timestamp_ms(),
+                sender_thread_id: session.thread_id,
                 receiver_thread_id,
                 prompt: prompt.clone(),
             }
@@ -151,7 +126,8 @@ async fn handle_message_submission(
             &turn,
             CollabAgentInteractionEndEvent {
                 call_id,
-                sender_thread_id: session.conversation_id,
+                completed_at_ms: now_unix_timestamp_ms(),
+                sender_thread_id: session.thread_id,
                 receiver_thread_id,
                 receiver_agent_nickname: receiver_agent.agent_nickname,
                 receiver_agent_role: receiver_agent.agent_role,

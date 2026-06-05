@@ -1,7 +1,11 @@
 use super::*;
 use codex_config::types::AppToolApproval;
+use codex_config::types::McpServerOAuthConfig;
 use codex_config::types::McpServerToolConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_config::types::SessionPickerViewMode;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 #[cfg(unix)]
@@ -16,7 +20,6 @@ fn blocking_set_model_top_level() {
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetModel {
             model: Some("gpt-5.4".to_string()),
             effort: Some(ReasoningEffort::High),
@@ -29,6 +32,48 @@ fn blocking_set_model_top_level() {
 model_reasoning_effort = "high"
 "#;
     assert_eq!(contents, expected);
+}
+
+#[test]
+fn set_service_tier_saves_default_as_default() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+
+    ConfigEditsBuilder::new(codex_home)
+        .set_service_tier(Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()))
+        .apply_blocking()
+        .expect("persist");
+
+    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    assert_eq!(contents, "service_tier = \"default\"\n");
+}
+
+#[test]
+fn set_service_tier_saves_priority_as_fast() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+
+    ConfigEditsBuilder::new(codex_home)
+        .set_service_tier(Some(ServiceTier::Fast.request_value().to_string()))
+        .apply_blocking()
+        .expect("persist");
+
+    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    assert_eq!(contents, "service_tier = \"fast\"\n");
+}
+
+#[test]
+fn set_service_tier_preserves_unknown_service_tier() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+
+    ConfigEditsBuilder::new(codex_home)
+        .set_service_tier(Some("experimental-tier-id".to_string()))
+        .apply_blocking()
+        .expect("persist");
+
+    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    assert_eq!(contents, "service_tier = \"experimental-tier-id\"\n");
 }
 
 #[test]
@@ -46,6 +91,188 @@ fn builder_with_edits_applies_custom_paths() {
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     assert_eq!(contents, "enabled = true\n");
+}
+
+#[test]
+fn session_picker_view_edit_writes_root_tui_setting() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+
+    ConfigEditsBuilder::new(codex_home)
+        .with_edits([session_picker_view_edit(SessionPickerViewMode::Dense)])
+        .apply_blocking()
+        .expect("persist");
+
+    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let expected = r#"[tui]
+session_picker_view = "dense"
+"#;
+    assert_eq!(contents, expected);
+}
+
+#[test]
+fn keymap_binding_edit_writes_root_action_binding() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+
+    ConfigEditsBuilder::new(codex_home)
+        .with_edits([keymap_binding_edit("composer", "submit", "ctrl-enter")])
+        .apply_blocking()
+        .expect("persist");
+
+    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let expected = r#"[tui.keymap.composer]
+submit = "ctrl-enter"
+"#;
+    assert_eq!(contents, expected);
+}
+
+#[test]
+fn keymap_bindings_edit_writes_single_binding_as_string() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+
+    ConfigEditsBuilder::new(codex_home)
+        .with_edits([keymap_bindings_edit(
+            "composer",
+            "submit",
+            &["ctrl-enter".to_string()],
+        )])
+        .apply_blocking()
+        .expect("persist");
+
+    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let expected = r#"[tui.keymap.composer]
+submit = "ctrl-enter"
+"#;
+    assert_eq!(contents, expected);
+}
+
+#[test]
+fn keymap_bindings_edit_writes_multiple_bindings_as_array() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+
+    ConfigEditsBuilder::new(codex_home)
+        .with_edits([keymap_bindings_edit(
+            "composer",
+            "submit",
+            &["enter".to_string(), "ctrl-enter".to_string()],
+        )])
+        .apply_blocking()
+        .expect("persist");
+
+    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let value: TomlValue = toml::from_str(&raw).expect("parse config");
+
+    assert_eq!(
+        value
+            .get("tui")
+            .and_then(|value| value.get("keymap"))
+            .and_then(|value| value.get("composer"))
+            .and_then(|value| value.get("submit"))
+            .and_then(TomlValue::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(TomlValue::as_str)
+                    .collect::<Vec<_>>()
+            }),
+        Some(vec!["enter", "ctrl-enter"])
+    );
+}
+
+#[test]
+fn keymap_binding_edit_replaces_existing_binding_without_touching_profile() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+    std::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        r#"profile = "team"
+
+[tui.keymap.composer]
+submit = "enter"
+
+[profiles.team.tui.keymap.composer]
+submit = "shift-enter"
+"#,
+    )
+    .expect("seed config");
+
+    ConfigEditsBuilder::new(codex_home)
+        .with_edits([keymap_binding_edit("composer", "submit", "ctrl-enter")])
+        .apply_blocking()
+        .expect("persist");
+
+    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let value: TomlValue = toml::from_str(&raw).expect("parse config");
+
+    assert_eq!(
+        value
+            .get("tui")
+            .and_then(|value| value.get("keymap"))
+            .and_then(|value| value.get("composer"))
+            .and_then(|value| value.get("submit"))
+            .and_then(TomlValue::as_str),
+        Some("ctrl-enter")
+    );
+    assert_eq!(
+        value
+            .get("profiles")
+            .and_then(|value| value.get("team"))
+            .and_then(|value| value.get("tui"))
+            .and_then(|value| value.get("keymap"))
+            .and_then(|value| value.get("composer"))
+            .and_then(|value| value.get("submit"))
+            .and_then(TomlValue::as_str),
+        Some("shift-enter")
+    );
+}
+
+#[test]
+fn keymap_binding_clear_edit_removes_root_action_binding_without_touching_profile() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+    std::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        r#"profile = "team"
+
+[tui.keymap.composer]
+submit = "enter"
+
+[profiles.team.tui.keymap.composer]
+submit = "shift-enter"
+"#,
+    )
+    .expect("seed config");
+
+    ConfigEditsBuilder::new(codex_home)
+        .with_edits([keymap_binding_clear_edit("composer", "submit")])
+        .apply_blocking()
+        .expect("persist");
+
+    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let value: TomlValue = toml::from_str(&raw).expect("parse config");
+
+    assert_eq!(
+        value
+            .get("tui")
+            .and_then(|value| value.get("keymap"))
+            .and_then(|value| value.get("composer"))
+            .and_then(|value| value.get("submit")),
+        None
+    );
+    assert_eq!(
+        value
+            .get("profiles")
+            .and_then(|value| value.get("team"))
+            .and_then(|value| value.get("tui"))
+            .and_then(|value| value.get("keymap"))
+            .and_then(|value| value.get("composer"))
+            .and_then(|value| value.get("submit"))
+            .and_then(TomlValue::as_str),
+        Some("shift-enter")
+    );
 }
 
 #[test]
@@ -134,7 +361,7 @@ enabled = false
 }
 
 #[test]
-fn blocking_set_model_preserves_inline_table_contents() {
+fn blocking_set_model_ignores_inline_legacy_profile_contents() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();
 
@@ -150,7 +377,6 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetModel {
             model: Some("o4-mini".to_string()),
             effort: None,
@@ -161,7 +387,12 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
     let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     let value: TomlValue = toml::from_str(&raw).expect("parse config");
 
-    // Ensure sandbox_mode is preserved under profiles.fast and model updated.
+    assert_eq!(
+        value.get("model").and_then(TomlValue::as_str),
+        Some("o4-mini")
+    );
+
+    // Legacy profile values stay untouched when root settings are updated.
     let profiles_tbl = value
         .get("profiles")
         .and_then(|v| v.as_table())
@@ -176,7 +407,7 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
     );
     assert_eq!(
         fast_tbl.get("model").and_then(|v| v.as_str()),
-        Some("o4-mini")
+        Some("gpt-4o")
     );
 }
 
@@ -195,7 +426,6 @@ fn blocking_set_model_writes_through_symlink_chain() {
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetModel {
             model: Some("gpt-5.4".to_string()),
             effort: Some(ReasoningEffort::High),
@@ -228,7 +458,6 @@ fn blocking_set_model_replaces_symlink_on_cycle() {
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetModel {
             model: Some("gpt-5.4".to_string()),
             effort: None,
@@ -267,7 +496,6 @@ network_access = false
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[
             ConfigEdit::SetPath {
                 segments: vec![
@@ -307,7 +535,7 @@ network_access = true
 }
 
 #[test]
-fn blocking_clear_model_removes_inline_table_entry() {
+fn blocking_clear_model_does_not_follow_legacy_active_profile() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();
 
@@ -322,7 +550,6 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetModel {
             model: None,
             effort: Some(ReasoningEffort::High),
@@ -333,15 +560,14 @@ profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     let expected = r#"profile = "fast"
 
-[profiles.fast]
-sandbox_mode = "strict"
+profiles = { fast = { model = "gpt-4o", sandbox_mode = "strict" } }
 model_reasoning_effort = "high"
 "#;
     assert_eq!(contents, expected);
 }
 
 #[test]
-fn blocking_set_model_scopes_to_active_profile() {
+fn blocking_set_model_does_not_follow_legacy_active_profile() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();
     std::fs::write(
@@ -356,7 +582,6 @@ model_reasoning_effort = "low"
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetModel {
             model: Some("o5-preview".to_string()),
             effort: Some(ReasoningEffort::Minimal),
@@ -366,39 +591,11 @@ model_reasoning_effort = "low"
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     let expected = r#"profile = "team"
+model = "o5-preview"
+model_reasoning_effort = "minimal"
 
 [profiles.team]
-model_reasoning_effort = "minimal"
-model = "o5-preview"
-"#;
-    assert_eq!(contents, expected);
-}
-
-#[test]
-fn blocking_set_model_with_explicit_profile() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-    std::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        r#"[profiles."team a"]
-model = "gpt-5.4"
-"#,
-    )
-    .expect("seed");
-
-    apply_blocking(
-        codex_home,
-        Some("team a"),
-        &[ConfigEdit::SetModel {
-            model: Some("o4-mini".to_string()),
-            effort: None,
-        }],
-    )
-    .expect("persist");
-
-    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let expected = r#"[profiles."team a"]
-model = "o4-mini"
+model_reasoning_effort = "low"
 "#;
     assert_eq!(contents, expected);
 }
@@ -420,7 +617,6 @@ existing = "value"
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetNoticeHideFullAccessWarning(true)],
     )
     .expect("persist");
@@ -450,7 +646,6 @@ existing = "value"
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetNoticeHideRateLimitModelNudge(true)],
     )
     .expect("persist");
@@ -476,7 +671,6 @@ existing = "value"
     .expect("seed");
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetNoticeHideModelMigrationPrompt(
             "hide_gpt5_1_migration_prompt".to_string(),
             true,
@@ -505,7 +699,6 @@ existing = "value"
     .expect("seed");
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetNoticeHideModelMigrationPrompt(
             "hide_gpt-5.1-codex-max_migration_prompt".to_string(),
             true,
@@ -534,7 +727,6 @@ existing = "value"
     .expect("seed");
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::RecordModelMigrationSeen {
             from: "gpt-5.2".to_string(),
             to: "gpt-5.4".to_string(),
@@ -565,7 +757,6 @@ existing = "value"
     .expect("seed");
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetNoticeHideExternalConfigMigrationPromptHome(
             true,
         )],
@@ -595,7 +786,6 @@ existing = "value"
     .expect("seed");
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[
             ConfigEdit::SetNoticeHideExternalConfigMigrationPromptProject(
                 "/Users/alexsong/code/skills".to_string(),
@@ -628,7 +818,6 @@ existing = "value"
     .expect("seed");
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetNoticeExternalConfigMigrationPromptHomeLastPromptedAt(1_760_000_000)],
     )
     .expect("persist");
@@ -656,7 +845,6 @@ existing = "value"
     .expect("seed");
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[
             ConfigEdit::SetNoticeExternalConfigMigrationPromptProjectLastPromptedAt(
                 "/Users/alexsong/code/skills".to_string(),
@@ -699,7 +887,7 @@ fn blocking_replace_mcp_servers_round_trips() {
                 env_vars: vec!["FOO".into()],
                 cwd: None,
             },
-            experimental_environment: None,
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
             supports_parallel_tool_calls: true,
@@ -710,6 +898,7 @@ fn blocking_replace_mcp_servers_round_trips() {
             enabled_tools: Some(vec!["one".to_string(), "two".to_string()]),
             disabled_tools: None,
             scopes: None,
+            oauth: None,
             oauth_resource: None,
             tools: HashMap::new(),
         },
@@ -728,7 +917,7 @@ fn blocking_replace_mcp_servers_round_trips() {
                 ),
                 env_http_headers: None,
             },
-            experimental_environment: None,
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: false,
             required: false,
             supports_parallel_tool_calls: false,
@@ -739,6 +928,9 @@ fn blocking_replace_mcp_servers_round_trips() {
             enabled_tools: None,
             disabled_tools: Some(vec!["forbidden".to_string()]),
             scopes: None,
+            oauth: Some(McpServerOAuthConfig {
+                client_id: Some("eci-prd-pub-codex-123".to_string()),
+            }),
             oauth_resource: Some("https://resource.example.com".to_string()),
             tools: HashMap::new(),
         },
@@ -746,7 +938,6 @@ fn blocking_replace_mcp_servers_round_trips() {
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::ReplaceMcpServers(servers.clone())],
     )
     .expect("persist");
@@ -763,6 +954,9 @@ oauth_resource = \"https://resource.example.com\"
 
 [mcp_servers.http.http_headers]
 Z-Header = \"z\"
+
+[mcp_servers.http.oauth]
+client_id = \"eci-prd-pub-codex-123\"
 
 [mcp_servers.stdio]
 command = \"cmd\"
@@ -794,7 +988,7 @@ fn blocking_replace_mcp_servers_serializes_tool_approval_overrides() {
                 env_vars: Vec::new(),
                 cwd: None,
             },
-            experimental_environment: None,
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
@@ -805,6 +999,7 @@ fn blocking_replace_mcp_servers_serializes_tool_approval_overrides() {
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth: None,
             oauth_resource: None,
             tools: HashMap::from([(
                 "search".to_string(),
@@ -815,12 +1010,7 @@ fn blocking_replace_mcp_servers_serializes_tool_approval_overrides() {
         },
     );
 
-    apply_blocking(
-        codex_home,
-        /*profile*/ None,
-        &[ConfigEdit::ReplaceMcpServers(servers)],
-    )
-    .expect("persist");
+    apply_blocking(codex_home, &[ConfigEdit::ReplaceMcpServers(servers)]).expect("persist");
 
     let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     let expected = "\
@@ -858,7 +1048,7 @@ foo = { command = "cmd" }
                 env_vars: Vec::new(),
                 cwd: None,
             },
-            experimental_environment: None,
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
@@ -869,17 +1059,13 @@ foo = { command = "cmd" }
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth: None,
             oauth_resource: None,
             tools: HashMap::new(),
         },
     );
 
-    apply_blocking(
-        codex_home,
-        /*profile*/ None,
-        &[ConfigEdit::ReplaceMcpServers(servers)],
-    )
-    .expect("persist");
+    apply_blocking(codex_home, &[ConfigEdit::ReplaceMcpServers(servers)]).expect("persist");
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     let expected = r#"[mcp_servers]
@@ -912,7 +1098,7 @@ foo = { command = "cmd" } # keep me
                 env_vars: Vec::new(),
                 cwd: None,
             },
-            experimental_environment: None,
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: false,
             required: false,
             supports_parallel_tool_calls: false,
@@ -923,17 +1109,13 @@ foo = { command = "cmd" } # keep me
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth: None,
             oauth_resource: None,
             tools: HashMap::new(),
         },
     );
 
-    apply_blocking(
-        codex_home,
-        /*profile*/ None,
-        &[ConfigEdit::ReplaceMcpServers(servers)],
-    )
-    .expect("persist");
+    apply_blocking(codex_home, &[ConfigEdit::ReplaceMcpServers(servers)]).expect("persist");
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     let expected = r#"[mcp_servers]
@@ -965,7 +1147,7 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
                 env_vars: Vec::new(),
                 cwd: None,
             },
-            experimental_environment: None,
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,
@@ -976,17 +1158,13 @@ foo = { command = "cmd", args = ["--flag"] } # keep me
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth: None,
             oauth_resource: None,
             tools: HashMap::new(),
         },
     );
 
-    apply_blocking(
-        codex_home,
-        /*profile*/ None,
-        &[ConfigEdit::ReplaceMcpServers(servers)],
-    )
-    .expect("persist");
+    apply_blocking(codex_home, &[ConfigEdit::ReplaceMcpServers(servers)]).expect("persist");
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     let expected = r#"[mcp_servers]
@@ -1019,7 +1197,7 @@ foo = { command = "cmd" }
                 env_vars: Vec::new(),
                 cwd: None,
             },
-            experimental_environment: None,
+            environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: false,
             required: false,
             supports_parallel_tool_calls: false,
@@ -1030,17 +1208,13 @@ foo = { command = "cmd" }
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth: None,
             oauth_resource: None,
             tools: HashMap::new(),
         },
     );
 
-    apply_blocking(
-        codex_home,
-        /*profile*/ None,
-        &[ConfigEdit::ReplaceMcpServers(servers)],
-    )
-    .expect("persist");
+    apply_blocking(codex_home, &[ConfigEdit::ReplaceMcpServers(servers)]).expect("persist");
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     let expected = r#"[mcp_servers]
@@ -1057,7 +1231,6 @@ fn blocking_clear_path_noop_when_missing() {
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::ClearPath {
             segments: vec!["missing".to_string()],
         }],
@@ -1078,7 +1251,6 @@ fn blocking_set_path_updates_notifications() {
     let item = value(false);
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::SetPath {
             segments: vec!["tui".to_string(), "notifications".to_string()],
             value: item,
@@ -1260,7 +1432,6 @@ fn replace_mcp_servers_blocking_clears_table_when_empty() {
 
     apply_blocking(
         codex_home,
-        /*profile*/ None,
         &[ConfigEdit::ReplaceMcpServers(BTreeMap::new())],
     )
     .expect("persist");

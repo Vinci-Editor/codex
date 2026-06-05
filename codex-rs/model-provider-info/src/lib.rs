@@ -34,9 +34,15 @@ const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
+pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
 pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
-pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str = "https://bedrock-mantle.us-east-1.api.aws/v1";
+pub const AMAZON_BEDROCK_GPT_5_5_MODEL_ID: &str = "openai.gpt-5.5";
+pub const AMAZON_BEDROCK_GPT_5_4_MODEL_ID: &str = "openai.gpt-5.4";
+pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str =
+    "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
+const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER: &str = "x-amzn-mantle-client-agent";
+const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE: &str = "codex";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
@@ -136,6 +142,8 @@ pub struct ModelProviderInfo {
 pub struct ModelProviderAwsAuthInfo {
     /// AWS profile name to use. When unset, the AWS SDK default chain decides.
     pub profile: Option<String>,
+    /// AWS region to use for provider-specific endpoints.
+    pub region: Option<String>,
 }
 
 impl ModelProviderInfo {
@@ -227,8 +235,11 @@ impl ModelProviderInfo {
     }
 
     pub fn to_api_provider(&self, auth_mode: Option<AuthMode>) -> CodexResult<ApiProvider> {
-        let default_base_url = if matches!(auth_mode, Some(AuthMode::Chatgpt)) {
-            "https://chatgpt.com/backend-api/codex"
+        let default_base_url = if matches!(
+            auth_mode,
+            Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens | AuthMode::AgentIdentity)
+        ) {
+            CHATGPT_CODEX_BASE_URL
         } else {
             "https://api.openai.com/v1"
         };
@@ -352,10 +363,16 @@ impl ModelProviderInfo {
             env_key_instructions: None,
             experimental_bearer_token: None,
             auth: None,
-            aws: Some(aws.unwrap_or(ModelProviderAwsAuthInfo { profile: None })),
+            aws: Some(aws.unwrap_or(ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+            })),
             wire_api: WireApi::Responses,
             query_params: None,
-            http_headers: None,
+            http_headers: Some(HashMap::from([(
+                AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string(),
+                AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE.to_string(),
+            )])),
             env_http_headers: None,
             request_max_retries: None,
             stream_max_retries: None,
@@ -422,7 +439,7 @@ pub fn built_in_model_providers(
 ///
 /// Configured providers extend the built-in set. Built-in providers are not
 /// generally overridable, but the built-in Amazon Bedrock provider allows the
-/// user to set `aws.profile`.
+/// user to set `aws.profile` and `aws.region`.
 pub fn merge_configured_model_providers(
     mut model_providers: HashMap<String, ModelProviderInfo>,
     configured_model_providers: HashMap<String, ModelProviderInfo>,
@@ -433,15 +450,20 @@ pub fn merge_configured_model_providers(
             if provider != ModelProviderInfo::default() {
                 return Err(format!(
                     "model_providers.{AMAZON_BEDROCK_PROVIDER_ID} only supports changing \
-`aws.profile`; other non-default provider fields are not supported"
+`aws.profile` and `aws.region`; other non-default provider fields are not supported"
                 ));
             }
 
-            if let Some(profile) = aws_override.and_then(|aws| aws.profile)
-                && let Some(built_in) = model_providers.get_mut(AMAZON_BEDROCK_PROVIDER_ID)
-                && let Some(aws) = built_in.aws.as_mut()
+            if let Some(aws_override) = aws_override
+                && let Some(built_in_provider) = model_providers.get_mut(AMAZON_BEDROCK_PROVIDER_ID)
+                && let Some(built_in_aws) = built_in_provider.aws.as_mut()
             {
-                aws.profile = Some(profile);
+                if let Some(profile) = aws_override.profile {
+                    built_in_aws.profile = Some(profile);
+                }
+                if let Some(region) = aws_override.region {
+                    built_in_aws.region = Some(region);
+                }
             }
         } else {
             model_providers.entry(key).or_insert(provider);

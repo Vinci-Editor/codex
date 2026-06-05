@@ -9,6 +9,7 @@ use crate::state::NetworkProxyState;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::net::TcpListener as StdTcpListener;
@@ -223,7 +224,7 @@ impl NetworkProxyBuilder {
             socks_enabled: current_cfg.network.enable_socks5,
             runtime_settings: Arc::new(RwLock::new(NetworkProxyRuntimeSettings::from_config(
                 &current_cfg,
-            ))),
+            )?)),
             reserved_listeners,
             policy_decider: self.policy_decider,
         })
@@ -299,15 +300,26 @@ struct NetworkProxyRuntimeSettings {
     allow_local_binding: bool,
     allow_unix_sockets: Arc<[String]>,
     dangerously_allow_all_unix_sockets: bool,
+    mitm_ca_trust_bundle: Option<crate::certs::ManagedMitmCaTrustBundle>,
 }
 
 impl NetworkProxyRuntimeSettings {
-    fn from_config(config: &config::NetworkProxyConfig) -> Self {
-        Self {
+    fn from_config(config: &config::NetworkProxyConfig) -> Result<Self> {
+        let mitm_ca_trust_bundle = if config.network.mitm {
+            let env = crate::certs::CUSTOM_CA_ENV_KEYS
+                .into_iter()
+                .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
+                .collect();
+            Some(crate::certs::managed_ca_trust_bundle(&env)?)
+        } else {
+            None
+        };
+        Ok(Self {
             allow_local_binding: config.network.allow_local_binding,
             allow_unix_sockets: config.network.allow_unix_sockets().into(),
             dangerously_allow_all_unix_sockets: config.network.dangerously_allow_all_unix_sockets,
-        }
+            mitm_ca_trust_bundle,
+        })
     }
 }
 
@@ -366,12 +378,14 @@ pub const ALL_PROXY_ENV_KEYS: &[&str] = &["ALL_PROXY", "all_proxy"];
 pub const PROXY_ACTIVE_ENV_KEY: &str = "CODEX_NETWORK_PROXY_ACTIVE";
 pub const ALLOW_LOCAL_BINDING_ENV_KEY: &str = "CODEX_NETWORK_ALLOW_LOCAL_BINDING";
 const ELECTRON_GET_USE_PROXY_ENV_KEY: &str = "ELECTRON_GET_USE_PROXY";
+const NODE_USE_ENV_PROXY_ENV_KEY: &str = "NODE_USE_ENV_PROXY";
 #[cfg(any(target_os = "macos", test))]
 const GIT_SSH_COMMAND_ENV_KEY: &str = "GIT_SSH_COMMAND";
 pub const PROXY_ENV_KEYS: &[&str] = &[
     PROXY_ACTIVE_ENV_KEY,
     ALLOW_LOCAL_BINDING_ENV_KEY,
     ELECTRON_GET_USE_PROXY_ENV_KEY,
+    NODE_USE_ENV_PROXY_ENV_KEY,
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "http_proxy",
@@ -422,7 +436,6 @@ pub const NO_PROXY_ENV_KEYS: &[&str] = &[
 
 pub const DEFAULT_NO_PROXY_VALUE: &str = concat!(
     "localhost,127.0.0.1,::1,",
-    "169.254.0.0/16,",
     "10.0.0.0/8,",
     "172.16.0.0/12,",
     "192.168.0.0/16"
@@ -476,6 +489,7 @@ fn apply_proxy_env_overrides(
     socks_addr: SocketAddr,
     socks_enabled: bool,
     allow_local_binding: bool,
+    mitm_ca_trust_bundle: Option<&crate::certs::ManagedMitmCaTrustBundle>,
 ) {
     let http_proxy_url = format!("http://{http_addr}");
     let socks_proxy_url = format!("socks5h://{socks_addr}");
@@ -526,6 +540,8 @@ fn apply_proxy_env_overrides(
         ELECTRON_GET_USE_PROXY_ENV_KEY.to_string(),
         "true".to_string(),
     );
+    // Node.js built-in HTTP clients only honor proxy environment variables when this is enabled.
+    env.insert(NODE_USE_ENV_PROXY_ENV_KEY.to_string(), "1".to_string());
 
     // Keep HTTP_PROXY/HTTPS_PROXY as HTTP endpoints. A lot of clients break if
     // those vars contain SOCKS URLs. We only switch ALL_PROXY here.
@@ -551,6 +567,27 @@ fn apply_proxy_env_overrides(
                     codex_proxy_git_ssh_command(socks_addr),
                 );
             }
+        }
+    }
+
+    if let Some(mitm_ca_trust_bundle) = mitm_ca_trust_bundle {
+        let managed_path = mitm_ca_trust_bundle.path.to_string_lossy().into_owned();
+        for key in crate::certs::CUSTOM_CA_ENV_KEYS {
+            if env
+                .get(key)
+                .filter(|value| !value.is_empty())
+                .is_some_and(|value| {
+                    value != &managed_path
+                        && mitm_ca_trust_bundle.startup_env_values.get(key) != Some(value)
+                })
+            {
+                // TODO(winston): Materialize policy-checked per-child bundles for readable
+                // startup and command-scoped CA overrides. For now startup overrides are
+                // replaced with the default bundle and later command-scoped overrides are
+                // preserved, either of which can make intercepted TLS fail.
+                continue;
+            }
+            env.insert(key.to_string(), managed_path.clone());
         }
     }
 }
@@ -592,16 +629,28 @@ impl NetworkProxy {
         self.runtime_settings().dangerously_allow_all_unix_sockets
     }
 
+    /// Returns the generated MITM CA bundle path child sandboxes should expose to TLS clients.
+    pub fn managed_mitm_ca_trust_bundle_path(&self) -> Option<AbsolutePathBuf> {
+        self.runtime_settings()
+            .mitm_ca_trust_bundle
+            .and_then(|bundle| {
+                AbsolutePathBuf::from_absolute_path(bundle.path)
+                    .map_err(|err| warn!("managed MITM CA trust bundle path is invalid: {err}"))
+                    .ok()
+            })
+    }
+
     pub fn apply_to_env(&self, env: &mut HashMap<String, String>) {
-        let allow_local_binding = self.allow_local_binding();
-        // Enforce proxying for child processes. We intentionally override existing values so
-        // command-level environment cannot bypass the managed proxy endpoint.
+        let runtime_settings = self.runtime_settings();
+        // Enforce proxying for child processes. Proxy endpoint values are always rewritten;
+        // managed MITM CA vars preserve child-scoped overrides after proxy startup.
         apply_proxy_env_overrides(
             env,
             self.http_addr,
             self.socks_addr,
             self.socks_enabled,
-            allow_local_binding,
+            runtime_settings.allow_local_binding,
+            runtime_settings.mitm_ca_trust_bundle.as_ref(),
         );
     }
 
@@ -628,7 +677,7 @@ impl NetworkProxy {
             "cannot update network.enable_socks5_udp on a running proxy"
         );
 
-        let settings = NetworkProxyRuntimeSettings::from_config(&new_state.config);
+        let settings = NetworkProxyRuntimeSettings::from_config(&new_state.config)?;
         self.state.replace_config_state(new_state).await?;
         let mut guard = self
             .runtime_settings
@@ -788,12 +837,20 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
+    use std::path::Path;
 
     #[tokio::test]
     async fn managed_proxy_builder_uses_loopback_ports() {
+        let http_listener = StdTcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let socks_listener = StdTcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let socks_addr = socks_listener.local_addr().unwrap();
+        drop(http_listener);
+        drop(socks_listener);
+
         let state = Arc::new(network_proxy_state_for_policy(NetworkProxySettings {
-            proxy_url: "http://127.0.0.1:43128".to_string(),
-            socks_url: "http://127.0.0.1:48081".to_string(),
+            proxy_url: format!("http://{http_addr}"),
+            socks_url: format!("http://{socks_addr}"),
             ..NetworkProxySettings::default()
         }));
         let proxy = match NetworkProxy::builder().state(state).build().await {
@@ -813,14 +870,8 @@ mod tests {
         assert!(proxy.socks_addr.ip().is_loopback());
         #[cfg(target_os = "windows")]
         {
-            assert_eq!(
-                proxy.http_addr,
-                "127.0.0.1:43128".parse::<SocketAddr>().unwrap()
-            );
-            assert_eq!(
-                proxy.socks_addr,
-                "127.0.0.1:48081".parse::<SocketAddr>().unwrap()
-            );
+            assert_eq!(proxy.http_addr, http_addr);
+            assert_eq!(proxy.socks_addr, socks_addr);
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -975,6 +1026,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
             /*socks_enabled*/ true,
             /*allow_local_binding*/ false,
+            /*mitm_ca_trust_bundle*/ None,
         );
 
         assert_eq!(
@@ -1009,13 +1061,14 @@ mod tests {
         assert!(no_proxy.contains("10.0.0.0/8"));
         assert!(no_proxy.contains("172.16.0.0/12"));
         assert!(no_proxy.contains("192.168.0.0/16"));
-        assert!(no_proxy.contains("169.254.0.0/16"));
+        assert!(!no_proxy.contains("169.254.0.0/16"));
         assert_eq!(env.get(PROXY_ACTIVE_ENV_KEY), Some(&"1".to_string()));
         assert_eq!(env.get(ALLOW_LOCAL_BINDING_ENV_KEY), Some(&"0".to_string()));
         assert_eq!(
             env.get(ELECTRON_GET_USE_PROXY_ENV_KEY),
             Some(&"true".to_string())
         );
+        assert_eq!(env.get(NODE_USE_ENV_PROXY_ENV_KEY), Some(&"1".to_string()));
         #[cfg(target_os = "macos")]
         assert_eq!(
             env.get(GIT_SSH_COMMAND_ENV_KEY),
@@ -1037,6 +1090,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
             /*socks_enabled*/ true,
             /*allow_local_binding*/ false,
+            /*mitm_ca_trust_bundle*/ None,
         );
 
         for key in env.keys() {
@@ -1050,6 +1104,60 @@ mod tests {
     }
 
     #[test]
+    fn apply_proxy_env_overrides_sets_mitm_ca_trust_bundle_vars() {
+        let mut env = HashMap::new();
+        let mitm_ca_trust_bundle_path = Path::new("/tmp/codex-proxy/ca-bundle.pem");
+        let mitm_ca_trust_bundle = crate::certs::ManagedMitmCaTrustBundle {
+            path: mitm_ca_trust_bundle_path.to_path_buf(),
+            startup_env_values: HashMap::new(),
+        };
+        apply_proxy_env_overrides(
+            &mut env,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3128),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
+            /*socks_enabled*/ true,
+            /*allow_local_binding*/ false,
+            Some(&mitm_ca_trust_bundle),
+        );
+
+        for key in crate::certs::CUSTOM_CA_ENV_KEYS {
+            assert_eq!(
+                env.get(key),
+                Some(&mitm_ca_trust_bundle_path.display().to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn apply_proxy_env_overrides_preserves_command_scoped_mitm_ca_override() {
+        let command_ca_bundle_path = "/tmp/command-ca.pem".to_string();
+        let mut env = HashMap::from([(
+            "REQUESTS_CA_BUNDLE".to_string(),
+            command_ca_bundle_path.clone(),
+        )]);
+        let mitm_ca_trust_bundle_path = Path::new("/tmp/codex-proxy/ca-bundle.pem");
+        let mitm_ca_trust_bundle = crate::certs::ManagedMitmCaTrustBundle {
+            path: mitm_ca_trust_bundle_path.to_path_buf(),
+            startup_env_values: HashMap::new(),
+        };
+
+        apply_proxy_env_overrides(
+            &mut env,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3128),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
+            /*socks_enabled*/ true,
+            /*allow_local_binding*/ false,
+            Some(&mitm_ca_trust_bundle),
+        );
+
+        assert_eq!(env.get("REQUESTS_CA_BUNDLE"), Some(&command_ca_bundle_path));
+        assert_eq!(
+            env.get("SSL_CERT_FILE"),
+            Some(&mitm_ca_trust_bundle_path.display().to_string())
+        );
+    }
+
+    #[test]
     fn apply_proxy_env_overrides_uses_http_for_all_proxy_without_socks() {
         let mut env = HashMap::new();
         apply_proxy_env_overrides(
@@ -1058,6 +1166,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
             /*socks_enabled*/ false,
             /*allow_local_binding*/ true,
+            /*mitm_ca_trust_bundle*/ None,
         );
 
         assert_eq!(
@@ -1076,6 +1185,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
             /*socks_enabled*/ true,
             /*allow_local_binding*/ false,
+            /*mitm_ca_trust_bundle*/ None,
         );
 
         assert_eq!(
@@ -1124,6 +1234,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
             /*socks_enabled*/ true,
             /*allow_local_binding*/ false,
+            /*mitm_ca_trust_bundle*/ None,
         );
 
         assert_eq!(
@@ -1146,6 +1257,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 48081),
             /*socks_enabled*/ true,
             /*allow_local_binding*/ false,
+            /*mitm_ca_trust_bundle*/ None,
         );
 
         assert_eq!(
@@ -1169,6 +1281,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 48081),
             /*socks_enabled*/ true,
             /*allow_local_binding*/ false,
+            /*mitm_ca_trust_bundle*/ None,
         );
 
         assert_eq!(

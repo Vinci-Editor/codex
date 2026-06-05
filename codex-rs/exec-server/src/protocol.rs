@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::FileSystemSandboxContext;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use codex_config::types::ShellEnvironmentPolicyInherit;
+use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
@@ -23,6 +23,9 @@ pub const FS_READ_FILE_METHOD: &str = "fs/readFile";
 pub const FS_WRITE_FILE_METHOD: &str = "fs/writeFile";
 pub const FS_CREATE_DIRECTORY_METHOD: &str = "fs/createDirectory";
 pub const FS_GET_METADATA_METHOD: &str = "fs/getMetadata";
+pub const FS_CANONICALIZE_METHOD: &str = "fs/canonicalize";
+pub const FS_JOIN_METHOD: &str = "fs/join";
+pub const FS_PARENT_METHOD: &str = "fs/parent";
 pub const FS_READ_DIRECTORY_METHOD: &str = "fs/readDirectory";
 pub const FS_REMOVE_METHOD: &str = "fs/remove";
 pub const FS_COPY_METHOD: &str = "fs/copy";
@@ -213,6 +216,44 @@ pub struct FsGetMetadataResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FsCanonicalizeParams {
+    pub path: AbsolutePathBuf,
+    pub sandbox: Option<FileSystemSandboxContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsCanonicalizeResponse {
+    pub path: AbsolutePathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsJoinParams {
+    pub base_path: AbsolutePathBuf,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsJoinResponse {
+    pub path: AbsolutePathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsParentParams {
+    pub path: AbsolutePathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsParentResponse {
+    pub path: Option<AbsolutePathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FsReadDirectoryParams {
     pub path: AbsolutePathBuf,
     pub sandbox: Option<FileSystemSandboxContext>,
@@ -286,15 +327,19 @@ pub struct HttpRequestParams {
     /// Optional request body bytes.
     #[serde(default, rename = "bodyBase64")]
     pub body: Option<ByteChunk>,
-    /// Optional request timeout in milliseconds.
-    #[serde(default)]
+    /// Request timeout in milliseconds.
+    ///
+    /// Omitted or `null` disables the timeout. A number applies that exact
+    /// millisecond deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     /// Caller-chosen stream id for `http/request/bodyDelta` notifications.
     ///
     /// The id must remain unique on a connection until the terminal body delta
-    /// arrives, even if the caller stops reading the stream earlier.
-    #[serde(default)]
-    pub request_id: Option<String>,
+    /// arrives, even if the caller stops reading the stream earlier. Buffered
+    /// requests still send an id so callers can keep one consistent request
+    /// envelope shape.
+    pub request_id: String,
     /// Return after response headers and stream the response body as deltas.
     #[serde(default)]
     pub stream_response: bool,
@@ -389,5 +434,51 @@ mod base64_bytes {
         BASE64_STANDARD
             .decode(encoded)
             .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HttpRequestParams;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn http_request_timeout_treats_omitted_and_null_as_no_timeout() {
+        let omitted: HttpRequestParams = serde_json::from_value(serde_json::json!({
+            "method": "GET",
+            "url": "https://example.test",
+            "requestId": "req-omitted-timeout",
+        }))
+        .expect("omitted timeout should deserialize");
+        let null_timeout: HttpRequestParams = serde_json::from_value(serde_json::json!({
+            "method": "GET",
+            "url": "https://example.test",
+            "requestId": "req-null-timeout",
+            "timeoutMs": null,
+        }))
+        .expect("null timeout should deserialize");
+        let explicit_timeout: HttpRequestParams = serde_json::from_value(serde_json::json!({
+            "method": "GET",
+            "url": "https://example.test",
+            "requestId": "req-explicit-timeout",
+            "timeoutMs": 1234,
+        }))
+        .expect("numeric timeout should deserialize");
+
+        assert_eq!(
+            (omitted.request_id.as_str(), omitted.timeout_ms),
+            ("req-omitted-timeout", None)
+        );
+        assert_eq!(
+            (null_timeout.request_id.as_str(), null_timeout.timeout_ms),
+            ("req-null-timeout", None)
+        );
+        assert_eq!(
+            (
+                explicit_timeout.request_id.as_str(),
+                explicit_timeout.timeout_ms
+            ),
+            ("req-explicit-timeout", Some(1234))
+        );
     }
 }

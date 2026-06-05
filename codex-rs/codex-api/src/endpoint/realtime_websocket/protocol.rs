@@ -201,7 +201,6 @@ pub(super) struct ConversationItemContent {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ConversationContentType {
-    Text,
     InputText,
 }
 

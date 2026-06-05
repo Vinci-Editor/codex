@@ -1,7 +1,6 @@
 use crate::config::Config;
 pub use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 pub use codex_rollout::Cursor;
-pub use codex_rollout::EventPersistenceMode;
 pub use codex_rollout::INTERACTIVE_SESSION_SOURCES;
 pub use codex_rollout::RolloutRecorder;
 pub use codex_rollout::RolloutRecorderParams;
@@ -50,15 +49,7 @@ pub(crate) mod list {
     pub use codex_rollout::find_thread_path_by_id_str;
 }
 
-pub(crate) mod metadata {
-    pub(crate) use codex_rollout::builder_from_items;
-}
-
-pub(crate) mod policy {
-    pub use codex_rollout::EventPersistenceMode;
-    pub use codex_rollout::should_persist_response_item_for_memories;
-}
-
+#[cfg(test)]
 pub(crate) mod recorder {
     pub use codex_rollout::RolloutRecorder;
 }

@@ -8,6 +8,13 @@ use codex_protocol::protocol::HookRunSummary;
 use crate::engine::ConfiguredHandler;
 use crate::engine::dispatcher;
 
+/// Identifies a thread-spawned subagent when a normal hook runs inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentHookContext {
+    pub agent_id: String,
+    pub agent_type: String,
+}
+
 pub(crate) fn join_text_chunks(chunks: Vec<String>) -> Option<String> {
     if chunks.is_empty() {
         None
@@ -103,13 +110,17 @@ pub(crate) fn matcher_pattern_for_event(
         HookEventName::PreToolUse
         | HookEventName::PermissionRequest
         | HookEventName::PostToolUse
-        | HookEventName::SessionStart => matcher,
+        | HookEventName::SessionStart
+        | HookEventName::SubagentStart
+        | HookEventName::SubagentStop
+        | HookEventName::PreCompact
+        | HookEventName::PostCompact => matcher,
         HookEventName::UserPromptSubmit | HookEventName::Stop => None,
     }
 }
 
 pub(crate) fn validate_matcher_pattern(matcher: &str) -> Result<(), regex::Error> {
-    if is_match_all_matcher(matcher) {
+    if is_match_all_matcher(matcher) || is_exact_matcher(matcher) {
         return Ok(());
     }
     regex::Regex::new(matcher).map(|_| ())
@@ -119,6 +130,9 @@ pub(crate) fn matches_matcher(matcher: Option<&str>, input: Option<&str>) -> boo
     match matcher {
         None => true,
         Some(matcher) if is_match_all_matcher(matcher) => true,
+        Some(matcher) if is_exact_matcher(matcher) => input
+            .map(|input| matcher.split('|').any(|candidate| candidate == input))
+            .unwrap_or(false),
         Some(matcher) => input
             .and_then(|input| {
                 regex::Regex::new(matcher)
@@ -129,8 +143,25 @@ pub(crate) fn matches_matcher(matcher: Option<&str>, input: Option<&str>) -> boo
     }
 }
 
+pub(crate) fn matcher_inputs<'a>(
+    tool_name: &'a str,
+    matcher_aliases: &'a [String],
+) -> Vec<&'a str> {
+    // Keep the canonical name first so matcher previews and execution preserve
+    // the same primary identity that hook stdin will serialize.
+    std::iter::once(tool_name)
+        .chain(matcher_aliases.iter().map(String::as_str))
+        .collect()
+}
+
 fn is_match_all_matcher(matcher: &str) -> bool {
     matcher.is_empty() || matcher == "*"
+}
+
+fn is_exact_matcher(matcher: &str) -> bool {
+    matcher
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '|')
 }
 
 #[cfg(test)]
@@ -163,11 +194,49 @@ mod tests {
     }
 
     #[test]
-    fn matcher_uses_regex_matching() {
+    fn exact_matcher_supports_pipe_alternatives() {
         assert!(matches_matcher(Some("Edit|Write"), Some("Edit")));
         assert!(matches_matcher(Some("Edit|Write"), Some("Write")));
         assert!(!matches_matcher(Some("Edit|Write"), Some("Bash")));
         assert_eq!(validate_matcher_pattern("Edit|Write"), Ok(()));
+    }
+
+    #[test]
+    fn literal_matcher_uses_exact_matching() {
+        assert!(matches_matcher(Some("Bash"), Some("Bash")));
+        assert!(!matches_matcher(Some("Bash"), Some("BashOutput")));
+        assert!(matches_matcher(
+            Some("mcp__memory__create_entities"),
+            Some("mcp__memory__create_entities")
+        ));
+        assert!(!matches_matcher(
+            Some("mcp__memory"),
+            Some("mcp__memory__create_entities")
+        ));
+        assert_eq!(validate_matcher_pattern("mcp__memory"), Ok(()));
+    }
+
+    #[test]
+    fn matcher_uses_regex_when_it_contains_regex_characters() {
+        assert!(matches_matcher(Some("^Bash"), Some("BashOutput")));
+        assert_eq!(validate_matcher_pattern("^Bash"), Ok(()));
+    }
+
+    #[test]
+    fn mcp_matchers_support_regex_wildcards() {
+        assert!(matches_matcher(
+            Some("mcp__memory__.*"),
+            Some("mcp__memory__create_entities")
+        ));
+        assert!(matches_matcher(
+            Some("mcp__.*__write.*"),
+            Some("mcp__filesystem__write_file")
+        ));
+        assert!(!matches_matcher(
+            Some("mcp__.*__write.*"),
+            Some("mcp__filesystem__read_file")
+        ));
+        assert_eq!(validate_matcher_pattern("mcp__memory__.*"), Ok(()));
     }
 
     #[test]
@@ -208,6 +277,14 @@ mod tests {
         assert_eq!(
             matcher_pattern_for_event(HookEventName::SessionStart, Some("startup|resume")),
             Some("startup|resume")
+        );
+        assert_eq!(
+            matcher_pattern_for_event(HookEventName::PreCompact, Some("^auto$")),
+            Some("^auto$")
+        );
+        assert_eq!(
+            matcher_pattern_for_event(HookEventName::PostCompact, Some("manual|auto")),
+            Some("manual|auto")
         );
     }
 }

@@ -4,16 +4,16 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_features::Feature;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::sse;
@@ -21,6 +21,7 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::time::Duration;
@@ -30,7 +31,6 @@ const CHILD_PROMPT: &str = "child: say done";
 const SPAWN_CALL_ID: &str = "spawn-call-1";
 const REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(/*millis*/ 20);
 const TURN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 60);
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_api_parent_and_subagent_requests_include_identity_headers() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -46,7 +46,12 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
         },
         sse(vec![
             ev_response_created("resp-parent-1"),
-            ev_function_call(SPAWN_CALL_ID, "spawn_agent", &spawn_args),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                "multi_agent_v1",
+                "spawn_agent",
+                &spawn_args,
+            ),
             ev_completed("resp-parent-1"),
         ]),
     )
@@ -120,35 +125,50 @@ async fn responses_api_parent_and_subagent_requests_include_identity_headers() -
         child.header("x-codex-parent-thread-id").as_deref(),
         Some(parent_thread_id)
     );
+    let child_turn_metadata: serde_json::Value = serde_json::from_str(
+        &child
+            .header("x-codex-turn-metadata")
+            .ok_or_else(|| anyhow!("child request missing x-codex-turn-metadata"))?,
+    )?;
+    assert!(child_turn_metadata.get("forked_from_thread_id").is_none());
+    assert_eq!(
+        child_turn_metadata["parent_thread_id"].as_str(),
+        Some(parent_thread_id)
+    );
 
     Ok(())
 }
 
 async fn submit_turn_with_timeout(test: &TestCodex, prompt: &str) -> Result<()> {
     let session_model = test.session_configured.model.clone();
+    let cwd = test.config.cwd.to_path_buf();
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::workspace_write(), cwd.as_path());
     test.codex
-        .submit(Op::UserTurn {
+        .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: prompt.into(),
                 text_elements: Vec::new(),
             }],
+            environments: None,
             final_output_json_schema: None,
-            cwd: test.config.cwd.to_path_buf(),
-            approval_policy: AskForApproval::OnRequest,
-            approvals_reviewer: None,
-            sandbox_policy: SandboxPolicy::WorkspaceWrite {
-                writable_roots: Vec::new(),
-                read_only_access: Default::default(),
-                network_access: false,
-                exclude_tmpdir_env_var: false,
-                exclude_slash_tmp: false,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                cwd: Some(cwd),
+                approval_policy: Some(AskForApproval::OnRequest),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: session_model,
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
             },
-            model: session_model,
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
         })
         .await?;
 

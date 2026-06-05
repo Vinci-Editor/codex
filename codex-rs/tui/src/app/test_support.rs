@@ -19,18 +19,23 @@ pub(super) async fn make_test_app() -> App {
         session_telemetry,
         app_event_tx,
         chat_widget,
+        workspace_command_runner: None,
         config,
-        active_profile: None,
+        state_db: None,
         cli_kv_overrides: Vec::new(),
         harness_overrides: ConfigOverrides::default(),
+        loader_overrides: LoaderOverrides::without_managed_config_for_tests(),
         runtime_approval_policy_override: None,
-        runtime_sandbox_policy_override: None,
+        runtime_permission_profile_override: None,
         file_search,
         transcript_cells: Vec::new(),
         overlay: None,
         deferred_history_lines: Vec::new(),
         has_emitted_history_lines: false,
+        transcript_reflow: TranscriptReflowState::default(),
+        initial_history_replay_buffer: None,
         enhanced_keys_supported: false,
+        keymap: crate::keymap::RuntimeKeymap::defaults(),
         commit_anim_running: Arc::new(AtomicBool::new(false)),
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
@@ -38,9 +43,8 @@ pub(super) async fn make_test_app() -> App {
         backtrack_render_pending: false,
         feedback: codex_feedback::CodexFeedback::new(),
         feedback_audience: FeedbackAudience::External,
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
-        remote_app_server_url: None,
-        remote_app_server_auth_token: None,
+        environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+        app_server_target: crate::AppServerTarget::Embedded,
         pending_update_action: None,
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
@@ -55,7 +59,9 @@ pub(super) async fn make_test_app() -> App {
         primary_session_configured: None,
         pending_primary_events: VecDeque::new(),
         pending_app_server_requests: PendingAppServerRequests::default(),
+        pending_startup_thread_start: false,
         pending_plugin_enabled_writes: HashMap::new(),
+        pending_hook_enabled_writes: HashMap::new(),
     }
 }
 
@@ -71,7 +77,8 @@ fn test_session_telemetry(config: &Config, model: &str) -> SessionTelemetry {
         "test_originator".to_string(),
         /*log_user_prompts*/ false,
         "test".to_string(),
-        SessionSource::Cli,
+        serde_json::from_value(serde_json::json!("cli"))
+            .expect("cli session source should deserialize"),
     )
 }
 

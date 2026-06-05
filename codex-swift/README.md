@@ -101,6 +101,37 @@ For a physical iPhone talking to a Mac-hosted LM Studio server, use the Mac's LA
 URL instead of `127.0.0.1`, and configure local-network permission plus any
 development ATS exceptions in the app target.
 
+## List Provider Models
+
+Use `CodexModelCatalog` when the app needs a provider-aware model picker instead
+of a hard-coded model list:
+
+```swift
+let catalog = CodexModelCatalog(
+    provider: provider,
+    authStore: authStore,
+    apiKeyStore: apiKeyStore
+)
+
+let models = try await catalog.listModels()
+let defaultModel = models.first(where: \.isDefault)?.model
+```
+
+For `CodexProvider.openAI`, the catalog calls the ChatGPT Codex `/models`
+endpoint and applies the same ChatGPT auth headers as `CodexSession`. For API-key
+providers it sends the configured bearer key. Local OpenAI-compatible providers
+use their `/models` route without auth unless the provider says otherwise.
+
+`CodexModelOption` carries the model id, display name, description, default
+reasoning effort, supported reasoning efforts, input modalities, and hidden or
+default flags. Send a per-turn `reasoningEffort` only when the selected model's
+`supportedReasoningEfforts` includes that value; local providers commonly return
+no reasoning metadata.
+
+If a provider is offline or does not expose a compatible model endpoint, apps can
+fall back to `CodexModelCatalog.fallbackModels(for:)` and still let the user type
+a custom model id.
+
 ## Sign In With ChatGPT
 
 ChatGPT login can use device code auth or browser PKCE auth. Both flows return

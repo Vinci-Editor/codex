@@ -43,10 +43,9 @@ async fn emits_warning_when_unstable_features_enabled_via_config() {
         ..
     } = thread_manager
         .resume_thread_with_history(
-            config,
+            config.clone(),
             InitialHistory::New,
             auth_manager,
-            /*persist_extended_history*/ false,
             /*parent_trace*/ None,
         )
         .await
@@ -90,10 +89,9 @@ async fn suppresses_warning_when_configured() {
         ..
     } = thread_manager
         .resume_thread_with_history(
-            config,
+            config.clone(),
             InitialHistory::New,
             auth_manager,
-            /*persist_extended_history*/ false,
             /*parent_trace*/ None,
         )
         .await

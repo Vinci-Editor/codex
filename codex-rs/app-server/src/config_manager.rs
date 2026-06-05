@@ -1,12 +1,12 @@
 use codex_arg0::Arg0DispatchPaths;
-use codex_cloud_requirements::cloud_requirements_loader;
+use codex_cloud_config::cloud_config_bundle_loader;
+use codex_config::CloudConfigBundleLoader;
+use codex_config::ConfigLayerStack;
+use codex_config::LoaderOverrides;
 use codex_config::ThreadConfigLoader;
+use codex_config::loader::load_config_layers_state;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
-use codex_core::config_loader::CloudRequirementsLoader;
-use codex_core::config_loader::ConfigLayerStack;
-use codex_core::config_loader::LoaderOverrides;
-use codex_core::config_loader::load_config_layers_state;
 use codex_exec_server::LOCAL_FS;
 use codex_features::feature_for_key;
 use codex_login::AuthManager;
@@ -30,59 +30,40 @@ pub(crate) struct ConfigManager {
     cli_overrides: Arc<RwLock<Vec<(String, TomlValue)>>>,
     runtime_feature_enablement: Arc<RwLock<BTreeMap<String, bool>>>,
     loader_overrides: LoaderOverrides,
-    cloud_requirements: Arc<RwLock<CloudRequirementsLoader>>,
+    strict_config: bool,
+    cloud_config_bundle: Arc<RwLock<CloudConfigBundleLoader>>,
     arg0_paths: Arg0DispatchPaths,
-    thread_config_loader: Arc<dyn ThreadConfigLoader>,
-    host_name: Option<String>,
+    thread_config_loader: Arc<RwLock<Arc<dyn ThreadConfigLoader>>>,
 }
 
 impl ConfigManager {
     pub(crate) fn new(
         codex_home: PathBuf,
-        cli_overrides: Arc<RwLock<Vec<(String, TomlValue)>>>,
-        runtime_feature_enablement: Arc<RwLock<BTreeMap<String, bool>>>,
+        cli_overrides: Vec<(String, TomlValue)>,
         loader_overrides: LoaderOverrides,
-        cloud_requirements: Arc<RwLock<CloudRequirementsLoader>>,
+        strict_config: bool,
+        cloud_config_bundle: CloudConfigBundleLoader,
         arg0_paths: Arg0DispatchPaths,
         thread_config_loader: Arc<dyn ThreadConfigLoader>,
-    ) -> Self {
-        Self::new_with_host_name(
-            codex_home,
-            cli_overrides,
-            runtime_feature_enablement,
-            loader_overrides,
-            cloud_requirements,
-            arg0_paths,
-            thread_config_loader,
-            codex_config::host_name(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_host_name(
-        codex_home: PathBuf,
-        cli_overrides: Arc<RwLock<Vec<(String, TomlValue)>>>,
-        runtime_feature_enablement: Arc<RwLock<BTreeMap<String, bool>>>,
-        loader_overrides: LoaderOverrides,
-        cloud_requirements: Arc<RwLock<CloudRequirementsLoader>>,
-        arg0_paths: Arg0DispatchPaths,
-        thread_config_loader: Arc<dyn ThreadConfigLoader>,
-        host_name: Option<String>,
     ) -> Self {
         Self {
             codex_home,
-            cli_overrides,
-            runtime_feature_enablement,
+            cli_overrides: Arc::new(RwLock::new(cli_overrides)),
+            runtime_feature_enablement: Arc::new(RwLock::new(BTreeMap::new())),
             loader_overrides,
-            cloud_requirements,
+            strict_config,
+            cloud_config_bundle: Arc::new(RwLock::new(cloud_config_bundle)),
             arg0_paths,
-            thread_config_loader,
-            host_name,
+            thread_config_loader: Arc::new(RwLock::new(thread_config_loader)),
         }
     }
 
     pub(crate) fn codex_home(&self) -> &Path {
         self.codex_home.as_path()
+    }
+
+    pub(crate) fn user_config_path(&self) -> std::io::Result<AbsolutePathBuf> {
+        self.loader_overrides.user_config_path(self.codex_home())
     }
 
     pub(crate) fn current_cli_overrides(&self) -> Vec<(String, TomlValue)> {
@@ -92,8 +73,8 @@ impl ConfigManager {
             .unwrap_or_default()
     }
 
-    pub(crate) fn current_cloud_requirements(&self) -> CloudRequirementsLoader {
-        self.cloud_requirements
+    pub(crate) fn current_cloud_config_bundle(&self) -> CloudConfigBundleLoader {
+        self.cloud_config_bundle
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_default()
@@ -109,18 +90,36 @@ impl ConfigManager {
         Ok(())
     }
 
-    pub(crate) fn replace_cloud_requirements_loader(
+    pub(crate) fn replace_cloud_config_bundle_loader(
         &self,
         auth_manager: Arc<AuthManager>,
         chatgpt_base_url: String,
     ) {
         let loader =
-            cloud_requirements_loader(auth_manager, chatgpt_base_url, self.codex_home.clone());
-        if let Ok(mut guard) = self.cloud_requirements.write() {
+            cloud_config_bundle_loader(auth_manager, chatgpt_base_url, self.codex_home.clone());
+        if let Ok(mut guard) = self.cloud_config_bundle.write() {
             *guard = loader;
         } else {
-            warn!("failed to update cloud requirements loader");
+            warn!("failed to update cloud config bundle loader");
         }
+    }
+
+    pub(crate) fn replace_thread_config_loader(
+        &self,
+        thread_config_loader: Arc<dyn ThreadConfigLoader>,
+    ) {
+        if let Ok(mut guard) = self.thread_config_loader.write() {
+            *guard = thread_config_loader;
+        } else {
+            warn!("failed to update thread config loader");
+        }
+    }
+
+    fn current_thread_config_loader(&self) -> Arc<dyn ThreadConfigLoader> {
+        self.thread_config_loader
+            .read()
+            .map(|guard| Arc::clone(&*guard))
+            .unwrap_or_else(|_| Arc::new(codex_config::NoopThreadConfigLoader))
     }
 
     pub(crate) async fn sync_default_client_residency_requirement(&self) {
@@ -146,6 +145,42 @@ impl ConfigManager {
             fallback_cwd,
         )
         .await
+    }
+
+    pub(crate) async fn load_latest_config_for_thread(
+        &self,
+        thread_config: &Config,
+    ) -> std::io::Result<Config> {
+        let refreshed_config = self
+            .load_latest_config(Some(thread_config.cwd.to_path_buf()))
+            .await?;
+        let mut config = thread_config
+            .rebuild_preserving_session_layers(&refreshed_config)
+            .await?;
+        self.apply_runtime_feature_enablement(&mut config);
+        self.apply_arg0_paths(&mut config);
+        Ok(config)
+    }
+
+    pub(crate) async fn load_default_config(&self) -> std::io::Result<Config> {
+        let mut config = Config::load_default_with_cli_overrides_for_codex_home(
+            self.codex_home.clone(),
+            self.current_cli_overrides(),
+        )
+        .await?;
+        if self.loader_overrides.user_config_path.is_some()
+            || self.loader_overrides.user_config_profile.is_some()
+        {
+            let user_config_path = self.loader_overrides.user_config_path(self.codex_home())?;
+            config.config_layer_stack = config.config_layer_stack.with_user_config_profile(
+                &user_config_path,
+                self.loader_overrides.user_config_profile.as_ref(),
+                TomlValue::Table(toml::map::Map::new()),
+            );
+        }
+        self.apply_runtime_feature_enablement(&mut config);
+        self.apply_arg0_paths(&mut config);
+        Ok(config)
     }
 
     pub(crate) async fn load_with_overrides(
@@ -181,15 +216,23 @@ impl ConfigManager {
         &self,
         cli_overrides: &[(String, TomlValue)],
         request_overrides: Option<HashMap<String, serde_json::Value>>,
-        typesafe_overrides: ConfigOverrides,
+        mut typesafe_overrides: ConfigOverrides,
         fallback_cwd: Option<PathBuf>,
     ) -> std::io::Result<Config> {
+        let mut request_overrides = request_overrides.unwrap_or_default();
+        if let Some(value) = request_overrides.remove("bypass_hook_trust") {
+            typesafe_overrides.bypass_hook_trust = Some(value.as_bool().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "`bypass_hook_trust` override must be a boolean",
+                )
+            })?);
+        }
         let merged_cli_overrides = cli_overrides
             .iter()
             .cloned()
             .chain(
                 request_overrides
-                    .unwrap_or_default()
                     .into_iter()
                     .map(|(key, value)| (key, json_to_toml(value))),
             )
@@ -199,11 +242,11 @@ impl ConfigManager {
             .codex_home(self.codex_home.clone())
             .cli_overrides(merged_cli_overrides)
             .loader_overrides(self.loader_overrides.clone())
+            .strict_config(self.strict_config)
             .harness_overrides(typesafe_overrides)
             .fallback_cwd(fallback_cwd)
-            .cloud_requirements(self.current_cloud_requirements())
-            .thread_config_loader(Arc::clone(&self.thread_config_loader))
-            .host_name(self.host_name.clone())
+            .cloud_config_bundle(self.current_cloud_config_bundle())
+            .thread_config_loader(self.current_thread_config_loader())
             .build()
             .await?;
         self.apply_runtime_feature_enablement(&mut config);
@@ -222,15 +265,18 @@ impl ConfigManager {
         &self,
         cwd: Option<AbsolutePathBuf>,
     ) -> std::io::Result<ConfigLayerStack> {
+        let thread_config_loader = self.current_thread_config_loader();
         load_config_layers_state(
             LOCAL_FS.as_ref(),
             &self.codex_home,
             cwd,
             &self.current_cli_overrides(),
-            self.loader_overrides.clone(),
-            self.current_cloud_requirements(),
-            self.thread_config_loader.as_ref(),
-            self.host_name.as_deref(),
+            codex_config::ConfigLoadOptions {
+                loader_overrides: self.loader_overrides.clone(),
+                strict_config: self.strict_config,
+                cloud_config_bundle: self.current_cloud_config_bundle(),
+            },
+            thread_config_loader.as_ref(),
         )
         .await
     }
@@ -257,18 +303,16 @@ impl ConfigManager {
         codex_home: PathBuf,
         cli_overrides: Vec<(String, TomlValue)>,
         loader_overrides: LoaderOverrides,
-        cloud_requirements: CloudRequirementsLoader,
-        host_name: Option<String>,
+        cloud_config_bundle: CloudConfigBundleLoader,
     ) -> Self {
-        Self::new_with_host_name(
+        Self::new(
             codex_home,
-            Arc::new(RwLock::new(cli_overrides)),
-            Arc::new(RwLock::new(BTreeMap::new())),
+            cli_overrides,
             loader_overrides,
-            Arc::new(RwLock::new(cloud_requirements)),
+            /*strict_config*/ false,
+            cloud_config_bundle,
             Arg0DispatchPaths::default(),
             Arc::new(codex_config::NoopThreadConfigLoader),
-            host_name,
         )
     }
 
@@ -278,8 +322,7 @@ impl ConfigManager {
             codex_home,
             Vec::new(),
             LoaderOverrides::without_managed_config_for_tests(),
-            CloudRequirementsLoader::default(),
-            /*host_name*/ None,
+            CloudConfigBundleLoader::default(),
         )
     }
 }

@@ -49,18 +49,19 @@ fn build_permissions_update_item(
     }
 
     let prev = previous?;
-    if prev.sandbox_policy == *next.sandbox_policy.get()
+    if prev.permission_profile() == next.permission_profile()
         && prev.approval_policy == next.approval_policy.value()
     {
         return None;
     }
 
     Some(
-        PermissionsInstructions::from_policy(
-            next.sandbox_policy.get(),
+        PermissionsInstructions::from_permission_profile(
+            &next.permission_profile,
             next.approval_policy.value(),
             next.config.approvals_reviewer,
             exec_policy,
+            #[allow(deprecated)]
             &next.cwd,
             next.features.enabled(Feature::ExecPermissionApprovals),
             next.features.enabled(Feature::RequestPermissionsTool),
@@ -73,6 +74,10 @@ fn build_collaboration_mode_update_item(
     previous: Option<&TurnContextItem>,
     next: &TurnContext,
 ) -> Option<String> {
+    if !next.config.include_collaboration_mode_instructions {
+        return None;
+    }
+
     let prev = previous?;
     if prev.collaboration_mode.as_ref() != Some(&next.collaboration_mode) {
         // If the next mode has empty developer instructions, this returns None and we emit no
@@ -197,7 +202,6 @@ fn build_text_message(role: &str, text_sections: Vec<String>) -> Option<Response
         id: None,
         role: role.to_string(),
         content,
-        end_turn: None,
         phase: None,
     })
 }

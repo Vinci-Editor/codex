@@ -256,21 +256,14 @@ public actor CodexSession {
         for (key, value) in configuration.provider.defaultHeaders {
             request.setValue(value, forHTTPHeaderField: key)
         }
-        switch configuration.provider.authMode {
-        case .none:
-            break
-        case .chatGPT:
-            let tokens = try await chatGPTTokensForRequest()
-            request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
-            if let accountID = tokens.resolvedChatGPTAccountID {
-                request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-ID")
-            }
-        case .apiKey:
-            guard let apiKey = try configuration.apiKeyStore?.loadAPIKey(), !apiKey.isEmpty else {
-                throw CodexSessionError.missingAuthentication
-            }
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        }
+        try await CodexAuthorization.apply(
+            to: &request,
+            provider: configuration.provider,
+            authStore: configuration.authStore,
+            apiKeyStore: configuration.apiKeyStore,
+            chatGPTAuthenticator: configuration.chatGPTAuthenticator,
+            missingAuthentication: CodexSessionError.missingAuthentication
+        )
         request.httpBody = body
 
         var activeAssistantItemID: String?
@@ -400,18 +393,6 @@ public actor CodexSession {
 
     private func buildToolDefinitions() -> [[String: Any]] {
         CodexMobileCoreBridge.builtinTools() + configuration.tools.map { $0.responsesToolDefinition() }
-    }
-
-    private func chatGPTTokensForRequest() async throws -> CodexAuthTokens {
-        guard let authStore = configuration.authStore, var tokens = try authStore.loadTokens() else {
-            throw CodexSessionError.missingAuthentication
-        }
-        if tokens.shouldRefresh() {
-            let authenticator = configuration.chatGPTAuthenticator ?? CodexDeviceCodeAuthenticator()
-            tokens = try await authenticator.refreshTokens(tokens)
-            try authStore.saveTokens(tokens)
-        }
-        return tokens
     }
 
     private static func errorBody(from bytes: URLSession.AsyncBytes) async throws -> String {

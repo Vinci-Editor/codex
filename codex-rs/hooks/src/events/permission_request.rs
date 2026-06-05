@@ -22,7 +22,7 @@ use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
 use crate::schema::PermissionRequestCommandInput;
-use crate::schema::PermissionRequestToolInput;
+use crate::schema::SubagentCommandInputFields;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::HookEventName;
@@ -30,19 +30,21 @@ use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
+use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct PermissionRequestRequest {
     pub session_id: ThreadId,
     pub turn_id: String,
+    pub subagent: Option<common::SubagentHookContext>,
     pub cwd: PathBuf,
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub permission_mode: String,
     pub tool_name: String,
+    pub matcher_aliases: Vec<String>,
     pub run_id_suffix: String,
-    pub command: String,
-    pub description: Option<String>,
+    pub tool_input: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,10 +68,11 @@ pub(crate) fn preview(
     handlers: &[ConfiguredHandler],
     request: &PermissionRequestRequest,
 ) -> Vec<HookRunSummary> {
-    dispatcher::select_handlers(
+    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
+    dispatcher::select_handlers_for_matcher_inputs(
         handlers,
         HookEventName::PermissionRequest,
-        Some(&request.tool_name),
+        &matcher_inputs,
     )
     .into_iter()
     .map(|handler| {
@@ -86,10 +89,11 @@ pub(crate) async fn run(
     shell: &CommandShell,
     request: PermissionRequestRequest,
 ) -> PermissionRequestOutcome {
-    let matched = dispatcher::select_handlers(
+    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
+    let matched = dispatcher::select_handlers_for_matcher_inputs(
         handlers,
         HookEventName::PermissionRequest,
-        Some(&request.tool_name),
+        &matcher_inputs,
     );
     if matched.is_empty() {
         return PermissionRequestOutcome {
@@ -166,19 +170,19 @@ fn resolve_permission_request_decision<'a>(
 }
 
 fn build_command_input(request: &PermissionRequestRequest) -> PermissionRequestCommandInput {
+    let subagent = SubagentCommandInputFields::from(request.subagent.as_ref());
     PermissionRequestCommandInput {
         session_id: request.session_id.to_string(),
         turn_id: request.turn_id.clone(),
+        agent_id: subagent.agent_id,
+        agent_type: subagent.agent_type,
         transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
         cwd: request.cwd.display().to_string(),
         hook_event_name: "PermissionRequest".to_string(),
         model: request.model.clone(),
         permission_mode: request.permission_mode.clone(),
         tool_name: request.tool_name.clone(),
-        tool_input: PermissionRequestToolInput {
-            command: request.command.clone(),
-            description: request.description.clone(),
-        },
+        tool_input: request.tool_input.clone(),
     }
 }
 
@@ -233,7 +237,7 @@ fn parse_completed(
                             }
                         }
                     }
-                } else if trimmed_stdout.starts_with('{') || trimmed_stdout.starts_with('[') {
+                } else if output_parser::looks_like_json(&run_result.stdout) {
                     status = HookRunStatus::Failed;
                     entries.push(HookOutputEntry {
                         kind: HookOutputEntryKind::Error,
@@ -282,6 +286,7 @@ fn parse_completed(
     dispatcher::ParsedHandler {
         completed,
         data: PermissionRequestHandlerData { decision },
+        completion_order: 0,
     }
 }
 

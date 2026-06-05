@@ -7,29 +7,47 @@ pub use crate::mcp_types::AppToolApproval;
 pub use crate::mcp_types::McpServerConfig;
 pub use crate::mcp_types::McpServerDisabledReason;
 pub use crate::mcp_types::McpServerEnvVar;
+pub use crate::mcp_types::McpServerOAuthConfig;
 pub use crate::mcp_types::McpServerToolConfig;
 pub use crate::mcp_types::McpServerTransportConfig;
 pub use crate::mcp_types::RawMcpServerConfig;
 pub use codex_protocol::config_types::AltScreenMode;
 pub use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::EnvironmentVariablePattern;
 pub use codex_protocol::config_types::ModeKind;
 pub use codex_protocol::config_types::Personality;
 pub use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::ShellEnvironmentPolicy;
+use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 pub use codex_protocol::config_types::WebSearchMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
-use wildmatch::WildMatchPattern;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 
+pub use crate::tui_keymap::KeybindingSpec;
+pub use crate::tui_keymap::KeybindingsSpec;
+pub use crate::tui_keymap::MAX_FUNCTION_KEY;
+pub use crate::tui_keymap::TuiApprovalKeymap;
+pub use crate::tui_keymap::TuiChatKeymap;
+pub use crate::tui_keymap::TuiComposerKeymap;
+pub use crate::tui_keymap::TuiEditorKeymap;
+pub use crate::tui_keymap::TuiGlobalKeymap;
+pub use crate::tui_keymap::TuiKeymap;
+pub use crate::tui_keymap::TuiListKeymap;
+pub use crate::tui_keymap::TuiPagerKeymap;
+pub use crate::tui_keymap::TuiVimNormalKeymap;
+pub use crate::tui_keymap::TuiVimOperatorKeymap;
+
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
-pub const DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 16;
-pub const DEFAULT_MEMORIES_MAX_ROLLOUT_AGE_DAYS: i64 = 30;
+pub const DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 2;
+pub const DEFAULT_MEMORIES_MAX_ROLLOUT_AGE_DAYS: i64 = 10;
 pub const DEFAULT_MEMORIES_MIN_ROLLOUT_IDLE_HOURS: i64 = 6;
+pub const DEFAULT_MEMORIES_MIN_RATE_LIMIT_REMAINING_PERCENT: i64 = 25;
 pub const DEFAULT_MEMORIES_MAX_RAW_MEMORIES_FOR_CONSOLIDATION: usize = 256;
 pub const DEFAULT_MEMORIES_MAX_UNUSED_DAYS: i64 = 30;
 const MIN_MEMORIES_MAX_RAW_MEMORIES_FOR_CONSOLIDATION: usize = 1;
@@ -39,6 +57,30 @@ const MAX_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize = 128;
 
 const fn default_enabled() -> bool {
     true
+}
+
+/// Preferred layout for the resume/fork session picker.
+#[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionPickerViewMode {
+    Comfortable,
+    #[default]
+    Dense,
+}
+
+impl SessionPickerViewMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Comfortable => "comfortable",
+            Self::Dense => "dense",
+        }
+    }
+}
+
+impl fmt::Display for SessionPickerViewMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Determine where Codex should store CLI auth credentials.
@@ -120,6 +162,7 @@ impl UriBasedFileOpener {
 
 /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[serde(default)]
 #[schemars(deny_unknown_fields)]
 pub struct History {
     /// If true, history entries will not be written to disk.
@@ -172,11 +215,45 @@ pub struct ToolSuggestDiscoverable {
     pub id: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct ToolSuggestDisabledTool {
+    #[serde(rename = "type")]
+    pub kind: ToolSuggestDiscoverableType,
+    pub id: String,
+}
+
+impl ToolSuggestDisabledTool {
+    pub fn plugin(id: impl Into<String>) -> Self {
+        Self {
+            kind: ToolSuggestDiscoverableType::Plugin,
+            id: id.into(),
+        }
+    }
+
+    pub fn connector(id: impl Into<String>) -> Self {
+        Self {
+            kind: ToolSuggestDiscoverableType::Connector,
+            id: id.into(),
+        }
+    }
+
+    pub fn normalized(&self) -> Option<Self> {
+        let id = self.id.trim();
+        (!id.is_empty()).then(|| Self {
+            kind: self.kind,
+            id: id.to_string(),
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ToolSuggestConfig {
     #[serde(default)]
     pub discoverables: Vec<ToolSuggestDiscoverable>,
+    #[serde(default)]
+    pub disabled_tools: Vec<ToolSuggestDisabledTool>,
 }
 
 /// Memories settings loaded from config.toml.
@@ -190,6 +267,8 @@ pub struct MemoriesToml {
     pub generate_memories: Option<bool>,
     /// When `false`, skip injecting memory usage instructions into developer prompts.
     pub use_memories: Option<bool>,
+    /// When `true`, expose dedicated memory tools through the extension tool surface.
+    pub dedicated_tools: Option<bool>,
     /// Maximum number of recent raw memories retained for global consolidation.
     #[schemars(range(min = 1, max = 4096))]
     pub max_raw_memories_for_consolidation: Option<usize>,
@@ -202,6 +281,9 @@ pub struct MemoriesToml {
     pub max_rollouts_per_startup: Option<usize>,
     /// Minimum idle time between last thread activity and memory creation (hours). > 12h recommended.
     pub min_rollout_idle_hours: Option<i64>,
+    /// Minimum remaining percentage required in Codex rate-limit windows before memory startup runs.
+    #[schemars(range(min = 0, max = 100))]
+    pub min_rate_limit_remaining_percent: Option<i64>,
     /// Model used for thread summarisation.
     pub extract_model: Option<String>,
     /// Model used for memory consolidation.
@@ -209,16 +291,18 @@ pub struct MemoriesToml {
 }
 
 /// Effective memories settings after defaults are applied.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoriesConfig {
     pub disable_on_external_context: bool,
     pub generate_memories: bool,
     pub use_memories: bool,
+    pub dedicated_tools: bool,
     pub max_raw_memories_for_consolidation: usize,
     pub max_unused_days: i64,
     pub max_rollout_age_days: i64,
     pub max_rollouts_per_startup: usize,
     pub min_rollout_idle_hours: i64,
+    pub min_rate_limit_remaining_percent: i64,
     pub extract_model: Option<String>,
     pub consolidation_model: Option<String>,
 }
@@ -229,11 +313,13 @@ impl Default for MemoriesConfig {
             disable_on_external_context: false,
             generate_memories: true,
             use_memories: true,
+            dedicated_tools: false,
             max_raw_memories_for_consolidation: DEFAULT_MEMORIES_MAX_RAW_MEMORIES_FOR_CONSOLIDATION,
             max_unused_days: DEFAULT_MEMORIES_MAX_UNUSED_DAYS,
             max_rollout_age_days: DEFAULT_MEMORIES_MAX_ROLLOUT_AGE_DAYS,
             max_rollouts_per_startup: DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP,
             min_rollout_idle_hours: DEFAULT_MEMORIES_MIN_ROLLOUT_IDLE_HOURS,
+            min_rate_limit_remaining_percent: DEFAULT_MEMORIES_MIN_RATE_LIMIT_REMAINING_PERCENT,
             extract_model: None,
             consolidation_model: None,
         }
@@ -249,6 +335,7 @@ impl From<MemoriesToml> for MemoriesConfig {
                 .unwrap_or(defaults.disable_on_external_context),
             generate_memories: toml.generate_memories.unwrap_or(defaults.generate_memories),
             use_memories: toml.use_memories.unwrap_or(defaults.use_memories),
+            dedicated_tools: toml.dedicated_tools.unwrap_or(defaults.dedicated_tools),
             max_raw_memories_for_consolidation: toml
                 .max_raw_memories_for_consolidation
                 .unwrap_or(defaults.max_raw_memories_for_consolidation)
@@ -275,6 +362,10 @@ impl From<MemoriesToml> for MemoriesConfig {
                 .min_rollout_idle_hours
                 .unwrap_or(defaults.min_rollout_idle_hours)
                 .clamp(1, 48),
+            min_rate_limit_remaining_percent: toml
+                .min_rate_limit_remaining_percent
+                .unwrap_or(defaults.min_rate_limit_remaining_percent)
+                .clamp(0, 100),
             extract_model: toml.extract_model,
             consolidation_model: toml.consolidation_model,
         }
@@ -333,6 +424,10 @@ pub struct AppConfig {
     /// When `false`, Codex does not surface this app.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    /// Reviewer for approval prompts from this app, overriding the thread default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
 
     /// Whether tools with `destructive_hint = true` are allowed for this app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,6 +525,12 @@ pub struct OtelConfigToml {
 
     /// Optional metrics exporter
     pub metrics_exporter: Option<OtelExporterKind>,
+
+    /// Attributes to add to every exported trace span.
+    pub span_attributes: Option<BTreeMap<String, String>>,
+
+    /// Semicolon-separated `key:value` fields to upsert into W3C tracestate members.
+    pub tracestate: Option<BTreeMap<String, BTreeMap<String, String>>>,
 }
 
 /// Effective OTEL settings after defaults are applied.
@@ -440,6 +541,8 @@ pub struct OtelConfig {
     pub exporter: OtelExporterKind,
     pub trace_exporter: OtelExporterKind,
     pub metrics_exporter: OtelExporterKind,
+    pub span_attributes: BTreeMap<String, String>,
+    pub tracestate: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Default for OtelConfig {
@@ -450,6 +553,8 @@ impl Default for OtelConfig {
             exporter: OtelExporterKind::None,
             trace_exporter: OtelExporterKind::None,
             metrics_exporter: OtelExporterKind::Statsig,
+            span_attributes: BTreeMap::new(),
+            tracestate: BTreeMap::new(),
         }
     }
 }
@@ -505,6 +610,16 @@ impl fmt::Display for NotificationCondition {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TuiPetAnchor {
+    /// Anchor the pet to the bottom of the current TUI composer viewport.
+    #[default]
+    Composer,
+    /// Anchor the pet to the physical bottom of the terminal screen.
+    ScreenBottom,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiNotificationSettings {
@@ -532,6 +647,9 @@ pub struct ModelAvailabilityNuxConfig {
     pub shown_count: HashMap<String, u32>,
 }
 
+/// Fallback resize-reflow row cap when Codex cannot identify a terminal-specific scrollback size.
+pub const DEFAULT_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS: usize = 1_000;
+
 /// Collection of settings that are specific to the TUI.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -549,14 +667,21 @@ pub struct Tui {
     #[serde(default = "default_true")]
     pub show_tooltips: bool,
 
+    /// Start the composer in Vim mode (`Normal`) by default.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub vim_mode_default: bool,
+
+    /// Start the TUI in raw scrollback mode for copy-friendly transcript output.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub raw_output_mode: bool,
+
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
     ///
-    /// - `auto` (default): Disable alternate screen in Zellij, enable elsewhere.
-    /// - `always`: Always use alternate screen (original behavior).
+    /// - `auto` (default): Use alternate screen.
+    /// - `always`: Always use alternate screen.
     /// - `never`: Never use alternate screen (inline mode only, preserves scrollback).
-    ///
-    /// Using alternate screen provides a cleaner fullscreen experience but prevents
-    /// scrollback in terminal multiplexers like Zellij that follow the xterm spec.
     #[serde(default)]
     pub alternate_screen: AltScreenMode,
 
@@ -567,10 +692,17 @@ pub struct Tui {
     #[serde(default)]
     pub status_line: Option<Vec<String>>,
 
+    /// Color status line items with colors derived from the active syntax theme.
+    /// Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub status_line_use_colors: bool,
+
     /// Ordered list of terminal title item identifiers.
     ///
     /// When set, the TUI renders the selected items into the terminal window/tab title.
-    /// When unset, the TUI defaults to: `spinner` and `project`.
+    /// When unset, the TUI defaults to: `activity` and `project`.
+    /// The `activity` item spins while working and shows an action-required
+    /// message when blocked on the user.
     #[serde(default)]
     pub terminal_title: Option<Vec<String>>,
 
@@ -581,9 +713,39 @@ pub struct Tui {
     #[serde(default)]
     pub theme: Option<String>,
 
+    /// Pet id to preselect in the terminal pet picker.
+    ///
+    /// Custom pet ids resolve against CODEX_HOME/pets/<pet-id>/pet.json.
+    #[serde(default)]
+    pub pet: Option<String>,
+
+    /// Where the terminal pet should anchor vertically.
+    ///
+    /// Defaults to `composer`, which follows the current TUI composer viewport.
+    #[serde(default)]
+    pub pet_anchor: TuiPetAnchor,
+
+    /// Preferred layout for resume/fork session picker results.
+    #[serde(default)]
+    pub session_picker_view: Option<SessionPickerViewMode>,
+
+    /// Keybinding overrides for the TUI.
+    ///
+    /// This supports rebinding selected actions globally and by context.
+    /// Context bindings take precedence over `global` bindings.
+    #[serde(default)]
+    pub keymap: TuiKeymap,
+
     /// Startup tooltip availability NUX state persisted by the TUI.
     #[serde(default)]
     pub model_availability_nux: ModelAvailabilityNuxConfig,
+
+    /// Trim terminal resize-reflow replay to the most recent rendered terminal rows when the
+    /// transcript exceeds this cap. Omit to use Codex's terminal-specific default. Set to `0` to
+    /// keep all rendered rows.
+    #[serde(default)]
+    #[schemars(range(min = 0))]
+    pub terminal_resize_reflow_max_rows: Option<usize>,
 }
 
 const fn default_true() -> bool {
@@ -615,6 +777,8 @@ pub struct Notice {
     pub hide_full_access_warning: Option<bool>,
     /// Tracks whether the user has acknowledged the Windows world-writable directories warning.
     pub hide_world_writable_warning: Option<bool>,
+    /// Tracks whether the user opted out of Codex-managed fast defaults.
+    pub fast_default_opt_out: Option<bool>,
     /// Tracks whether the user opted out of the rate limit model switch reminder.
     pub hide_rate_limit_model_nudge: Option<bool>,
     /// Tracks whether the user has seen the model migration prompt
@@ -639,6 +803,50 @@ pub use crate::skills_config::SkillsConfig;
 pub struct PluginConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    /// Per-MCP-server policy overlays for MCP servers contributed by this plugin.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mcp_servers: HashMap<String, PluginMcpServerConfig>,
+}
+
+/// Policy settings for a plugin-provided MCP server.
+///
+/// This intentionally excludes transport settings: plugin manifests own how the
+/// MCP server is launched, while user config owns enablement and tool policy.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PluginMcpServerConfig {
+    /// When `false`, Codex skips initializing this plugin MCP server.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+
+    /// Approval mode for tools in this server unless a tool override exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tools_approval_mode: Option<AppToolApproval>,
+
+    /// Explicit allow-list of tools exposed from this server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
+
+    /// Explicit deny-list of tools. These tools are removed after applying `enabled_tools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_tools: Option<Vec<String>>,
+
+    /// Per-tool approval settings keyed by tool name.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tools: HashMap<String, McpServerToolConfig>,
+}
+
+impl Default for PluginMcpServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_tools_approval_mode: None,
+            enabled_tools: None,
+            disabled_tools: None,
+            tools: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
@@ -695,23 +903,7 @@ impl From<SandboxWorkspaceWrite> for codex_app_server_protocol::SandboxSettings 
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum ShellEnvironmentPolicyInherit {
-    /// "Core" environment variables for the platform. On UNIX, this would
-    /// include HOME, LOGNAME, PATH, SHELL, and USER, among others.
-    Core,
-
-    /// Inherits the full environment from the parent process.
-    #[default]
-    All,
-
-    /// Do not inherit any environment variables from the parent process.
-    None,
-}
-
-/// Policy for building the `env` when spawning a process via either the
-/// `shell` or `local_shell` tool.
+/// Policy for building the `env` when spawning a process via shell-like tools.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ShellEnvironmentPolicyToml {
@@ -728,37 +920,6 @@ pub struct ShellEnvironmentPolicyToml {
     pub include_only: Option<Vec<String>>,
 
     pub experimental_use_profile: Option<bool>,
-}
-
-pub type EnvironmentVariablePattern = WildMatchPattern<'*', '?'>;
-
-/// Deriving the `env` based on this policy works as follows:
-/// 1. Create an initial map based on the `inherit` policy.
-/// 2. If `ignore_default_excludes` is false, filter the map using the default
-///    exclude pattern(s), which are: `"*KEY*"`, `"*SECRET*"`, and `"*TOKEN*"`.
-/// 3. If `exclude` is not empty, filter the map using the provided patterns.
-/// 4. Insert any entries from `r#set` into the map.
-/// 5. If non-empty, filter the map using the `include_only` patterns.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ShellEnvironmentPolicy {
-    /// Starting point when building the environment.
-    pub inherit: ShellEnvironmentPolicyInherit,
-
-    /// True to skip the check to exclude default environment variables that
-    /// contain "KEY", "SECRET", or "TOKEN" in their name. Defaults to true.
-    pub ignore_default_excludes: bool,
-
-    /// Environment variable names to exclude from the environment.
-    pub exclude: Vec<EnvironmentVariablePattern>,
-
-    /// (key, value) pairs to insert in the environment.
-    pub r#set: HashMap<String, String>,
-
-    /// Environment variable names to retain in the environment.
-    pub include_only: Vec<EnvironmentVariablePattern>,
-
-    /// If true, the shell profile will be used to run the command.
-    pub use_profile: bool,
 }
 
 impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
@@ -788,19 +949,6 @@ impl From<ShellEnvironmentPolicyToml> for ShellEnvironmentPolicy {
             r#set,
             include_only,
             use_profile,
-        }
-    }
-}
-
-impl Default for ShellEnvironmentPolicy {
-    fn default() -> Self {
-        Self {
-            inherit: ShellEnvironmentPolicyInherit::All,
-            ignore_default_excludes: true,
-            exclude: Vec::new(),
-            r#set: HashMap::new(),
-            include_only: Vec::new(),
-            use_profile: false,
         }
     }
 }

@@ -10,14 +10,11 @@
 //!   paste once enough chars have arrived.
 //!
 //! This module provides the `PasteBurst` state machine. `ChatComposer` feeds it only "plain"
-//! character events (no Ctrl/Alt) and uses its decisions to either:
+//! character events (no Ctrl/Alt) and uses the full buffering decisions to either:
 //!
 //! - briefly hold a first ASCII char (flicker suppression),
 //! - buffer a burst as a single pasted string, or
 //! - let input flow through as normal typing.
-//!
-//! For the higher-level view of how `PasteBurst` integrates with `ChatComposer`, see
-//! `docs/tui-chat-composer.md`.
 //!
 //! # Call Pattern
 //!
@@ -35,6 +32,10 @@
 //!   [`PasteBurst::flush_before_modified_input`] to avoid leaving buffered text "stuck", and then
 //!   [`PasteBurst::clear_window_after_non_char`] so subsequent typing does not get grouped into a
 //!   previous burst.
+//! - Direct-insert callers can skip buffering, use
+//!   [`PasteBurst::direct_insert_newline_should_insert`] in their Enter handler, and call
+//!   [`PasteBurst::extend_window`] when Enter or [`PasteBurst::on_plain_char_no_hold`] reports a
+//!   burst-like stream.
 //!
 //! # State Variables
 //!
@@ -109,10 +110,10 @@
 //! - [`PasteBurst::on_plain_char_no_hold`] never holds (used for IME/non-ASCII paths), since
 //!   holding a non-ASCII character can feel like dropped input.
 //!
-//! # Contract With `ChatComposer`
+//! # Contract With Callers
 //!
-//! `PasteBurst` does not mutate the UI text buffer on its own. The caller (`ChatComposer`) must
-//! interpret decisions and apply the corresponding UI edits:
+//! `PasteBurst` does not mutate the UI text buffer on its own. Callers must interpret decisions
+//! and apply the corresponding UI edits. `ChatComposer` uses the full buffering contract:
 //!
 //! - For each plain ASCII `KeyCode::Char`, call [`PasteBurst::on_plain_char`].
 //!   - [`CharDecision::RetainFirstChar`]: do **not** insert the char into the textarea yet.
@@ -154,12 +155,7 @@ const PASTE_BURST_MIN_CHARS: u16 = 3;
 const PASTE_ENTER_SUPPRESS_WINDOW: Duration = Duration::from_millis(120);
 
 // Maximum delay between consecutive chars to be considered part of a paste burst.
-// Windows terminals (especially VS Code integrated terminal) deliver paste events
-// more slowly than native terminals, so we use a higher threshold there.
-#[cfg(not(windows))]
 const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(8);
-#[cfg(windows)]
-const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(30);
 
 // Idle timeout before flushing buffered paste content.
 // Slower paste bursts have been observed in Windows environments.
@@ -339,6 +335,14 @@ impl PasteBurst {
     pub fn newline_should_insert_instead_of_submit(&self, now: Instant) -> bool {
         let in_burst_window = self.burst_window_until.is_some_and(|until| now <= until);
         self.is_active() || in_burst_window
+    }
+
+    /// Decide if Enter should insert a newline for callers that insert chars immediately.
+    pub fn direct_insert_newline_should_insert(&self, now: Instant) -> bool {
+        self.newline_should_insert_instead_of_submit(now)
+            || self
+                .last_plain_char_time
+                .is_some_and(|t| now.duration_since(t) <= PASTE_BURST_CHAR_INTERVAL)
     }
 
     /// Keep the burst window alive.

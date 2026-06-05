@@ -17,13 +17,15 @@ pub use manager::SandboxTransformError;
 pub use manager::SandboxTransformRequest;
 pub use manager::SandboxType;
 pub use manager::SandboxablePreference;
+pub use manager::compatibility_sandbox_policy_for_permission_profile;
 pub use manager::get_platform_sandbox;
+pub use manager::with_managed_mitm_ca_readable_root;
 
 use codex_protocol::error::CodexErr;
 
 #[cfg(not(target_os = "linux"))]
 pub fn system_bwrap_warning(
-    _sandbox_policy: &codex_protocol::protocol::SandboxPolicy,
+    _permission_profile: &codex_protocol::models::PermissionProfile,
 ) -> Option<String> {
     None
 }
