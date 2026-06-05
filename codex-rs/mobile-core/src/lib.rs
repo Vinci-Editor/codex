@@ -68,7 +68,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["list_dir", "apply_patch", "shell_command", "exec_command"]
+            vec![
+                "list_dir",
+                "apply_patch",
+                "view_image",
+                "shell_command",
+                "exec_command"
+            ]
         );
     }
 }

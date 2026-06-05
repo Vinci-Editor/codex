@@ -61,6 +61,9 @@ public enum CodexMobileCoreBridge {
     }
 
     public static func toolOutput(callID: String, output: Any, success: Bool, custom: Bool, name: String?) -> [String: Any] {
+        if isToolOutputContentItems(output) {
+            return fallbackToolOutput(callID: callID, output: output, success: success, custom: custom, name: name)
+        }
         #if canImport(CodexMobileCore)
         let input: [String: Any] = [
             "callId": callID,
@@ -295,6 +298,30 @@ public enum CodexMobileCoreBridge {
                 ]
             ),
             functionTool(
+                name: "view_image",
+                description: "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.",
+                required: ["path"],
+                properties: [
+                    "path": ["type": "string"],
+                    "detail": [
+                        "type": "string",
+                        "enum": ["high", "original"],
+                    ],
+                ],
+                outputSchema: [
+                    "type": "object",
+                    "properties": [
+                        "image_url": ["type": "string"],
+                        "detail": [
+                            "type": "string",
+                            "enum": ["high", "original"],
+                        ],
+                    ],
+                    "required": ["image_url", "detail"],
+                    "additionalProperties": false,
+                ]
+            ),
+            functionTool(
                 name: "shell_command",
                 description: "Runs a shell command. On macOS this uses /bin/zsh -lc; on iOS this is a deterministic Codex emulator.",
                 required: ["command"],
@@ -432,7 +459,10 @@ public enum CodexMobileCoreBridge {
         ]
     }
 
-    private static func normalizeToolOutput(_ output: Any, success: Bool) -> String {
+    private static func normalizeToolOutput(_ output: Any, success: Bool) -> Any {
+        if success, isToolOutputContentItems(output) {
+            return output
+        }
         let text: String
         if let output = output as? String {
             text = output
@@ -444,6 +474,25 @@ public enum CodexMobileCoreBridge {
             text = String(describing: output)
         }
         return success ? text : "Tool failed:\n\(text)"
+    }
+
+    private static func isToolOutputContentItems(_ output: Any) -> Bool {
+        guard let items = output as? [[String: Any]], !items.isEmpty else {
+            return false
+        }
+        return items.allSatisfy { item in
+            guard let type = item["type"] as? String else {
+                return false
+            }
+            switch type {
+            case "input_text":
+                return item["text"] is String
+            case "input_image":
+                return item["image_url"] is String
+            default:
+                return false
+            }
+        }
     }
 
     private static func fallbackEmulateShell(_ input: [String: Any]) -> [String: Any] {
@@ -1309,9 +1358,10 @@ public enum CodexMobileCoreBridge {
         name: String,
         description: String,
         required: [String],
-        properties: [String: Any]
+        properties: [String: Any],
+        outputSchema: [String: Any]? = nil
     ) -> [String: Any] {
-        [
+        var tool: [String: Any] = [
             "type": "function",
             "name": name,
             "description": description,
@@ -1323,6 +1373,10 @@ public enum CodexMobileCoreBridge {
                 "additionalProperties": false,
             ],
         ]
+        if let outputSchema {
+            tool["output_schema"] = outputSchema
+        }
+        return tool
     }
 
     private static func requiredString(_ value: Any?, field: String) throws -> String {

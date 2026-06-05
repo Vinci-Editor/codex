@@ -1,5 +1,8 @@
 import Foundation
+import CoreGraphics
 import CodexMobileCoreBridge
+import ImageIO
+import UniformTypeIdentifiers
 
 public struct CodexSessionConfiguration: Sendable {
     public let provider: CodexProvider
@@ -140,6 +143,9 @@ public struct CodexSessionSnapshot: Codable, Sendable, Equatable, Hashable {
 }
 
 public actor CodexSession {
+    private static let viewImageMaxBytes = 25 * 1024 * 1024
+    private static let viewImageHighMaxPixelDimension = 2_048
+
     private let configuration: CodexSessionConfiguration
     private let conversationID = UUID().uuidString
     private let agentPath: String
@@ -189,7 +195,7 @@ public actor CodexSession {
         return try JSONSerialization.data(
             withJSONObject: CodexMobileCoreBridge.toolOutput(
                 callID: call.callID,
-                output: result.output,
+                output: result.responseOutput?.jsonValue ?? result.output,
                 success: result.success,
                 custom: call.kind == .custom,
                 name: call.name
@@ -272,7 +278,7 @@ public actor CodexSession {
             "model": options?.model ?? configuration.model,
             "instructions": buildInstructions(),
             "input": history,
-            "tools": buildToolDefinitions(),
+            "tools": buildToolDefinitions(options: options),
             "stream": true,
             "store": false,
             "reasoning": reasoning,
@@ -430,10 +436,24 @@ public actor CodexSession {
             .joined(separator: "\n\n")
     }
 
-    private func buildToolDefinitions() -> [[String: Any]] {
-        CodexMobileCoreBridge.builtinTools()
+    private func buildToolDefinitions(options: CodexTurnOptions?) -> [[String: Any]] {
+        let supportsImages = Self.modelSupportsImages(inputModalities: options?.inputModalities)
+        let builtinTools = CodexMobileCoreBridge.builtinTools().filter { tool in
+            guard tool["name"] as? String == "view_image" else {
+                return true
+            }
+            return supportsImages
+        }
+        return builtinTools
             + subagentToolDefinitions()
             + configuration.tools.map { $0.responsesToolDefinition() }
+    }
+
+    private static func modelSupportsImages(inputModalities: [String]?) -> Bool {
+        guard let inputModalities, !inputModalities.isEmpty else {
+            return true
+        }
+        return inputModalities.contains { $0.lowercased() == "image" }
     }
 
     private static func errorBody(from bytes: URLSession.AsyncBytes) async throws -> String {
@@ -749,6 +769,8 @@ public actor CodexSession {
             return try executeApplyPatch(call)
         case "write_file":
             return try executeWriteFile(call)
+        case "view_image":
+            return try executeViewImage(call)
         case "spawn_agent":
             return try await executeSpawnAgent(call)
         case "send_message":
@@ -1022,6 +1044,46 @@ public actor CodexSession {
         }
     }
 
+    private func executeViewImage(_ call: CodexToolCall) throws -> CodexToolResult {
+        let arguments = try Self.decodeArguments(call.arguments)
+        let path = arguments["path"] as? String ?? arguments["file_path"] as? String ?? ""
+        let detail = arguments["detail"] as? String
+        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return CodexToolResult(output: "Missing path.", success: false)
+        }
+        guard detail == nil || detail == "high" || detail == "original" else {
+            return CodexToolResult(
+                output: "view_image.detail only supports `high` or `original`; omit `detail` for default high resized behavior, got `\(detail ?? "")`",
+                success: false
+            )
+        }
+        guard let workspace = configuration.workspace else {
+            return CodexToolResult(output: "No workspace selected.", success: false)
+        }
+
+        return try workspace.withSecurityScope { root in
+            let target = try Self.resolveExistingWorkspaceURL(root: root, rawPath: path)
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+                return CodexToolResult(output: "\(path): is not an image file", success: false)
+            }
+
+            do {
+                let image = try Self.imageDataURL(for: target, detail: detail)
+                let relativePath = Self.relativeWorkspacePath(root: root, url: target)
+                return CodexToolResult(
+                    output: "Viewed \(relativePath)",
+                    responseOutput: .inputImage(imageURL: image.dataURL, detail: image.detail)
+                )
+            } catch {
+                return CodexToolResult(
+                    output: "unable to process image at `\(path)`: \(error.localizedDescription)",
+                    success: false
+                )
+            }
+        }
+    }
+
     private func executeSpawnAgent(_ call: CodexToolCall) async throws -> CodexToolResult {
         guard configuration.subagentOptions.isEnabled else {
             return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
@@ -1219,7 +1281,7 @@ public actor CodexSession {
     private func appendToolOutput(call: CodexToolCall, result: CodexToolResult) {
         history.append(CodexMobileCoreBridge.toolOutput(
             callID: call.callID,
-            output: result.output,
+            output: result.responseOutput?.jsonValue ?? result.output,
             success: result.success,
             custom: call.kind == .custom,
             name: call.name
@@ -1591,6 +1653,58 @@ public actor CodexSession {
         url.path
             .replacingOccurrences(of: root.path, with: "")
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    private static func imageDataURL(for url: URL, detail: String?) throws -> (dataURL: String, detail: String) {
+        let values = try url.resourceValues(forKeys: [.fileSizeKey])
+        if let fileSize = values.fileSize, fileSize > viewImageMaxBytes {
+            throw CodexSessionError.workspacePathError(
+                "\(url.lastPathComponent): image is too large (\(fileSize) bytes)"
+            )
+        }
+
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              CGImageSourceGetCount(source) > 0 else {
+            throw CodexSessionError.workspacePathError("\(url.lastPathComponent): unsupported image file")
+        }
+
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        let width = properties?[kCGImagePropertyPixelWidth] as? Int ?? 0
+        let height = properties?[kCGImagePropertyPixelHeight] as? Int ?? 0
+        let originalMaxDimension = max(width, height)
+        guard originalMaxDimension > 0 else {
+            throw CodexSessionError.workspacePathError("\(url.lastPathComponent): image has no readable dimensions")
+        }
+
+        let usesOriginal = detail == "original"
+        let maxPixelDimension = usesOriginal
+            ? originalMaxDimension
+            : min(originalMaxDimension, viewImageHighMaxPixelDimension)
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelDimension,
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            throw CodexSessionError.workspacePathError("\(url.lastPathComponent): could not decode image")
+        }
+
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw CodexSessionError.workspacePathError("\(url.lastPathComponent): could not create image output")
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw CodexSessionError.workspacePathError("\(url.lastPathComponent): could not encode image")
+        }
+
+        let encoded = (output as Data).base64EncodedString()
+        return ("data:image/png;base64,\(encoded)", usesOriginal ? "original" : "high")
     }
 
     private static func isInsideWorkspace(url: URL, root: URL) -> Bool {

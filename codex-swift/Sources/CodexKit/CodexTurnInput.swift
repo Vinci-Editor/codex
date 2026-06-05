@@ -6,19 +6,22 @@ public struct CodexTurnOptions: Sendable, Equatable {
     public let serviceTier: String?
     public let toolChoice: String?
     public let parallelToolCalls: Bool?
+    public let inputModalities: [String]?
 
     public init(
         model: String? = nil,
         reasoningEffort: String? = nil,
         serviceTier: String? = nil,
         toolChoice: String? = nil,
-        parallelToolCalls: Bool? = nil
+        parallelToolCalls: Bool? = nil,
+        inputModalities: [String]? = nil
     ) {
         self.model = model
         self.reasoningEffort = reasoningEffort
         self.serviceTier = serviceTier
         self.toolChoice = toolChoice
         self.parallelToolCalls = parallelToolCalls
+        self.inputModalities = inputModalities
     }
 }
 

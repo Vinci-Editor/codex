@@ -351,7 +351,8 @@ let options = CodexTurnOptions(
     reasoningEffort: "low",
     serviceTier: "flex",
     toolChoice: "auto",
-    parallelToolCalls: true
+    parallelToolCalls: true,
+    inputModalities: ["text", "image"]
 )
 
 let stream = await session.submit(
@@ -421,6 +422,11 @@ the stream when the user stops a turn or leaves the screen.
   when the artifact is available.
 - `write_file`: writes a complete UTF-8 text file inside the selected workspace.
   Prefer `apply_patch` for focused edits.
+- `view_image`: reads a workspace image file, optionally resizes it for high
+  detail, and returns an `input_image` tool-output content item so the next model
+  request can visually inspect the image. Pass selected model input modalities in
+  `CodexTurnOptions.inputModalities`; `CodexKit` hides `view_image` when the
+  current model is known to be text-only.
 - `shell_command`: runs a shell-like command. On macOS this runs `/bin/zsh -lc`
   inside the selected workspace. On iOS this uses the deterministic Rust shell
   emulator, not arbitrary process execution.

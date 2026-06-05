@@ -24,10 +24,33 @@ public struct CodexToolCall: Sendable, Equatable {
 public struct CodexToolResult: Sendable, Equatable {
     public let output: String
     public let success: Bool
+    public let responseOutput: CodexToolResponseOutput?
 
-    public init(output: String, success: Bool = true) {
+    public init(output: String, success: Bool = true, responseOutput: CodexToolResponseOutput? = nil) {
         self.output = output
         self.success = success
+        self.responseOutput = responseOutput
+    }
+}
+
+public enum CodexToolResponseOutput: Sendable, Equatable {
+    case text(String)
+    case inputImage(imageURL: String, detail: String?)
+
+    var jsonValue: Any {
+        switch self {
+        case .text(let text):
+            return text
+        case .inputImage(let imageURL, let detail):
+            var item: [String: Any] = [
+                "type": "input_image",
+                "image_url": imageURL,
+            ]
+            if let detail {
+                item["detail"] = detail
+            }
+            return [item]
+        }
     }
 }
 

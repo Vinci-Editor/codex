@@ -7,6 +7,7 @@ pub fn builtin_tools_json() -> String {
         "tools": [
             list_dir_tool(),
             apply_patch_tool(),
+            view_image_tool(),
             shell_command_tool(),
             exec_command_tool(),
         ]
@@ -56,6 +57,47 @@ fn apply_patch_tool() -> Value {
                 }
             },
             "required": ["patch"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn view_image_tool() -> Value {
+    json!({
+        "type": "function",
+        "name": "view_image",
+        "description": "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.",
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Local filesystem path to an image file."
+                },
+                "detail": {
+                    "type": "string",
+                    "enum": ["high", "original"],
+                    "description": "Image detail level. Defaults to high; use original to preserve exact resolution."
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        },
+        "output_schema": {
+            "type": "object",
+            "properties": {
+                "image_url": {
+                    "type": "string",
+                    "description": "Data URL for the loaded image."
+                },
+                "detail": {
+                    "type": "string",
+                    "enum": ["high", "original"],
+                    "description": "Image detail hint returned by view_image."
+                }
+            },
+            "required": ["image_url", "detail"],
             "additionalProperties": false
         }
     })
@@ -138,16 +180,38 @@ pub fn tool_output_json(input: &str) -> Result<String, serde_json::Error> {
     serde_json::to_string(&item)
 }
 
-fn normalize_tool_output(output: Value, success: bool) -> String {
+fn normalize_tool_output(output: Value, success: bool) -> Value {
+    if success && is_tool_output_content_items(&output) {
+        return output;
+    }
     let text = match output {
         Value::String(text) => text,
         value => value.to_string(),
     };
     if success {
-        text
+        Value::String(text)
     } else {
-        format!("Tool failed:\n{text}")
+        Value::String(format!("Tool failed:\n{text}"))
     }
+}
+
+fn is_tool_output_content_items(output: &Value) -> bool {
+    let Some(items) = output.as_array() else {
+        return false;
+    };
+    if items.is_empty() {
+        return false;
+    }
+    items.iter().all(|item| {
+        let Some(item) = item.as_object() else {
+            return false;
+        };
+        match item.get("type").and_then(Value::as_str) {
+            Some("input_text") => item.get("text").and_then(Value::as_str).is_some(),
+            Some("input_image") => item.get("image_url").and_then(Value::as_str).is_some(),
+            _ => false,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -168,5 +232,22 @@ mod tests {
         assert_eq!(value["call_id"], "call-1");
         assert_eq!(value["name"], "custom");
         assert_eq!(value["output"], "done");
+    }
+
+    #[test]
+    fn preserves_structured_image_tool_output() {
+        let json = tool_output_json(
+            r#"{"callId":"call-1","output":[{"type":"input_image","image_url":"data:image/png;base64,AAA","detail":"high"}],"success":true,"custom":false}"#,
+        )
+        .expect("tool output");
+        let value: Value = serde_json::from_str(&json).expect("json");
+
+        assert_eq!(value["type"], "function_call_output");
+        assert_eq!(value["call_id"], "call-1");
+        assert_eq!(value["output"][0]["type"], "input_image");
+        assert_eq!(
+            value["output"][0]["image_url"],
+            "data:image/png;base64,AAA"
+        );
     }
 }
