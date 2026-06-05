@@ -400,10 +400,10 @@ public actor CodexSession {
     private func addSubagentEventContinuation(
         id: UUID,
         continuation: AsyncStream<CodexStreamEvent>.Continuation
-    ) {
+    ) async {
         subagentEventContinuations[id] = continuation
-        for record in subagents.values.sorted(by: { $0.createdOrder < $1.createdOrder }) {
-            continuation.yield(.subagentStatus(Self.subagentStatus(record)))
+        for status in await subagentRegistry.statusSnapshot() {
+            continuation.yield(.subagentStatus(status))
         }
     }
 
@@ -570,7 +570,7 @@ public actor CodexSession {
         from baseHistory: [[String: Any]],
         options: CodexTurnOptions?
     ) async throws -> String {
-        let compactionInput = requestInputHistory(from: baseHistory, includeDynamicContext: false) + [
+        let compactionInput = await requestInputHistory(from: baseHistory, includeDynamicContext: false) + [
             Self.message(role: "user", textType: "input_text", text: Self.compactionSummaryPrompt)
         ]
         let reasoning = Self.reasoningParameter(options: options)
@@ -730,10 +730,11 @@ public actor CodexSession {
         continuation: AsyncThrowingStream<CodexStreamEvent, Error>.Continuation
     ) async throws -> TurnStreamResult {
         let reasoning = Self.reasoningParameter(options: options)
+        let requestHistory = await requestInputHistory()
         var input: [String: Any] = [
             "model": options?.model ?? configuration.model,
             "instructions": buildInstructions(),
-            "input": requestInputHistory(),
+            "input": requestHistory,
             "tools": buildToolDefinitions(options: options),
             "stream": true,
             "store": false,
@@ -904,12 +905,12 @@ public actor CodexSession {
     private func requestInputHistory(
         from items: [[String: Any]]? = nil,
         includeDynamicContext: Bool = true
-    ) -> [[String: Any]] {
+    ) async -> [[String: Any]] {
         let input = Self.requestInputHistory(
             contextualUserInstructions: configuration.contextualUserInstructions,
             history: items ?? history
         )
-        guard includeDynamicContext, let subagentContextMessage = subagentEnvironmentContextMessage() else {
+        guard includeDynamicContext, let subagentContextMessage = await subagentEnvironmentContextMessage() else {
             return input
         }
         return [subagentContextMessage] + input
@@ -928,10 +929,8 @@ public actor CodexSession {
         ] + history
     }
 
-    private func subagentEnvironmentContextMessage() -> [String: Any]? {
-        let statuses = subagents.values
-            .sorted { $0.createdOrder < $1.createdOrder }
-            .map(Self.subagentStatus)
+    private func subagentEnvironmentContextMessage() async -> [String: Any]? {
+        let statuses = await subagentRegistry.statusSnapshot()
         guard let context = Self.subagentEnvironmentContext(statuses: statuses) else {
             return nil
         }
@@ -1429,11 +1428,11 @@ public actor CodexSession {
             ),
             tool(
                 "list_agents",
-                "List live child agents in this session.",
+                "List live agents in this agent tree.",
                 [
                     "path_prefix": [
                         "type": "string",
-                        "description": "Optional canonical task-name prefix filter.",
+                        "description": "Optional absolute or current-agent-relative path prefix filter.",
                     ],
                 ]
             ),
@@ -1695,7 +1694,7 @@ public actor CodexSession {
         case "wait_agent":
             return try await executeWaitAgent(call)
         case "list_agents":
-            return try executeListAgents(call)
+            return try await executeListAgents(call)
         case "close_agent":
             return try await executeCloseAgent(call, subagentStatus: subagentStatus)
         default:
@@ -2473,20 +2472,19 @@ public actor CodexSession {
         return CodexToolResult(output: try Self.jsonString(Self.subagentStatusPayload(latest)))
     }
 
-    private func executeListAgents(_ call: CodexToolCall) throws -> CodexToolResult {
+    private func executeListAgents(_ call: CodexToolCall) async throws -> CodexToolResult {
         guard configuration.subagentOptions.isEnabled else {
             return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
         }
         let arguments = try Self.decodeArguments(call.arguments)
-        let prefix = (arguments["path_prefix"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let agents = subagents.values
-            .filter { record in
-                guard let prefix, !prefix.isEmpty else {
+        let prefix = subagentPathPrefix(arguments["path_prefix"] as? String)
+        let agents = await subagentRegistry.statusSnapshot()
+            .filter { status in
+                guard let prefix else {
                     return true
                 }
-                return record.path.hasPrefix(prefix)
+                return status.path == prefix || status.path.hasPrefix("\(prefix)/")
             }
-            .sorted { $0.createdOrder < $1.createdOrder }
             .map(Self.subagentStatusPayload)
         return CodexToolResult(output: try Self.jsonString(["agents": agents]))
     }
@@ -2910,6 +2908,22 @@ public actor CodexSession {
         parent == "/" ? "/\(taskName)" : "\(parent)/\(taskName)"
     }
 
+    private func subagentPathPrefix(_ rawPrefix: String?) -> String? {
+        guard let rawPrefix = rawPrefix?.trimmingCharacters(in: .whitespacesAndNewlines), !rawPrefix.isEmpty else {
+            return nil
+        }
+
+        let prefix = rawPrefix.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !prefix.isEmpty else {
+            return nil
+        }
+
+        if rawPrefix.hasPrefix("/") {
+            return "/\(prefix)"
+        }
+        return Self.subagentPath(parent: agentPath, taskName: prefix)
+    }
+
     private static func isValidSubagentTaskName(_ value: String) -> Bool {
         guard !value.isEmpty else {
             return false
@@ -3249,6 +3263,8 @@ private enum SubagentStatus: String {
 private actor CodexSubagentRegistry {
     private var sequence = 0
     private var openAgentIDs: Set<String> = []
+    private var statusByID: [String: CodexSubagentStatus] = [:]
+    private var orderByID: [String: Int] = [:]
 
     func reserveAgent(maxOpenAgents: Int) -> String? {
         guard openAgentIDs.count < maxOpenAgents else {
@@ -3257,6 +3273,7 @@ private actor CodexSubagentRegistry {
         sequence += 1
         let id = "agent-\(sequence)"
         openAgentIDs.insert(id)
+        orderByID[id] = sequence
         return id
     }
 
@@ -3268,15 +3285,37 @@ private actor CodexSubagentRegistry {
             return false
         }
         openAgentIDs.insert(id)
+        if orderByID[id] == nil {
+            sequence += 1
+            orderByID[id] = sequence
+        }
         return true
     }
 
     func update(_ status: CodexSubagentStatus) {
+        statusByID[status.agentID] = status
+        if orderByID[status.agentID] == nil {
+            sequence += 1
+            orderByID[status.agentID] = sequence
+        }
         if status.status == SubagentStatus.closed.rawValue {
             openAgentIDs.remove(status.agentID)
         } else {
             openAgentIDs.insert(status.agentID)
         }
+    }
+
+    func statusSnapshot() -> [CodexSubagentStatus] {
+        statusByID.values
+            .filter { $0.status != SubagentStatus.closed.rawValue }
+            .sorted { lhs, rhs in
+                let lhsOrder = orderByID[lhs.agentID] ?? Int.max
+                let rhsOrder = orderByID[rhs.agentID] ?? Int.max
+                if lhsOrder != rhsOrder {
+                    return lhsOrder < rhsOrder
+                }
+                return lhs.path < rhs.path
+            }
     }
 }
 
