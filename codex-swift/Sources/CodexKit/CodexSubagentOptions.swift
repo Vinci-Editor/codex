@@ -40,6 +40,14 @@ public struct CodexSubagentRole: Sendable, Equatable, Hashable {
         """
     )
 
+    public static let worker = CodexSubagentRole(
+        name: "worker",
+        description: "Use for bounded implementation, bug-fixing, and production work with clear file ownership.",
+        additionalInstructions: """
+        You are a worker subagent. Own the specific implementation scope assigned by your parent, avoid overlapping unrelated files, and preserve changes made by other agents or users. Report the concrete files changed, validation performed, and any remaining integration risks.
+        """
+    )
+
     private static func trimmedNonEmpty(_ value: String?) -> String? {
         guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
             return nil
@@ -72,7 +80,7 @@ public struct CodexSubagentOptions: Sendable, Equatable {
         isEnabled: Bool,
         maxOpenAgents: Int = 4,
         maxDepth: Int? = nil,
-        roles: [CodexSubagentRole] = [.default, .explorer],
+        roles: [CodexSubagentRole] = [.default, .explorer, .worker],
         defaultWaitTimeoutMilliseconds: Int = 30_000,
         minWaitTimeoutMilliseconds: Int = 10_000,
         maxWaitTimeoutMilliseconds: Int = 3_600_000

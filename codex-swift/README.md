@@ -313,6 +313,7 @@ let configuration = CodexSessionConfiguration(
         roles: [
             .default,
             .explorer,
+            .worker,
             CodexSubagentRole(
                 name: "reviewer",
                 description: "Review code and call out correctness risks.",
