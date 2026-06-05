@@ -765,6 +765,59 @@ func subagentTurnOptionsInheritResponsesLiteMetadataWithoutModelOverride() {
 }
 
 @Test
+func subagentTurnOptionValidationRejectsUnavailableOverrides() {
+    let options = CodexTurnOptions(
+        model: "gpt-5.5",
+        reasoningEffort: "medium",
+        serviceTier: "priority",
+        availableModelOptions: [
+            CodexModelOption(
+                id: "gpt-5.5",
+                model: "gpt-5.5",
+                displayName: "GPT-5.5",
+                defaultReasoningEffort: "medium",
+                supportedReasoningEfforts: [
+                    CodexReasoningEffortOption(reasoningEffort: "low"),
+                    CodexReasoningEffortOption(reasoningEffort: "medium"),
+                ],
+                serviceTiers: [
+                    CodexServiceTierOption(id: "priority", name: "Priority"),
+                ]
+            ),
+        ]
+    )
+
+    let unknownModel = CodexSession.subagentTurnOptionsValidationError(
+        arguments: ["model": "unknown-model"],
+        parentOptions: options
+    )
+    let unsupportedReasoning = CodexSession.subagentTurnOptionsValidationError(
+        arguments: ["model": "gpt-5.5", "reasoning_effort": "high"],
+        parentOptions: options
+    )
+    let unsupportedServiceTier = CodexSession.subagentTurnOptionsValidationError(
+        arguments: ["model": "gpt-5.5", "service_tier": "flex"],
+        parentOptions: options
+    )
+
+    #expect(unknownModel?.contains("Unknown model `unknown-model`") == true)
+    #expect(unsupportedReasoning?.contains("Reasoning effort `high` is not supported") == true)
+    #expect(unsupportedServiceTier?.contains("Service tier `flex` is not supported") == true)
+    #expect(CodexSession.subagentTurnOptionsValidationError(
+        arguments: ["model": "gpt-5.5", "reasoning_effort": "low", "service_tier": "priority"],
+        parentOptions: options
+    ) == nil)
+}
+
+@Test
+func subagentTurnOptionValidationAllowsSparseLocalModelCatalogs() {
+    #expect(CodexSession.subagentTurnOptionsValidationError(
+        arguments: ["model": "local-model", "reasoning_effort": "high", "service_tier": "priority"],
+        parentOptions: CodexTurnOptions()
+    ) == nil)
+}
+
+@Test
 func subagentModelOverrideDescriptionIncludesPickerVisibleModelMetadata() {
     let options = CodexTurnOptions(
         model: "gpt-5.4",

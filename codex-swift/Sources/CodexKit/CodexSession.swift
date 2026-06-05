@@ -607,14 +607,14 @@ public actor CodexSession {
         arguments: [String: Any],
         parentOptions: CodexTurnOptions?
     ) -> CodexTurnOptions {
-        let modelOverride = arguments["model"] as? String
+        let modelOverride = trimmedNonEmpty(arguments["model"] as? String)
         let inheritsParentModelMetadata = modelOverride == nil || modelOverride == parentOptions?.model
         return CodexTurnOptions(
             model: modelOverride ?? parentOptions?.model,
-            reasoningEffort: arguments["reasoning_effort"] as? String ?? parentOptions?.reasoningEffort,
+            reasoningEffort: trimmedNonEmpty(arguments["reasoning_effort"] as? String) ?? parentOptions?.reasoningEffort,
             reasoningSummary: inheritsParentModelMetadata ? parentOptions?.reasoningSummary : nil,
             supportsReasoningSummaries: inheritsParentModelMetadata ? parentOptions?.supportsReasoningSummaries : nil,
-            serviceTier: arguments["service_tier"] as? String ?? (inheritsParentModelMetadata ? parentOptions?.serviceTier : nil),
+            serviceTier: trimmedNonEmpty(arguments["service_tier"] as? String) ?? (inheritsParentModelMetadata ? parentOptions?.serviceTier : nil),
             toolChoice: parentOptions?.toolChoice,
             parallelToolCalls: parentOptions?.parallelToolCalls,
             usesResponsesLite: inheritsParentModelMetadata ? parentOptions?.usesResponsesLite ?? false : false,
@@ -922,6 +922,74 @@ public actor CodexSession {
             .filter { $0 != "default" }
             + [options?.serviceTier].compactMap { $0 }
         return orderedUnique(values)
+    }
+
+    static func subagentTurnOptionsValidationError(
+        arguments: [String: Any],
+        parentOptions: CodexTurnOptions?
+    ) -> String? {
+        let requestedModel = trimmedNonEmpty(arguments["model"] as? String)
+        let requestedReasoningEffort = trimmedNonEmpty(arguments["reasoning_effort"] as? String)
+        let requestedServiceTier = trimmedNonEmpty(arguments["service_tier"] as? String)
+        guard requestedModel != nil || requestedReasoningEffort != nil || requestedServiceTier != nil else {
+            return nil
+        }
+
+        let models = subagentVisibleModelOptions(options: parentOptions)
+        let selectedModel: CodexModelOption?
+        if let requestedModel {
+            guard models.isEmpty == false else {
+                return nil
+            }
+            guard let model = models.first(where: { $0.model == requestedModel }) else {
+                return "Unknown model `\(requestedModel)` for spawn_agent. Available models: \(availableValuesDescription(models.map(\.model)))."
+            }
+            selectedModel = model
+        } else if let parentModel = trimmedNonEmpty(parentOptions?.model) {
+            selectedModel = models.first(where: { $0.model == parentModel })
+        } else {
+            selectedModel = nil
+        }
+
+        if let requestedReasoningEffort {
+            if let selectedModel {
+                let supported = selectedModel.supportedReasoningEfforts.map(\.reasoningEffort)
+                if !supported.isEmpty, !supported.contains(requestedReasoningEffort) {
+                    return "Reasoning effort `\(requestedReasoningEffort)` is not supported for model `\(selectedModel.model)`. Supported reasoning efforts: \(availableValuesDescription(supported))."
+                }
+            } else {
+                let supported = subagentReasoningEffortValues(options: parentOptions)
+                if !supported.isEmpty, !supported.contains(requestedReasoningEffort) {
+                    return "Reasoning effort `\(requestedReasoningEffort)` is not available for spawn_agent. Available reasoning efforts: \(availableValuesDescription(supported))."
+                }
+            }
+        }
+
+        if let requestedServiceTier {
+            if let selectedModel {
+                let supported = selectedModel.serviceTiers
+                    .map(\.id)
+                    .filter { $0 != "default" }
+                if !supported.contains(requestedServiceTier) {
+                    return "Service tier `\(requestedServiceTier)` is not supported for model `\(selectedModel.model)`. Supported service tiers: \(availableValuesDescription(supported))."
+                }
+            } else {
+                let supported = subagentServiceTierValues(options: parentOptions)
+                if !supported.isEmpty, !supported.contains(requestedServiceTier) {
+                    return "Service tier `\(requestedServiceTier)` is not available for spawn_agent. Available service tiers: \(availableValuesDescription(supported))."
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private static func availableValuesDescription(_ values: [String]) -> String {
+        let uniqueValues = orderedUnique(values)
+        guard !uniqueValues.isEmpty else {
+            return "none"
+        }
+        return uniqueValues.joined(separator: ", ")
     }
 
     private static func schemaStringProperty(description: String, enumValues: [String]) -> [String: Any] {
@@ -1914,6 +1982,9 @@ public actor CodexSession {
         }
         guard !message.isEmpty else {
             return CodexToolResult(output: "Missing message.", success: false)
+        }
+        if let validationError = Self.subagentTurnOptionsValidationError(arguments: arguments, parentOptions: activeTurnOptions) {
+            return CodexToolResult(output: validationError, success: false)
         }
 
         let childPath = Self.subagentPath(parent: agentPath, taskName: taskName)
