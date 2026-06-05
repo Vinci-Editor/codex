@@ -932,6 +932,23 @@ func subagentSpawnValidationRejectsInvalidForkTurns() {
 }
 
 @Test
+func subagentOptionsNormalizeDepthLimit() {
+    let unlimited = CodexSubagentOptions(isEnabled: true)
+    let clamped = CodexSubagentOptions(isEnabled: true, maxDepth: 0)
+
+    #expect(unlimited.maxDepth == nil)
+    #expect(clamped.maxDepth == 1)
+}
+
+@Test
+func subagentDepthTreatsRootAsDepthZero() {
+    #expect(CodexSession.subagentDepth(path: "/root") == 0)
+    #expect(CodexSession.subagentDepth(path: "/root/research") == 1)
+    #expect(CodexSession.subagentDepth(path: "/root/research/audit") == 2)
+    #expect(CodexSession.subagentDepth(path: "/scratch") == 1)
+}
+
+@Test
 func subagentTurnOptionValidationAllowsSparseLocalModelCatalogs() {
     #expect(CodexSession.subagentTurnOptionsValidationError(
         arguments: ["model": "local-model", "reasoning_effort": "high", "service_tier": "priority"],

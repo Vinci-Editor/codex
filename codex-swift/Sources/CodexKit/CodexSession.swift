@@ -1332,6 +1332,7 @@ public actor CodexSession {
             Self.subagentInheritedModelGuidance(options: options),
             "The default `fork_turns` is `all`. Full-history forked agents inherit the parent model and reasoning effort; omit `model` and `reasoning_effort` unless `fork_turns` is `none` or a positive integer string.",
             "This session allows up to \(configuration.subagentOptions.maxOpenAgents) open subagents.",
+            configuration.subagentOptions.maxDepth.map { "This session allows subagent nesting up to depth \($0), where direct children of `/root` are depth 1." } ?? "",
         ]
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
@@ -2227,6 +2228,13 @@ public actor CodexSession {
         }
 
         let childPath = Self.subagentPath(parent: agentPath, taskName: taskName)
+        if let maxDepth = configuration.subagentOptions.maxDepth,
+           Self.subagentDepth(path: childPath) > maxDepth {
+            return CodexToolResult(
+                output: "Subagent depth limit reached (\(maxDepth)). Solve the task yourself.",
+                success: false
+            )
+        }
         guard !subagents.values.contains(where: { $0.path == childPath }) else {
             return CodexToolResult(output: "\(childPath): agent already exists.", success: false)
         }
@@ -2906,6 +2914,19 @@ public actor CodexSession {
 
     private static func subagentPath(parent: String, taskName: String) -> String {
         parent == "/" ? "/\(taskName)" : "\(parent)/\(taskName)"
+    }
+
+    static func subagentDepth(path: String) -> Int {
+        let components = path
+            .split(separator: "/")
+            .map(String.init)
+        guard !components.isEmpty else {
+            return 0
+        }
+        if components.first == "root" {
+            return max(0, components.count - 1)
+        }
+        return components.count
     }
 
     private func subagentPathPrefix(_ rawPrefix: String?) -> String? {

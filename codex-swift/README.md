@@ -306,15 +306,21 @@ let configuration = CodexSessionConfiguration(
     provider: provider,
     model: model,
     workspace: workspace,
-    subagentOptions: .enabled
+    subagentOptions: CodexSubagentOptions(
+        isEnabled: true,
+        maxOpenAgents: 4,
+        maxDepth: nil
+    )
 )
 ```
 
-When enabled, `CodexKit` exposes `spawn_agent`, `send_message`,
-`followup_task`, `wait_agent`, `list_agents`, and `close_agent`. Spawned agents
-inherit the same configuration, workspace, registered tools, approval handler,
-and auth context. `fork_turns` can be `none`, `all`, or a positive integer
-string to control how much parent history is copied into the child session.
+When enabled, `CodexKit` exposes `spawn_agent`, `send_input`, `send_message`,
+`resume_agent`, `followup_task`, `wait_agent`, `list_agents`, and `close_agent`.
+Spawned agents inherit the same configuration, workspace, registered tools,
+approval handler, and auth context. `fork_turns` can be `none`, `all`, or a
+positive integer string to control how much parent history is copied into the
+child session. Set `maxDepth` to cap recursive agent nesting; `nil` leaves
+nesting unlimited.
 
 ## Thread Goals
 
