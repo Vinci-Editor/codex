@@ -262,6 +262,47 @@ func projectInstructionsRespectByteLimitAcrossSources() throws {
 }
 
 @Test
+func projectSkillsLoadRootToCurrentDirectorySkillRoots() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    let nested = root.appending(path: "Sources/App", directoryHint: .isDirectory)
+    let alpha = root.appending(path: ".codex/skills/alpha", directoryHint: .isDirectory)
+    let beta = nested.appending(path: ".agents/skills/beta", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try FileManager.default.createDirectory(at: alpha, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: beta, withIntermediateDirectories: true)
+    try """
+    ---
+    name: alpha-skill
+    description: Root skill
+    ---
+
+    # Alpha
+    """.write(to: alpha.appending(path: "SKILL.md"), atomically: true, encoding: .utf8)
+    try """
+    ---
+    name: "beta-skill"
+    description: "Long beta description"
+    metadata:
+      short-description: "Short beta"
+    ---
+
+    # Beta
+    """.write(to: beta.appending(path: "SKILL.md"), atomically: true, encoding: .utf8)
+
+    let loadedSkills = try CodexProjectSkills.load(from: root, currentDirectoryURL: nested)
+    let skills = try #require(loadedSkills)
+
+    #expect(skills.skills.map(\.name) == ["alpha-skill", "beta-skill"])
+    #expect(skills.skills[1].shortDescription == "Short beta")
+    #expect(skills.text.contains("<skills_instructions>"))
+    #expect(skills.text.contains("alpha-skill: Root skill"))
+    #expect(skills.text.contains("beta-skill: Short beta"))
+    #expect(skills.text.contains("After deciding to use a skill, open its `SKILL.md`"))
+}
+
+@Test
 func webSearchOptionsBuildHostedToolDefinition() throws {
     let webSearch = CodexWebSearchOptions(
         mode: .live,
