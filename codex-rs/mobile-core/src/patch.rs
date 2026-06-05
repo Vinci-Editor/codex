@@ -102,7 +102,7 @@ fn run_apply_patch(request: ApplyPatchRequest) -> (i32, String, String) {
         None,
     ));
     let exit_code = match result {
-        Ok(()) => 0,
+        Ok(_delta) => 0,
         Err(error) => {
             if stderr.is_empty() {
                 stderr = format!("{error}\n").into_bytes();

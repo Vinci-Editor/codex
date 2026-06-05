@@ -2728,6 +2728,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-device-key"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "p256",
+ "pretty_assertions",
+ "rand 0.9.3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "url",
+]
+
+[[package]]
 name = "codex-exec"
 version = "0.0.0"
 dependencies = [
@@ -3223,23 +3237,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-mobile-core"
-version = "0.0.0"
-dependencies = [
- "base64 0.22.1",
- "codex-apply-patch",
- "codex-device-key",
- "codex-exec-server",
- "codex-utils-absolute-path",
- "pretty_assertions",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
 name = "codex-memories-extension"
 version = "0.0.0"
 dependencies = [
@@ -3318,6 +3315,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "codex-mobile-core"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "codex-apply-patch",
+ "codex-device-key",
+ "codex-exec-server",
+ "codex-utils-absolute-path",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

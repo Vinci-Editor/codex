@@ -114,14 +114,16 @@ pub fn parse_sse_event_json(data: &str) -> Result<String, serde_json::Error> {
             "itemId": value.get("item_id").and_then(Value::as_str),
             "raw": value,
         }),
-        "response.function_call_arguments.delta" | "response.tool_call_input.delta" => serde_json::json!({
-            "type": "toolCallInputDelta",
-            "delta": value.get("delta").and_then(Value::as_str).unwrap_or_default(),
-            "itemId": value.get("item_id").and_then(Value::as_str),
-            "callId": value.get("call_id").and_then(Value::as_str),
-            "outputIndex": value.get("output_index").and_then(Value::as_i64),
-            "raw": value,
-        }),
+        "response.function_call_arguments.delta" | "response.tool_call_input.delta" => {
+            serde_json::json!({
+                "type": "toolCallInputDelta",
+                "delta": value.get("delta").and_then(Value::as_str).unwrap_or_default(),
+                "itemId": value.get("item_id").and_then(Value::as_str),
+                "callId": value.get("call_id").and_then(Value::as_str),
+                "outputIndex": value.get("output_index").and_then(Value::as_i64),
+                "raw": value,
+            })
+        }
         "response.output_item.added" => serde_json::json!({
             "type": "outputItemAdded",
             "item": value.get("item").cloned().unwrap_or(Value::Null),
@@ -175,9 +177,10 @@ mod tests {
 
     #[test]
     fn normalizes_text_delta() {
-        let json =
-            parse_sse_event_json(r#"{"type":"response.output_text.delta","item_id":"msg-1","delta":"hi"}"#)
-            .expect("event");
+        let json = parse_sse_event_json(
+            r#"{"type":"response.output_text.delta","item_id":"msg-1","delta":"hi"}"#,
+        )
+        .expect("event");
         let value: Value = serde_json::from_str(&json).expect("json");
         assert_eq!(value["type"], "outputTextDelta");
         assert_eq!(value["itemId"], "msg-1");

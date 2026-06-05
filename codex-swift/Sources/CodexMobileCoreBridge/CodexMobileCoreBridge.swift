@@ -358,12 +358,18 @@ public enum CodexMobileCoreBridge {
             ),
             functionTool(
                 name: "shell_command",
-                description: "Runs a shell command. On macOS this uses /bin/zsh -lc; on iOS this is a deterministic Codex emulator.",
+                description: "Runs a one-shot shell command. On macOS this uses /bin/zsh; on iOS this is a deterministic Codex emulator.",
                 required: ["command"],
                 properties: [
                     "command": ["type": "string"],
                     "workdir": ["type": "string"],
                     "timeout_ms": ["type": "number"],
+                    "max_output_tokens": ["type": "number"],
+                    "max_output_bytes": ["type": "number"],
+                    "login": [
+                        "type": "boolean",
+                        "description": "On macOS, true runs the command through a login shell. Defaults to true. On iOS this is accepted for compatibility.",
+                    ],
                     "sandbox_permissions": [
                         "type": "string",
                         "enum": ["use_default", "require_escalated"],
@@ -382,13 +388,19 @@ public enum CodexMobileCoreBridge {
             ),
             functionTool(
                 name: "exec_command",
-                description: "Runs a shell command and returns Codex unified exec output. On macOS this uses /bin/zsh -lc; on iOS this uses the deterministic emulator.",
+                description: "Runs a one-shot shell command and returns Codex unified exec output. Ongoing session_id, write_stdin, and tty execution are not available in CodexKit.",
                 required: ["cmd"],
                 properties: [
                     "cmd": ["type": "string"],
                     "workdir": ["type": "string"],
+                    "timeout_ms": ["type": "number"],
                     "yield_time_ms": ["type": "number"],
                     "max_output_tokens": ["type": "number"],
+                    "max_output_bytes": ["type": "number"],
+                    "login": [
+                        "type": "boolean",
+                        "description": "On macOS, true runs the command through a login shell. Defaults to true. On iOS this is accepted for compatibility.",
+                    ],
                     "sandbox_permissions": [
                         "type": "string",
                         "enum": ["use_default", "require_escalated"],
@@ -727,6 +739,7 @@ public enum CodexMobileCoreBridge {
 
         let maxOutputBytes = shellOutputLimit(input)
         let timeoutMilliseconds = max(1, intValue(input["timeout_ms"]) ?? 120_000)
+        let useLoginShell = input["login"] as? Bool ?? true
 
         let workdir: URL
         do {
@@ -762,7 +775,7 @@ public enum CodexMobileCoreBridge {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-lc", command]
+        process.arguments = useLoginShell ? ["-lc", command] : ["-c", command]
         process.currentDirectoryURL = workdir
         process.environment = ProcessInfo.processInfo.environment
         process.standardOutput = stdoutPipe

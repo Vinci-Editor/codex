@@ -534,11 +534,15 @@ the stream when the user stops a turn or leaves the screen.
 - `update_plan`: lets the model publish the current turn checklist. `CodexKit`
   validates the submitted steps, emits `.planUpdated`, and returns a tool result
   without changing the workspace.
-- `shell_command`: runs a shell-like command. On macOS this runs `/bin/zsh -lc`
-  inside the selected workspace. On iOS this uses the deterministic Rust shell
-  emulator, not arbitrary process execution.
-- `exec_command`: accepts Codex unified exec-style arguments. On macOS it uses
-  the same native shell runner; on iOS it uses the deterministic emulator.
+- `shell_command`: runs a one-shot shell-like command. On macOS this runs
+  `/bin/zsh` inside the selected workspace, using a login shell by default and
+  honoring `login: false` with `-c`. On iOS this uses the deterministic Rust
+  shell emulator, not arbitrary process execution.
+- `exec_command`: accepts Codex unified exec-style arguments for one-shot
+  commands, including `timeout_ms`, output caps, `login`, and approval metadata.
+  On macOS it uses the same native shell runner; on iOS it uses the deterministic
+  emulator. Persistent `session_id`, `write_stdin`, and `tty` execution require
+  the Codex app-server process layer and are rejected by `CodexKit`.
 
 Session instructions steer the model toward `list_dir`, `read_file`,
 `search_files`, `apply_patch`, and `write_file` first. Shell tools remain

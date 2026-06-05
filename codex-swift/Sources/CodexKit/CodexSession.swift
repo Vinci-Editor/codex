@@ -1632,6 +1632,9 @@ public actor CodexSession {
         guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return CodexToolResult(output: "Missing command.", success: false)
         }
+        if let unsupportedFeature = Self.unsupportedShellExecutionFeature(for: call.name, arguments: arguments) {
+            return CodexToolResult(output: unsupportedFeature, success: false)
+        }
         guard let workspace = configuration.workspace else {
             return CodexToolResult(output: "No workspace selected.", success: false)
         }
@@ -1651,6 +1654,9 @@ public actor CodexSession {
             if let timeoutMilliseconds = Self.intValue(arguments["timeout_ms"]) {
                 input["timeout_ms"] = timeoutMilliseconds
             }
+            if arguments["login"] != nil {
+                input["login"] = Self.boolValue(arguments["login"])
+            }
             let response = try await CodexMobileCoreBridge.emulateShell(input) { delta in
                 progress?(.outputDelta(delta))
             }
@@ -1661,6 +1667,19 @@ public actor CodexSession {
                 success: exitCode == 0
             )
         }
+    }
+
+    private static func unsupportedShellExecutionFeature(for toolName: String, arguments: [String: Any]) -> String? {
+        guard toolName == "exec_command" else {
+            return nil
+        }
+        if let sessionID = trimmedNonEmpty(arguments["session_id"] as? String) {
+            return "CodexKit exec_command is one-shot and does not support ongoing shell sessions (`session_id`: \(sessionID)). Rerun without session_id; interactive stdin/PTY support requires Codex app-server process execution."
+        }
+        if boolValue(arguments["tty"]) {
+            return "CodexKit exec_command does not support TTY or interactive shell execution. Rerun with tty=false or omit tty."
+        }
+        return nil
     }
 
     private func executeApplyPatch(_ call: CodexToolCall) throws -> CodexToolResult {

@@ -239,6 +239,31 @@ func mobileBridgeBuildsResponsesRequest() throws {
 }
 
 @Test
+func builtinShellSchemasExposeOneShotUnifiedExecControls() throws {
+    let tools = CodexMobileCoreBridge.builtinTools()
+    let shell = try #require(tools.first { $0["name"] as? String == "shell_command" })
+    let shellParameters = try #require(shell["parameters"] as? [String: Any])
+    let shellProperties = try #require(shellParameters["properties"] as? [String: Any])
+    let exec = try #require(tools.first { $0["name"] as? String == "exec_command" })
+    let execParameters = try #require(exec["parameters"] as? [String: Any])
+    let execProperties = try #require(execParameters["properties"] as? [String: Any])
+
+    #expect((shell["description"] as? String)?.contains("one-shot") == true)
+    #expect(shellProperties.keys.contains("timeout_ms"))
+    #expect(shellProperties.keys.contains("max_output_tokens"))
+    #expect(shellProperties.keys.contains("max_output_bytes"))
+    #expect(shellProperties.keys.contains("login"))
+    #expect(shellProperties.keys.contains("sandbox_permissions"))
+    #expect((exec["description"] as? String)?.contains("session_id") == true)
+    #expect(execProperties.keys.contains("timeout_ms"))
+    #expect(execProperties.keys.contains("yield_time_ms"))
+    #expect(execProperties.keys.contains("max_output_tokens"))
+    #expect(execProperties.keys.contains("max_output_bytes"))
+    #expect(execProperties.keys.contains("login"))
+    #expect(execProperties.keys.contains("sandbox_permissions"))
+}
+
+@Test
 func sessionConfigurationPreservesAutomaticCompactionOptionsWhenAddingApprovalHandler() {
     let configuration = CodexSessionConfiguration(
         provider: .openAI,
@@ -1157,6 +1182,34 @@ func mutatingBuiltinWorkspaceToolsRequireApproval() async throws {
 
     #expect(output.contains("approval is required"))
     #expect(!FileManager.default.fileExists(atPath: root.appending(path: "denied.txt").path))
+}
+
+@Test
+func sessionRejectsUnsupportedInteractiveExecArguments() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let session = CodexSession(configuration: CodexSessionConfiguration(
+        provider: .lmStudio(),
+        model: "local-model",
+        workspace: CodexWorkspace(rootURL: root),
+        toolApprovalHandler: { _ in .approve }
+    ))
+    let sessionData = try await session.executeToolCall(CodexToolCall(
+        callID: "call-session",
+        name: "exec_command",
+        arguments: try jsonString(["cmd": "echo hi", "session_id": "proc-1"])
+    ))
+    let ttyData = try await session.executeToolCall(CodexToolCall(
+        callID: "call-tty",
+        name: "exec_command",
+        arguments: try jsonString(["cmd": "echo hi", "tty": true])
+    ))
+
+    #expect(try toolOutputBody(sessionData).contains("one-shot"))
+    #expect(try toolOutputBody(sessionData).contains("session_id"))
+    #expect(try toolOutputBody(ttyData).contains("TTY"))
 }
 
 private func jwt(payload: [String: Any]) throws -> String {

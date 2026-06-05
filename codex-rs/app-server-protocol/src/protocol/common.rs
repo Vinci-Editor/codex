@@ -788,16 +788,6 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadRealtimeStopResponse,
     },
-    #[experimental("thread/realtime/resolveHandoff")]
-    ThreadRealtimeResolveHandoff => "thread/realtime/resolveHandoff" {
-        params: v2::ThreadRealtimeResolveHandoffParams,
-        response: v2::ThreadRealtimeResolveHandoffResponse,
-    },
-    #[experimental("thread/realtime/finalizeHandoff")]
-    ThreadRealtimeFinalizeHandoff => "thread/realtime/finalizeHandoff" {
-        params: v2::ThreadRealtimeFinalizeHandoffParams,
-        response: v2::ThreadRealtimeFinalizeHandoffResponse,
-    },
     #[experimental("thread/realtime/listVoices")]
     ThreadRealtimeListVoices => "thread/realtime/listVoices" {
         params: v2::ThreadRealtimeListVoicesParams,

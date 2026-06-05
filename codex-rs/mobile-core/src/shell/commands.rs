@@ -5,8 +5,8 @@ use std::path::Path;
 
 const SUPPORTED_COMMANDS: &[&str] = &[
     "[", "basename", "cat", "cd", "command", "cp", "dirname", "echo", "egrep", "false", "fgrep",
-    "find", "git", "grep", "head", "ls", "mkdir", "mv", "nl", "printf", "pwd", "rg", "rm",
-    "sed", "sort", "tail", "tee", "test", "touch", "true", "type", "uniq", "wc", "which",
+    "find", "git", "grep", "head", "ls", "mkdir", "mv", "nl", "printf", "pwd", "rg", "rm", "sed",
+    "sort", "tail", "tee", "test", "touch", "true", "type", "uniq", "wc", "which",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

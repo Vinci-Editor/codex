@@ -148,7 +148,7 @@ fn shell_command_tool() -> Value {
     json!({
         "type": "function",
         "name": "shell_command",
-        "description": "Runs a shell-like command. On iOS this is a deterministic Codex emulator, not arbitrary process execution. On macOS CodexKit may route to a Process-backed shell backend.",
+        "description": "Runs a one-shot shell-like command. On iOS this is a deterministic Codex emulator, not arbitrary process execution. On macOS CodexKit may route to a Process-backed shell backend.",
         "strict": false,
         "parameters": {
             "type": "object",
@@ -156,6 +156,12 @@ fn shell_command_tool() -> Value {
                 "command": { "type": "string" },
                 "workdir": { "type": "string" },
                 "timeout_ms": { "type": "number" },
+                "max_output_tokens": { "type": "number" },
+                "max_output_bytes": { "type": "number" },
+                "login": {
+                    "type": "boolean",
+                    "description": "On macOS, true runs the command through a login shell. Defaults to true. On iOS this is accepted for compatibility."
+                },
                 "sandbox_permissions": {
                     "type": "string",
                     "enum": ["use_default", "require_escalated"],
@@ -181,15 +187,21 @@ fn exec_command_tool() -> Value {
     json!({
         "type": "function",
         "name": "exec_command",
-        "description": "Runs a shell-like command and returns Codex unified exec output. On iOS this uses the same deterministic emulator as shell_command.",
+        "description": "Runs a one-shot shell-like command and returns Codex unified exec output. Ongoing session_id, write_stdin, and tty execution are not available in CodexKit.",
         "strict": false,
         "parameters": {
             "type": "object",
             "properties": {
                 "cmd": { "type": "string", "description": "Shell command to execute." },
                 "workdir": { "type": "string" },
+                "timeout_ms": { "type": "number" },
                 "yield_time_ms": { "type": "number" },
                 "max_output_tokens": { "type": "number" },
+                "max_output_bytes": { "type": "number" },
+                "login": {
+                    "type": "boolean",
+                    "description": "On macOS, true runs the command through a login shell. Defaults to true. On iOS this is accepted for compatibility."
+                },
                 "sandbox_permissions": {
                     "type": "string",
                     "enum": ["use_default", "require_escalated"],
