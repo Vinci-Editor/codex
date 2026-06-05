@@ -29,7 +29,7 @@ var targets: [Target] = [
     ),
     .testTarget(
         name: "CodexKitTests",
-        dependencies: ["CodexKit"],
+        dependencies: ["CodexKit", "CodexMobileCoreBridge"],
         path: "Tests/CodexKitTests"
     ),
 ]

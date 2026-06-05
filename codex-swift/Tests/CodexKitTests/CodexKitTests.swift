@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 @testable import CodexKit
-import CodexMobileCoreBridge
+@testable import CodexMobileCoreBridge
 
 @Test
 func providerDefaultsExposeOpenAIAndLocalProviders() {
@@ -946,6 +946,37 @@ func sessionExecutesBuiltinWorkspaceTools() async throws {
 
     #expect(writeOutput.contains("Wrote written.txt"))
     #expect(try String(contentsOf: root.appending(path: "written.txt"), encoding: .utf8) == "written\n")
+}
+
+@Test
+func portableShellSupportsAbsoluteUnixCommandEntrypoints() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "CodexPortableShell-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+    try "hello\n".write(to: root.appending(path: "notes.txt"), atomically: true, encoding: .utf8)
+
+    let response = await CodexMobileCoreBridge.emulatePortableShellForTesting([
+        "workspaceRoot": root.path,
+        "command": #"""
+        /bin/cat notes.txt
+        /usr/bin/env bash -lc 'printf "%s\n" "$PWD"'
+        /usr/bin/env CODEX_TEST_VALUE=portable bash -lc 'printf "%s\n" "$CODEX_TEST_VALUE"'
+        sh -c 'printf portable > generated.txt'
+        /usr/bin/which cat
+        """#,
+        "maxOutputBytes": 64 * 1024,
+    ])
+
+    #expect(response["exit_code"] as? Int == 0)
+    let output = response["output"] as? String ?? ""
+    #expect(output.contains("hello\n"))
+    #expect(output.contains("/\n"))
+    #expect(output.contains("portable\n"))
+    #expect(output.contains("/bin/cat\n"))
+    #expect(try String(contentsOf: root.appending(path: "generated.txt"), encoding: .utf8) == "portable")
 }
 
 @Test
