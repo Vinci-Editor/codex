@@ -7,18 +7,28 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		0BDF0F02D871466D921091B6 /* ChatMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0BDF0F01D871466D921091B6 /* ChatMessage.swift */; };
+		35A21E7204504C20B9014FB4 /* DemoChatView+Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35A21E7104504C20B9014FB4 /* DemoChatView+Settings.swift */; };
 		649C79E64B5312F42ABF36FB /* CodexKit in Frameworks */ = {isa = PBXBuildFile; productRef = 14A7B10B2ED7EB3E7985C9FC /* CodexKit */; };
 		698BB5570B8FA09F9208C609 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = FB6DC6BCF3F3B3D68CF45F2A /* LaunchScreen.storyboard */; };
 		709FF03DDEC8CA4380F72B2A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2E397008CE7239C8FDF202F /* Assets.xcassets */; };
 		8E6CC1D8B3502218C7FF9FBE /* CodexMobileDemoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = E11FC999D2811B150B29FB4A /* CodexMobileDemoApp.swift */; };
+		920641294271459E942F228E /* DemoChatView+Session.swift in Sources */ = {isa = PBXBuildFile; fileRef = 920641284271459E942F228E /* DemoChatView+Session.swift */; };
+		99F4FCA34DB9479389A04BA4 /* EchoTool.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99F4FCA24DB9479389A04BA4 /* EchoTool.swift */; };
+		F01B91D16DBE44779BF18717 /* ChatBubble.swift in Sources */ = {isa = PBXBuildFile; fileRef = F01B91D06DBE44779BF18717 /* ChatBubble.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		0BDF0F01D871466D921091B6 /* ChatMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMessage.swift; sourceTree = "<group>"; };
 		0D2418577D85EF7EA5ABB4B9 /* codex-swift */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "codex-swift"; path = ../..; sourceTree = SOURCE_ROOT; };
 		188A2C9EA54FD0FA66AA0DDE /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		35A21E7104504C20B9014FB4 /* DemoChatView+Settings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DemoChatView+Settings.swift"; sourceTree = "<group>"; };
 		6A8B5F4F1BCD8FEFEE655BF2 /* CodexMobileDemo.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = CodexMobileDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		920641284271459E942F228E /* DemoChatView+Session.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DemoChatView+Session.swift"; sourceTree = "<group>"; };
+		99F4FCA24DB9479389A04BA4 /* EchoTool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EchoTool.swift; sourceTree = "<group>"; };
 		A2E397008CE7239C8FDF202F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		E11FC999D2811B150B29FB4A /* CodexMobileDemoApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexMobileDemoApp.swift; sourceTree = "<group>"; };
+		F01B91D06DBE44779BF18717 /* ChatBubble.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatBubble.swift; sourceTree = "<group>"; };
 		FB6DC6BCF3F3B3D68CF45F2A /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -63,7 +73,12 @@
 			isa = PBXGroup;
 			children = (
 				A2E397008CE7239C8FDF202F /* Assets.xcassets */,
+				F01B91D06DBE44779BF18717 /* ChatBubble.swift */,
+				0BDF0F01D871466D921091B6 /* ChatMessage.swift */,
 				E11FC999D2811B150B29FB4A /* CodexMobileDemoApp.swift */,
+				920641284271459E942F228E /* DemoChatView+Session.swift */,
+				35A21E7104504C20B9014FB4 /* DemoChatView+Settings.swift */,
+				99F4FCA24DB9479389A04BA4 /* EchoTool.swift */,
 				188A2C9EA54FD0FA66AA0DDE /* Info.plist */,
 				FB6DC6BCF3F3B3D68CF45F2A /* LaunchScreen.storyboard */,
 			);
@@ -146,7 +161,12 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F01B91D16DBE44779BF18717 /* ChatBubble.swift in Sources */,
+				0BDF0F02D871466D921091B6 /* ChatMessage.swift in Sources */,
 				8E6CC1D8B3502218C7FF9FBE /* CodexMobileDemoApp.swift in Sources */,
+				920641294271459E942F228E /* DemoChatView+Session.swift in Sources */,
+				35A21E7204504C20B9014FB4 /* DemoChatView+Settings.swift in Sources */,
+				99F4FCA34DB9479389A04BA4 /* EchoTool.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
