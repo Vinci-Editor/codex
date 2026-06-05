@@ -155,7 +155,21 @@ fn shell_command_tool() -> Value {
             "properties": {
                 "command": { "type": "string" },
                 "workdir": { "type": "string" },
-                "timeout_ms": { "type": "number" }
+                "timeout_ms": { "type": "number" },
+                "sandbox_permissions": {
+                    "type": "string",
+                    "enum": ["use_default", "require_escalated"],
+                    "description": "Per-command sandbox override. Defaults to use_default; use require_escalated when the host app should ask for explicit approval before running."
+                },
+                "justification": {
+                    "type": "string",
+                    "description": "User-facing approval question for require_escalated; omit otherwise."
+                },
+                "prefix_rule": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Reusable session approval prefix for command, only with sandbox_permissions set to require_escalated; for example [\"git\", \"pull\"]."
+                }
             },
             "required": ["command"],
             "additionalProperties": false
@@ -175,7 +189,21 @@ fn exec_command_tool() -> Value {
                 "cmd": { "type": "string", "description": "Shell command to execute." },
                 "workdir": { "type": "string" },
                 "yield_time_ms": { "type": "number" },
-                "max_output_tokens": { "type": "number" }
+                "max_output_tokens": { "type": "number" },
+                "sandbox_permissions": {
+                    "type": "string",
+                    "enum": ["use_default", "require_escalated"],
+                    "description": "Per-command sandbox override. Defaults to use_default; use require_escalated when the host app should ask for explicit approval before running."
+                },
+                "justification": {
+                    "type": "string",
+                    "description": "User-facing approval question for require_escalated; omit otherwise."
+                },
+                "prefix_rule": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Reusable session approval prefix for cmd, only with sandbox_permissions set to require_escalated; for example [\"git\", \"pull\"]."
+                }
             },
             "required": ["cmd"],
             "additionalProperties": false
@@ -286,9 +314,6 @@ mod tests {
         assert_eq!(value["type"], "function_call_output");
         assert_eq!(value["call_id"], "call-1");
         assert_eq!(value["output"][0]["type"], "input_image");
-        assert_eq!(
-            value["output"][0]["image_url"],
-            "data:image/png;base64,AAA"
-        );
+        assert_eq!(value["output"][0]["image_url"], "data:image/png;base64,AAA");
     }
 }

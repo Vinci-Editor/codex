@@ -251,6 +251,7 @@ public actor CodexSession {
     private var subagents: [String: SubagentRecord] = [:]
     private var subagentSequence = 0
     private var activeTurnOptions: CodexTurnOptions?
+    private var approvedShellPrefixRules: [[String]] = []
 
     public init(configuration: CodexSessionConfiguration) {
         self.configuration = configuration
@@ -1333,11 +1334,20 @@ public actor CodexSession {
         guard case .required(let reason) = approvalRequirement(for: call) else {
             return nil
         }
+        let metadata = Self.shellApprovalMetadata(for: call)
+        if let metadata, shellApprovalAlreadyGranted(metadata) {
+            return nil
+        }
 
         let request = CodexToolApprovalRequest(
             call: call,
             reason: reason,
-            summary: approvalSummary(for: call, reason: reason)
+            summary: approvalSummary(for: call, reason: reason),
+            command: metadata?.command,
+            workdir: metadata?.workdir,
+            sandboxPermissions: metadata?.sandboxPermissions ?? .useDefault,
+            justification: metadata?.justification,
+            suggestedPrefixRule: metadata?.prefixRule ?? []
         )
         guard let toolApprovalHandler = configuration.toolApprovalHandler else {
             return CodexToolResult(
@@ -1349,6 +1359,11 @@ public actor CodexSession {
         switch await toolApprovalHandler(request) {
         case .approve:
             return nil
+        case .approveForSession(let prefixRule):
+            if let metadata {
+                rememberShellPrefixRule(prefixRule, for: metadata)
+            }
+            return nil
         case .deny(let message):
             let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
             return CodexToolResult(
@@ -1356,6 +1371,136 @@ public actor CodexSession {
                 success: false
             )
         }
+    }
+
+    private struct ShellApprovalMetadata {
+        let command: String
+        let workdir: String?
+        let sandboxPermissions: CodexToolSandboxPermissions
+        let justification: String?
+        let prefixRule: [String]
+    }
+
+    private func shellApprovalAlreadyGranted(_ metadata: ShellApprovalMetadata) -> Bool {
+        approvedShellPrefixRules.contains { rule in
+            Self.command(metadata.command, hasPrefixRule: rule)
+        }
+    }
+
+    private func rememberShellPrefixRule(_ prefixRule: [String], for metadata: ShellApprovalMetadata) {
+        let normalized = Self.normalizedPrefixRule(prefixRule)
+        guard metadata.sandboxPermissions == .requireEscalated,
+              !normalized.isEmpty,
+              Self.command(metadata.command, hasPrefixRule: normalized),
+              !approvedShellPrefixRules.contains(normalized) else {
+            return
+        }
+        approvedShellPrefixRules.append(normalized)
+    }
+
+    private static func shellApprovalMetadata(for call: CodexToolCall) -> ShellApprovalMetadata? {
+        guard call.name == "shell_command" || call.name == "exec_command",
+              let arguments = try? decodeArguments(call.arguments) else {
+            return nil
+        }
+        let command = (arguments["command"] as? String ?? arguments["cmd"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty else {
+            return nil
+        }
+        let workdir = trimmedNonEmpty(arguments["workdir"] as? String)
+        let sandboxPermissions = (arguments["sandbox_permissions"] as? String)
+            .flatMap(CodexToolSandboxPermissions.init(rawValue:)) ?? .useDefault
+        let prefixRule = sandboxPermissions == .requireEscalated
+            ? normalizedPrefixRule(arguments["prefix_rule"])
+            : []
+        return ShellApprovalMetadata(
+            command: command,
+            workdir: workdir,
+            sandboxPermissions: sandboxPermissions,
+            justification: trimmedNonEmpty(arguments["justification"] as? String),
+            prefixRule: prefixRule
+        )
+    }
+
+    private static func normalizedPrefixRule(_ rawValue: Any?) -> [String] {
+        guard let values = rawValue as? [Any] else {
+            return []
+        }
+        return normalizedPrefixRule(values.compactMap { $0 as? String })
+    }
+
+    private static func normalizedPrefixRule(_ values: [String]) -> [String] {
+        values.compactMap { trimmedNonEmpty($0) }
+    }
+
+    private static func command(_ command: String, hasPrefixRule prefixRule: [String]) -> Bool {
+        let rule = normalizedPrefixRule(prefixRule)
+        guard !rule.isEmpty,
+              let words = shellWords(from: command),
+              words.count >= rule.count else {
+            return false
+        }
+        return Array(words.prefix(rule.count)) == rule
+    }
+
+    private static func shellWords(from command: String) -> [String]? {
+        var words: [String] = []
+        var current = ""
+        var quote: Character?
+        var escaping = false
+        var hasCurrent = false
+
+        for character in command {
+            if escaping {
+                current.append(character)
+                escaping = false
+                hasCurrent = true
+                continue
+            }
+
+            if character == "\\" && quote != "'" {
+                escaping = true
+                hasCurrent = true
+                continue
+            }
+
+            if let activeQuote = quote {
+                if character == activeQuote {
+                    quote = nil
+                } else {
+                    current.append(character)
+                    hasCurrent = true
+                }
+                continue
+            }
+
+            if character == "'" || character == "\"" {
+                quote = character
+                hasCurrent = true
+            } else if isShellWhitespace(character) {
+                if hasCurrent {
+                    words.append(current)
+                    current = ""
+                    hasCurrent = false
+                }
+            } else {
+                current.append(character)
+                hasCurrent = true
+            }
+        }
+
+        guard quote == nil, !escaping else {
+            return nil
+        }
+        if hasCurrent {
+            words.append(current)
+        }
+        return words
+    }
+
+    private static func isShellWhitespace(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy { CharacterSet.whitespacesAndNewlines.contains($0) }
     }
 
     private func approvalRequirement(for call: CodexToolCall) -> CodexToolApprovalRequirement {
@@ -1964,6 +2109,11 @@ public actor CodexSession {
         default:
             return nil
         }
+    }
+
+    private static func trimmedNonEmpty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
     }
 
     private static func boolValue(_ value: Any?) -> Bool {

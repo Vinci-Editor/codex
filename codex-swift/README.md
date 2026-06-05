@@ -295,7 +295,7 @@ Use a new session when provider, model, auth context, workspace, or registered
 tools change. Call `clearHistory()` if the user wants a fresh conversation with
 the same configuration.
 
-The default model is `gpt-5.4`. Override it in `CodexSessionConfiguration` for a
+The default model is `gpt-5.5`. Override it in `CodexSessionConfiguration` for a
 long-lived session default or per turn with `CodexTurnOptions`.
 
 Enable background child agents with `subagentOptions`:
@@ -352,14 +352,28 @@ let session = CodexSession(configuration: CodexSessionConfiguration(
     authStore: authStore,
     workspace: workspace,
     toolApprovalHandler: { request in
+        let message = [
+            request.justification ?? request.reason,
+            request.workdir.map { "Working directory: \($0)" },
+            request.suggestedPrefixRule.isEmpty ? nil : "Session prefix: \(request.suggestedPrefixRule.joined(separator: " "))",
+        ]
+        .compactMap { $0 }
+        .joined(separator: "\n\n")
         let approved = await showApprovalPrompt(
             title: request.summary,
-            message: request.reason
+            message: message
         )
         return approved ? .approve : .deny("Denied by user.")
     }
 ))
 ```
+
+For shell tools, approval requests also expose `command`, `workdir`,
+`sandboxPermissions`, `justification`, and any model-suggested `prefix_rule` as
+`suggestedPrefixRule`.
+Hosts that offer an "approve for session" action can return
+`.approveForSession(prefixRule:)`; `CodexSession` then skips later shell approval
+prompts only when the parsed command starts with that exact prefix.
 
 Custom Swift tools can opt into the same flow by overriding
 `approvalRequirement(for:)`:
@@ -394,7 +408,7 @@ the next turn:
 
 ```swift
 let result = try await session.compactHistory(options: CodexTurnOptions(
-    model: "gpt-5.4",
+    model: "gpt-5.5",
     reasoningEffort: "low"
 ))
 let snapshot = try await session.snapshot()
@@ -422,7 +436,7 @@ Use `submit(userText:options:)` for per-turn model or reasoning overrides, and
 
 ```swift
 let options = CodexTurnOptions(
-    model: "gpt-5.4",
+    model: "gpt-5.5",
     reasoningEffort: "low",
     serviceTier: "flex",
     toolChoice: "auto",

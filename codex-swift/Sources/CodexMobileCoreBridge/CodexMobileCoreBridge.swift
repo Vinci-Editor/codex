@@ -364,6 +364,20 @@ public enum CodexMobileCoreBridge {
                     "command": ["type": "string"],
                     "workdir": ["type": "string"],
                     "timeout_ms": ["type": "number"],
+                    "sandbox_permissions": [
+                        "type": "string",
+                        "enum": ["use_default", "require_escalated"],
+                        "description": "Per-command sandbox override. Defaults to use_default; use require_escalated when the host app should ask for explicit approval before running.",
+                    ],
+                    "justification": [
+                        "type": "string",
+                        "description": "User-facing approval question for require_escalated; omit otherwise.",
+                    ],
+                    "prefix_rule": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Reusable session approval prefix for command, only with sandbox_permissions set to require_escalated; for example [\"git\", \"pull\"].",
+                    ],
                 ]
             ),
             functionTool(
@@ -375,6 +389,20 @@ public enum CodexMobileCoreBridge {
                     "workdir": ["type": "string"],
                     "yield_time_ms": ["type": "number"],
                     "max_output_tokens": ["type": "number"],
+                    "sandbox_permissions": [
+                        "type": "string",
+                        "enum": ["use_default", "require_escalated"],
+                        "description": "Per-command sandbox override. Defaults to use_default; use require_escalated when the host app should ask for explicit approval before running.",
+                    ],
+                    "justification": [
+                        "type": "string",
+                        "description": "User-facing approval question for require_escalated; omit otherwise.",
+                    ],
+                    "prefix_rule": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Reusable session approval prefix for cmd, only with sandbox_permissions set to require_escalated; for example [\"git\", \"pull\"].",
+                    ],
                 ]
             ),
         ]
