@@ -27,6 +27,7 @@ public struct CodexSessionConfiguration: Sendable {
     public let workspace: CodexWorkspace?
     public let baseInstructionsOverride: String?
     public let additionalDeveloperInstructions: String?
+    public let contextualUserInstructions: String?
     public let tools: [any CodexTool]
     public let subagentOptions: CodexSubagentOptions
     public let webSearch: CodexWebSearchOptions?
@@ -43,6 +44,7 @@ public struct CodexSessionConfiguration: Sendable {
         workspace: CodexWorkspace? = nil,
         baseInstructionsOverride: String? = nil,
         additionalDeveloperInstructions: String? = nil,
+        contextualUserInstructions: String? = nil,
         tools: [any CodexTool] = [],
         subagentOptions: CodexSubagentOptions = .disabled,
         webSearch: CodexWebSearchOptions? = nil,
@@ -58,6 +60,7 @@ public struct CodexSessionConfiguration: Sendable {
         self.workspace = workspace
         self.baseInstructionsOverride = baseInstructionsOverride
         self.additionalDeveloperInstructions = additionalDeveloperInstructions
+        self.contextualUserInstructions = contextualUserInstructions
         self.tools = tools
         self.subagentOptions = subagentOptions
         self.webSearch = webSearch
@@ -76,6 +79,7 @@ public struct CodexSessionConfiguration: Sendable {
             workspace: workspace,
             baseInstructionsOverride: baseInstructionsOverride,
             additionalDeveloperInstructions: additionalDeveloperInstructions,
+            contextualUserInstructions: contextualUserInstructions,
             tools: tools,
             subagentOptions: subagentOptions,
             webSearch: webSearch,
@@ -95,6 +99,7 @@ public struct CodexSessionConfiguration: Sendable {
             workspace: workspace,
             baseInstructionsOverride: baseInstructionsOverride,
             additionalDeveloperInstructions: additionalDeveloperInstructions,
+            contextualUserInstructions: contextualUserInstructions,
             tools: tools + additionalTools,
             subagentOptions: subagentOptions,
             webSearch: webSearch,
@@ -402,7 +407,7 @@ public actor CodexSession {
         } else {
             reasoning = NSNull()
         }
-        let compactionInput = baseHistory + [
+        let compactionInput = requestInputHistory(from: baseHistory) + [
             Self.message(role: "user", textType: "input_text", text: Self.compactionSummaryPrompt)
         ]
         var input: [String: Any] = [
@@ -510,7 +515,7 @@ public actor CodexSession {
         var input: [String: Any] = [
             "model": options?.model ?? configuration.model,
             "instructions": buildInstructions(),
-            "input": history,
+            "input": requestInputHistory(),
             "tools": buildToolDefinitions(options: options),
             "stream": true,
             "store": false,
@@ -672,6 +677,26 @@ public actor CodexSession {
             .compactMap { $0 }
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
+    }
+
+    private func requestInputHistory(from items: [[String: Any]]? = nil) -> [[String: Any]] {
+        Self.requestInputHistory(
+            contextualUserInstructions: configuration.contextualUserInstructions,
+            history: items ?? history
+        )
+    }
+
+    static func requestInputHistory(
+        contextualUserInstructions: String?,
+        history: [[String: Any]]
+    ) -> [[String: Any]] {
+        let trimmedInstructions = contextualUserInstructions?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trimmedInstructions, !trimmedInstructions.isEmpty else {
+            return history
+        }
+        return [
+            message(role: "user", textType: "input_text", text: trimmedInstructions)
+        ] + history
     }
 
     private func buildToolDefinitions(options: CodexTurnOptions?) -> [[String: Any]] {

@@ -244,6 +244,30 @@ and jail enforcement while gaining a much broader in-process bash surface. The
 Rust mobile core remains the fallback shell emulator when `JustBash` is not
 available.
 
+## Load Project Instructions
+
+Use `CodexProjectInstructions` to mirror Codex's AGENTS.md project-doc behavior.
+The loader scans from the workspace root to the current directory, prefers
+`AGENTS.override.md` over `AGENTS.md` in each directory, and caps loaded bytes:
+
+```swift
+let instructions = try CodexProjectInstructions.load(
+    from: workspace.rootURL,
+    currentDirectoryURL: currentFileURL.deletingLastPathComponent()
+)
+```
+
+Pass the result as contextual user instructions so project docs are model-visible
+for the request without becoming part of persisted conversation history:
+
+```swift
+let configuration = CodexSessionConfiguration(
+    provider: provider,
+    workspace: workspace,
+    contextualUserInstructions: instructions?.text
+)
+```
+
 ## Start A Session
 
 `CodexSession` is the main harness object. It keeps conversation history,
@@ -260,6 +284,7 @@ let session = CodexSession(configuration: CodexSessionConfiguration(
     Inspect files with tools before answering workspace questions.
     """,
     additionalDeveloperInstructions: "Keep answers concise.",
+    contextualUserInstructions: instructions?.text,
     tools: [BuildNumberTool()],
     webSearch: CodexWebSearchOptions(mode: .cached, searchContextSize: .medium),
     compactionOptions: .automatic(triggerApproxTokens: 200_000)

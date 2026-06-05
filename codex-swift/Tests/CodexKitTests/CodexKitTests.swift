@@ -149,6 +149,75 @@ func sessionConfigurationAppendsAdditionalTools() {
 }
 
 @Test
+func sessionRequestInputPrependsContextualUserInstructionsWithoutMutatingHistory() {
+    let history = [
+        [
+            "type": "message",
+            "role": "user",
+            "content": [["type": "input_text", "text": "User task"]],
+        ]
+    ]
+    let input = CodexSession.requestInputHistory(
+        contextualUserInstructions: "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nProject rules\n</INSTRUCTIONS>",
+        history: history
+    )
+
+    #expect(input.count == 2)
+    #expect(input[0]["role"] as? String == "user")
+    #expect(((input[0]["content"] as? [[String: Any]])?.first?["text"] as? String)?.contains("Project rules") == true)
+    #expect(input[1]["role"] as? String == "user")
+    #expect(history.count == 1)
+}
+
+@Test
+func projectInstructionsLoadRootToCurrentDirectoryAndPreferOverride() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    let nested = root.appending(path: "Sources/App", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    try "root instructions".write(to: root.appending(path: "AGENTS.md"), atomically: true, encoding: .utf8)
+    try "shadowed".write(to: nested.appending(path: "AGENTS.md"), atomically: true, encoding: .utf8)
+    try "nested override".write(to: nested.appending(path: "AGENTS.override.md"), atomically: true, encoding: .utf8)
+
+    let loadedInstructions = try CodexProjectInstructions.load(
+        from: root,
+        currentDirectoryURL: nested
+    )
+    let instructions = try #require(loadedInstructions)
+
+    #expect(instructions.sources.map(\.lastPathComponent) == ["AGENTS.md", "AGENTS.override.md"])
+    #expect(instructions.text.hasPrefix("# AGENTS.md instructions for \(nested.path(percentEncoded: false))"))
+    #expect(instructions.text.contains("root instructions"))
+    #expect(instructions.text.contains("nested override"))
+    #expect(!instructions.text.contains("shadowed"))
+}
+
+@Test
+func projectInstructionsRespectByteLimitAcrossSources() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    let nested = root.appending(path: "Nested", directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    try "123456".write(to: root.appending(path: "AGENTS.md"), atomically: true, encoding: .utf8)
+    try "abcdef".write(to: nested.appending(path: "AGENTS.md"), atomically: true, encoding: .utf8)
+
+    let loadedInstructions = try CodexProjectInstructions.load(
+        from: root,
+        currentDirectoryURL: nested,
+        maxBytes: 8
+    )
+    let instructions = try #require(loadedInstructions)
+
+    #expect(instructions.text.contains("123456"))
+    #expect(instructions.text.contains("ab"))
+    #expect(!instructions.text.contains("abc"))
+}
+
+@Test
 func webSearchOptionsBuildHostedToolDefinition() throws {
     let webSearch = CodexWebSearchOptions(
         mode: .live,
