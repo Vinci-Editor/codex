@@ -1879,6 +1879,7 @@ public actor CodexSession {
         var payload: [String: Any] = [
             "agent_id": id,
             "task_name": childPath,
+            "status": SubagentStatus.running.rawValue,
         ]
         let modelSettings = Self.subagentModelSettingsPayload(options)
         if !modelSettings.isEmpty {
