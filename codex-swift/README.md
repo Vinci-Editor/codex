@@ -261,7 +261,8 @@ let session = CodexSession(configuration: CodexSessionConfiguration(
     """,
     additionalDeveloperInstructions: "Keep answers concise.",
     tools: [BuildNumberTool()],
-    webSearch: CodexWebSearchOptions(mode: .cached, searchContextSize: .medium)
+    webSearch: CodexWebSearchOptions(mode: .cached, searchContextSize: .medium),
+    compactionOptions: .automatic(triggerApproxTokens: 200_000)
 ))
 ```
 
@@ -357,6 +358,14 @@ recent user prompts and the generated handoff summary. Persist the new snapshot
 after a successful compaction. `CodexCompactionResult` reports the summary and
 the before/after history item counts for host UI.
 
+Apps can also opt into pre-turn automatic compaction with
+`CodexCompactionOptions.automatic(triggerApproxTokens:)`. When the approximate
+serialized history token count crosses the threshold, `CodexSession` compacts
+history before appending the next user message, then emits
+`.contextCompacted(CodexCompactionResult)` on that turn's stream. Hosts should
+persist the session snapshot after this event the same way they do after tool
+results or manual compaction.
+
 ## Stream A Turn
 
 `submit(userText:)` returns an `AsyncThrowingStream<CodexStreamEvent, Error>`.
@@ -405,6 +414,9 @@ for try await event in stream {
 
     case .webSearch(let call):
         showWebSearch(status: call.status, detail: call.detail)
+
+    case .contextCompacted(let result):
+        showCompaction(summary: result.summary)
 
     case .planUpdated(let plan):
         showPlan(plan)

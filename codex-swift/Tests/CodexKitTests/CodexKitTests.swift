@@ -129,6 +129,17 @@ func mobileBridgeBuildsResponsesRequest() throws {
 }
 
 @Test
+func sessionConfigurationPreservesAutomaticCompactionOptionsWhenAddingApprovalHandler() {
+    let configuration = CodexSessionConfiguration(
+        provider: .openAI,
+        compactionOptions: .automatic(triggerApproxTokens: 123_456)
+    )
+    let wrapped = configuration.withToolApprovalHandler { _ in .approve }
+
+    #expect(wrapped.compactionOptions.automaticTriggerApproxTokens == 123_456)
+}
+
+@Test
 func webSearchOptionsBuildHostedToolDefinition() throws {
     let webSearch = CodexWebSearchOptions(
         mode: .live,
@@ -221,6 +232,27 @@ func codexSessionBuildsCompactedHistoryFromUserMessagesAndSummary() throws {
     #expect(texts[0] == "Build a SwiftUI chat UI.")
     #expect(texts[1] == "Add context compaction.")
     #expect(texts[2] == "\(CodexSession.compactionSummaryPrefix)\nCompaction summary.")
+}
+
+@Test
+func codexSessionEstimatesHistoryTokensForAutomaticCompaction() {
+    let shortHistory: [[String: Any]] = [
+        [
+            "type": "message",
+            "role": "user",
+            "content": [["type": "input_text", "text": "short"]],
+        ],
+    ]
+    let longHistory: [[String: Any]] = [
+        [
+            "type": "message",
+            "role": "user",
+            "content": [["type": "input_text", "text": String(repeating: "x", count: 8_000)]],
+        ],
+    ]
+
+    #expect(CodexSession.approximateHistoryTokenCount(longHistory) > CodexSession.approximateHistoryTokenCount(shortHistory))
+    #expect(CodexSession.approximateHistoryTokenCount(longHistory) > 1_000)
 }
 
 #if os(macOS)

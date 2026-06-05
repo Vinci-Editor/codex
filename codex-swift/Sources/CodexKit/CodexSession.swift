@@ -4,6 +4,20 @@ import CodexMobileCoreBridge
 import ImageIO
 import UniformTypeIdentifiers
 
+public struct CodexCompactionOptions: Codable, Sendable, Equatable, Hashable {
+    public let automaticTriggerApproxTokens: Int?
+
+    public init(automaticTriggerApproxTokens: Int? = nil) {
+        self.automaticTriggerApproxTokens = automaticTriggerApproxTokens.map { max($0, 1) }
+    }
+
+    public static let disabled = CodexCompactionOptions()
+
+    public static func automatic(triggerApproxTokens: Int = 200_000) -> CodexCompactionOptions {
+        CodexCompactionOptions(automaticTriggerApproxTokens: triggerApproxTokens)
+    }
+}
+
 public struct CodexSessionConfiguration: Sendable {
     public let provider: CodexProvider
     public let model: String
@@ -16,6 +30,7 @@ public struct CodexSessionConfiguration: Sendable {
     public let tools: [any CodexTool]
     public let subagentOptions: CodexSubagentOptions
     public let webSearch: CodexWebSearchOptions?
+    public let compactionOptions: CodexCompactionOptions
     public let urlSession: URLSession
     public let toolApprovalHandler: CodexToolApprovalHandler?
 
@@ -31,6 +46,7 @@ public struct CodexSessionConfiguration: Sendable {
         tools: [any CodexTool] = [],
         subagentOptions: CodexSubagentOptions = .disabled,
         webSearch: CodexWebSearchOptions? = nil,
+        compactionOptions: CodexCompactionOptions = .disabled,
         urlSession: URLSession = .shared,
         toolApprovalHandler: CodexToolApprovalHandler? = nil
     ) {
@@ -45,6 +61,7 @@ public struct CodexSessionConfiguration: Sendable {
         self.tools = tools
         self.subagentOptions = subagentOptions
         self.webSearch = webSearch
+        self.compactionOptions = compactionOptions
         self.urlSession = urlSession
         self.toolApprovalHandler = toolApprovalHandler
     }
@@ -62,6 +79,7 @@ public struct CodexSessionConfiguration: Sendable {
             tools: tools,
             subagentOptions: subagentOptions,
             webSearch: webSearch,
+            compactionOptions: compactionOptions,
             urlSession: urlSession,
             toolApprovalHandler: handler
         )
@@ -153,6 +171,7 @@ public enum CodexStreamEvent: Sendable, Equatable {
     case completed(Data, CodexTokenUsage?)
     case planUpdated(CodexPlanUpdate)
     case webSearch(CodexWebSearchCall)
+    case contextCompacted(CodexCompactionResult)
     case toolCall(CodexToolCall)
     case toolResult(CodexToolCall, String, Bool)
     case error(String)
@@ -246,17 +265,7 @@ public actor CodexSession {
             throw CodexSessionError.compactionUnavailable("No session history to compact.")
         }
 
-        let originalHistory = history
-        let summary = try await requestCompactionSummary(from: originalHistory, options: options)
-        let normalizedSummary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        let finalSummary = normalizedSummary.isEmpty ? "(no summary available)" : normalizedSummary
-        let compactedHistory = Self.compactedHistory(summary: finalSummary, from: originalHistory)
-        history = compactedHistory
-        return CodexCompactionResult(
-            summary: finalSummary,
-            originalItemCount: originalHistory.count,
-            compactedItemCount: compactedHistory.count
-        )
+        return try await performCompaction(options: options)
     }
 
     public func executeToolCall(_ call: CodexToolCall) async throws -> Data {
@@ -301,6 +310,10 @@ public actor CodexSession {
         options: CodexTurnOptions?,
         continuation: AsyncThrowingStream<CodexStreamEvent, Error>.Continuation
     ) async throws {
+        if let compactionResult = try await automaticCompactionIfNeeded(options: options) {
+            continuation.yield(.contextCompacted(compactionResult))
+        }
+
         history.append([
             "type": "message",
             "role": "user",
@@ -335,6 +348,29 @@ public actor CodexSession {
         }
 
         throw CodexSessionError.toolLoopLimitExceeded
+    }
+
+    private func automaticCompactionIfNeeded(options: CodexTurnOptions?) async throws -> CodexCompactionResult? {
+        guard let trigger = configuration.compactionOptions.automaticTriggerApproxTokens,
+              trigger > 0,
+              Self.approximateHistoryTokenCount(history) >= trigger else {
+            return nil
+        }
+        return try await performCompaction(options: options)
+    }
+
+    private func performCompaction(options: CodexTurnOptions?) async throws -> CodexCompactionResult {
+        let originalHistory = history
+        let summary = try await requestCompactionSummary(from: originalHistory, options: options)
+        let normalizedSummary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalSummary = normalizedSummary.isEmpty ? "(no summary available)" : normalizedSummary
+        let compactedHistory = Self.compactedHistory(summary: finalSummary, from: originalHistory)
+        history = compactedHistory
+        return CodexCompactionResult(
+            summary: finalSummary,
+            originalItemCount: originalHistory.count,
+            compactedItemCount: compactedHistory.count
+        )
     }
 
     private func requestCompactionSummary(
@@ -1884,6 +1920,13 @@ public actor CodexSession {
 
     private static func isCompactionSummaryMessage(_ message: String) -> Bool {
         message.hasPrefix("\(compactionSummaryPrefix)\n")
+    }
+
+    static func approximateHistoryTokenCount(_ history: [[String: Any]]) -> Int {
+        guard let data = try? JSONSerialization.data(withJSONObject: history, options: []) else {
+            return 0
+        }
+        return approximateTokenCount(String(decoding: data, as: UTF8.self))
     }
 
     private static func approximateTokenCount(_ text: String) -> Int {
