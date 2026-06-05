@@ -439,7 +439,8 @@ func sessionExecutesBuiltinWorkspaceTools() async throws {
     let session = CodexSession(configuration: CodexSessionConfiguration(
         provider: .lmStudio(),
         model: "local-model",
-        workspace: CodexWorkspace(rootURL: root)
+        workspace: CodexWorkspace(rootURL: root),
+        toolApprovalHandler: { _ in .approve }
     ))
     let listData = try await session.executeToolCall(CodexToolCall(
         callID: "call-list",
@@ -500,6 +501,28 @@ func sessionExecutesBuiltinWorkspaceTools() async throws {
 
     #expect(writeOutput.contains("Wrote written.txt"))
     #expect(try String(contentsOf: root.appending(path: "written.txt"), encoding: .utf8) == "written\n")
+}
+
+@Test
+func mutatingBuiltinWorkspaceToolsRequireApproval() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let session = CodexSession(configuration: CodexSessionConfiguration(
+        provider: .lmStudio(),
+        model: "local-model",
+        workspace: CodexWorkspace(rootURL: root)
+    ))
+    let data = try await session.executeToolCall(CodexToolCall(
+        callID: "call-write",
+        name: "write_file",
+        arguments: try jsonString(["path": "denied.txt", "content": "denied\n"])
+    ))
+    let output = try toolOutputBody(data)
+
+    #expect(output.contains("approval is required"))
+    #expect(!FileManager.default.fileExists(atPath: root.appending(path: "denied.txt").path))
 }
 
 private func jwt(payload: [String: Any]) throws -> String {

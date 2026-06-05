@@ -12,6 +12,7 @@ public struct CodexSessionConfiguration: Sendable {
     public let additionalDeveloperInstructions: String?
     public let tools: [any CodexTool]
     public let urlSession: URLSession
+    public let toolApprovalHandler: CodexToolApprovalHandler?
 
     public init(
         provider: CodexProvider = .openAI,
@@ -23,7 +24,8 @@ public struct CodexSessionConfiguration: Sendable {
         baseInstructionsOverride: String? = nil,
         additionalDeveloperInstructions: String? = nil,
         tools: [any CodexTool] = [],
-        urlSession: URLSession = .shared
+        urlSession: URLSession = .shared,
+        toolApprovalHandler: CodexToolApprovalHandler? = nil
     ) {
         self.provider = provider
         self.model = model
@@ -35,6 +37,23 @@ public struct CodexSessionConfiguration: Sendable {
         self.additionalDeveloperInstructions = additionalDeveloperInstructions
         self.tools = tools
         self.urlSession = urlSession
+        self.toolApprovalHandler = toolApprovalHandler
+    }
+
+    public func withToolApprovalHandler(_ handler: CodexToolApprovalHandler?) -> CodexSessionConfiguration {
+        CodexSessionConfiguration(
+            provider: provider,
+            model: model,
+            authStore: authStore,
+            apiKeyStore: apiKeyStore,
+            chatGPTAuthenticator: chatGPTAuthenticator,
+            workspace: workspace,
+            baseInstructionsOverride: baseInstructionsOverride,
+            additionalDeveloperInstructions: additionalDeveloperInstructions,
+            tools: tools,
+            urlSession: urlSession,
+            toolApprovalHandler: handler
+        )
     }
 }
 
@@ -551,6 +570,10 @@ public actor CodexSession {
         _ call: CodexToolCall,
         progress: CodexToolProgressHandler? = nil
     ) async throws -> CodexToolResult {
+        if let deniedResult = await deniedToolResultIfNeeded(for: call) {
+            return deniedResult
+        }
+
         if let tool = toolsByName[call.name] {
             if let streamingTool = tool as? any CodexStreamingTool {
                 return try await streamingTool.execute(
@@ -580,6 +603,68 @@ public actor CodexSession {
             return try executeWriteFile(call)
         default:
             throw CodexSessionError.unknownTool(call.name)
+        }
+    }
+
+    private func deniedToolResultIfNeeded(for call: CodexToolCall) async -> CodexToolResult? {
+        guard case .required(let reason) = approvalRequirement(for: call) else {
+            return nil
+        }
+
+        let request = CodexToolApprovalRequest(
+            call: call,
+            reason: reason,
+            summary: approvalSummary(for: call, reason: reason)
+        )
+        guard let toolApprovalHandler = configuration.toolApprovalHandler else {
+            return CodexToolResult(
+                output: "Denied \(call.name): approval is required, but the host app did not provide an approval handler.",
+                success: false
+            )
+        }
+
+        switch await toolApprovalHandler(request) {
+        case .approve:
+            return nil
+        case .deny(let message):
+            let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            return CodexToolResult(
+                output: trimmed.isEmpty ? "Denied \(call.name)." : "Denied \(call.name): \(trimmed)",
+                success: false
+            )
+        }
+    }
+
+    private func approvalRequirement(for call: CodexToolCall) -> CodexToolApprovalRequirement {
+        if let tool = toolsByName[call.name] {
+            return tool.approvalRequirement(for: call)
+        }
+
+        switch call.name {
+        case "apply_patch":
+            return .required(reason: "Apply file edits in the workspace.")
+        case "write_file":
+            return .required(reason: "Write a file in the workspace.")
+        case "shell_command", "exec_command":
+            return .required(reason: "Run a shell command in the workspace.")
+        default:
+            return .none
+        }
+    }
+
+    private func approvalSummary(for call: CodexToolCall, reason: String) -> String {
+        let arguments = (try? Self.decodeArguments(call.arguments)) ?? [:]
+        switch call.name {
+        case "apply_patch":
+            return "Apply patch"
+        case "write_file":
+            let path = arguments["path"] as? String ?? arguments["file_path"] as? String
+            return path.map { "Write \($0)" } ?? reason
+        case "shell_command", "exec_command":
+            let command = arguments["command"] as? String ?? arguments["cmd"] as? String
+            return command.map { "Run \($0)" } ?? reason
+        default:
+            return reason
         }
     }
 

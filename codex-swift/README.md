@@ -267,6 +267,41 @@ the same configuration.
 The default model is `gpt-5.4`. Override it in `CodexSessionConfiguration` for a
 long-lived session default or per turn with `CodexTurnOptions`.
 
+## Approve Mutating Tools
+
+`CodexKit` asks the host app for approval before running built-in tools that can
+change the workspace or execute commands: `apply_patch`, `write_file`,
+`shell_command`, and `exec_command`. If no approval handler is configured, those
+tools return a failed tool result instead of running.
+
+```swift
+let session = CodexSession(configuration: CodexSessionConfiguration(
+    provider: provider,
+    model: model,
+    authStore: authStore,
+    workspace: workspace,
+    toolApprovalHandler: { request in
+        let approved = await showApprovalPrompt(
+            title: request.summary,
+            message: request.reason
+        )
+        return approved ? .approve : .deny("Denied by user.")
+    }
+))
+```
+
+Custom Swift tools can opt into the same flow by overriding
+`approvalRequirement(for:)`:
+
+```swift
+func approvalRequirement(for call: CodexToolCall) -> CodexToolApprovalRequirement {
+    .required(reason: "Publish changes to the project repository.")
+}
+```
+
+A denial is sent back to the model as a normal unsuccessful tool result, so the
+turn can continue with an explanation or a safer alternative.
+
 ## Persist A Session
 
 Apps that own their own chat history can snapshot the session's canonical

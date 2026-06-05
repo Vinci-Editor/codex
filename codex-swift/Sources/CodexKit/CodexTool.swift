@@ -37,6 +37,7 @@ public protocol CodexTool: Sendable {
     var inputSchema: [String: any Sendable] { get }
     var supportsParallelCalls: Bool { get }
 
+    func approvalRequirement(for call: CodexToolCall) -> CodexToolApprovalRequirement
     func execute(call: CodexToolCall, context: CodexToolContext) async throws -> CodexToolResult
 }
 
@@ -70,6 +71,10 @@ public protocol CodexStreamingTool: CodexTool {
 
 public extension CodexTool {
     var supportsParallelCalls: Bool { true }
+
+    func approvalRequirement(for call: CodexToolCall) -> CodexToolApprovalRequirement {
+        .none
+    }
 
     func responsesToolDefinition() -> [String: Any] {
         [
