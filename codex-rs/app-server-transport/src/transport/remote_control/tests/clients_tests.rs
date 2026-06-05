@@ -24,11 +24,8 @@ fn client_management_handle(
         enabled_tx: Arc::new(enabled_tx),
         status_tx: Arc::new(status_tx),
         state_db_available: false,
-        state_db: None,
         remote_control_url,
-        current_enrollment: Arc::new(RemoteControlEnrollmentState::new(/*enrollment*/ None)),
-        pairing_persistence_key: watch::channel(None).0,
-        pairing_persistence_key_required: false,
+        current_enrollment: Arc::new(StdMutex::new(None)),
         auth_manager,
     }
 }

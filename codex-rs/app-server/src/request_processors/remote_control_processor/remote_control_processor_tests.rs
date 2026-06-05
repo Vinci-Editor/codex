@@ -6,10 +6,7 @@ use pretty_assertions::assert_eq;
 #[tokio::test]
 async fn pairing_start_returns_internal_error_when_remote_control_is_unavailable() {
     let err = RemoteControlRequestProcessor::new(/*remote_control_handle*/ None)
-        .pairing_start(
-            RemoteControlPairingStartParams::default(),
-            /*app_server_client_name*/ None,
-        )
+        .pairing_start(RemoteControlPairingStartParams::default())
         .await
         .expect_err("missing remote control should fail pairing");
 
