@@ -15,6 +15,7 @@ public struct CodexSessionConfiguration: Sendable {
     public let additionalDeveloperInstructions: String?
     public let tools: [any CodexTool]
     public let subagentOptions: CodexSubagentOptions
+    public let webSearch: CodexWebSearchOptions?
     public let urlSession: URLSession
     public let toolApprovalHandler: CodexToolApprovalHandler?
 
@@ -29,6 +30,7 @@ public struct CodexSessionConfiguration: Sendable {
         additionalDeveloperInstructions: String? = nil,
         tools: [any CodexTool] = [],
         subagentOptions: CodexSubagentOptions = .disabled,
+        webSearch: CodexWebSearchOptions? = nil,
         urlSession: URLSession = .shared,
         toolApprovalHandler: CodexToolApprovalHandler? = nil
     ) {
@@ -42,6 +44,7 @@ public struct CodexSessionConfiguration: Sendable {
         self.additionalDeveloperInstructions = additionalDeveloperInstructions
         self.tools = tools
         self.subagentOptions = subagentOptions
+        self.webSearch = webSearch
         self.urlSession = urlSession
         self.toolApprovalHandler = toolApprovalHandler
     }
@@ -58,6 +61,7 @@ public struct CodexSessionConfiguration: Sendable {
             additionalDeveloperInstructions: additionalDeveloperInstructions,
             tools: tools,
             subagentOptions: subagentOptions,
+            webSearch: webSearch,
             urlSession: urlSession,
             toolApprovalHandler: handler
         )
@@ -70,6 +74,7 @@ public struct CodexOutputItem: Sendable, Equatable {
         case reasoning
         case functionCall
         case customToolCall
+        case webSearchCall
         case unknown
     }
 
@@ -117,6 +122,24 @@ public struct CodexOutputItem: Sendable, Equatable {
     }
 }
 
+public struct CodexWebSearchCall: Sendable, Codable, Equatable, Hashable, Identifiable {
+    public let id: String
+    public let status: String?
+    public let actionType: String
+    public let detail: String
+
+    public init(id: String, status: String? = nil, actionType: String = "other", detail: String = "") {
+        self.id = id
+        self.status = status
+        self.actionType = actionType
+        self.detail = detail
+    }
+
+    public var isCompleted: Bool {
+        status == nil || status == "completed"
+    }
+}
+
 public enum CodexStreamEvent: Sendable, Equatable {
     case created
     case outputItemStarted(CodexOutputItem)
@@ -129,6 +152,7 @@ public enum CodexStreamEvent: Sendable, Equatable {
     case outputItemDone(Data)
     case completed(Data, CodexTokenUsage?)
     case planUpdated(CodexPlanUpdate)
+    case webSearch(CodexWebSearchCall)
     case toolCall(CodexToolCall)
     case toolResult(CodexToolCall, String, Bool)
     case error(String)
@@ -410,6 +434,11 @@ public actor CodexSession {
                 if let item = normalized["item"] as? [String: Any] {
                     history.append(item)
                 }
+            case .webSearch:
+                if normalized["type"] as? String == "outputItemDone",
+                   let item = normalized["item"] as? [String: Any] {
+                    history.append(item)
+                }
             default:
                 break
             }
@@ -448,9 +477,19 @@ public actor CodexSession {
             }
             return supportsImages
         }
-        return builtinTools
+        return hostedToolDefinitions(options: options)
+            + builtinTools
             + subagentToolDefinitions()
             + configuration.tools.map { $0.responsesToolDefinition() }
+    }
+
+    private func hostedToolDefinitions(options: CodexTurnOptions?) -> [[String: Any]] {
+        guard configuration.provider.id == "openai",
+              let webSearch = options?.webSearch ?? configuration.webSearch,
+              webSearch.isEnabled else {
+            return []
+        }
+        return [webSearch.responsesToolDefinition]
     }
 
     private static func modelSupportsImages(inputModalities: [String]?) -> Bool {
@@ -630,11 +669,17 @@ public actor CodexSession {
                 delta: normalized["delta"] as? String ?? ""
             )
         case "outputItemAdded":
+            if let webSearch = webSearchCall(from: normalized["item"]) {
+                return .webSearch(webSearch)
+            }
             if let item = outputItem(from: normalized["item"]) {
                 return .outputItemStarted(item)
             }
             return .outputItemAdded(normalizedData)
         case "outputItemDone":
+            if let webSearch = webSearchCall(from: normalized["item"]) {
+                return .webSearch(webSearch)
+            }
             if let item = outputItem(from: normalized["item"]) {
                 return .outputItemCompleted(item)
             }
@@ -672,6 +717,8 @@ public actor CodexSession {
             kind = .functionCall
         case "custom_tool_call":
             kind = .customToolCall
+        case "web_search_call":
+            kind = .webSearchCall
         default:
             kind = .unknown
         }
@@ -705,6 +752,58 @@ public actor CodexSession {
             return part["text"] as? String
         }.joined()
         return text.isEmpty ? nil : text
+    }
+
+    private static func webSearchCall(from item: Any?) -> CodexWebSearchCall? {
+        guard let item = item as? [String: Any],
+              item["type"] as? String == "web_search_call",
+              let id = item["id"] as? String,
+              !id.isEmpty else {
+            return nil
+        }
+        let action = item["action"] as? [String: Any]
+        let actionType = action?["type"] as? String ?? "other"
+        return CodexWebSearchCall(
+            id: id,
+            status: item["status"] as? String,
+            actionType: actionType,
+            detail: webSearchDetail(action: action)
+        )
+    }
+
+    private static func webSearchDetail(action: [String: Any]?) -> String {
+        guard let action else {
+            return ""
+        }
+        switch action["type"] as? String {
+        case "search":
+            if let query = action["query"] as? String, !query.isEmpty {
+                return query
+            }
+            if let queries = action["queries"] as? [String], !queries.isEmpty {
+                return queries.joined(separator: ", ")
+            }
+        case "open_page":
+            if let url = action["url"] as? String {
+                return url
+            }
+        case "find_in_page":
+            let pattern = action["pattern"] as? String
+            let url = action["url"] as? String
+            switch (pattern, url) {
+            case (.some(let pattern), .some(let url)):
+                return "'\(pattern)' in \(url)"
+            case (.some(let pattern), .none):
+                return pattern
+            case (.none, .some(let url)):
+                return url
+            case (.none, .none):
+                break
+            }
+        default:
+            break
+        }
+        return ""
     }
 
     private static func toolCall(from item: Any?) -> CodexToolCall? {

@@ -260,7 +260,8 @@ let session = CodexSession(configuration: CodexSessionConfiguration(
     Inspect files with tools before answering workspace questions.
     """,
     additionalDeveloperInstructions: "Keep answers concise.",
-    tools: [BuildNumberTool()]
+    tools: [BuildNumberTool()],
+    webSearch: CodexWebSearchOptions(mode: .cached, searchContextSize: .medium)
 ))
 ```
 
@@ -352,7 +353,8 @@ let options = CodexTurnOptions(
     serviceTier: "flex",
     toolChoice: "auto",
     parallelToolCalls: true,
-    inputModalities: ["text", "image"]
+    inputModalities: ["text", "image"],
+    webSearch: CodexWebSearchOptions(mode: .disabled)
 )
 
 let stream = await session.submit(
@@ -383,6 +385,9 @@ for try await event in stream {
 
     case .toolResult(let call, let output, let success):
         showToolFinished(name: call.name, output: output, success: success)
+
+    case .webSearch(let call):
+        showWebSearch(status: call.status, detail: call.detail)
 
     case .planUpdated(let plan):
         showPlan(plan)
@@ -415,6 +420,11 @@ the stream when the user stops a turn or leaves the screen.
 
 `CodexKit` exposes a Codex-compatible default tool surface:
 
+- Hosted `web_search`: pass `CodexWebSearchOptions` in
+  `CodexSessionConfiguration` to add the Responses hosted web-search tool for
+  OpenAI-backed turns. Use `.cached` for cached search or `.live` to allow live
+  external web access. `CodexTurnOptions.webSearch` can override the session
+  default for one turn, including `.disabled` for review-only workflows.
 - `list_dir`: lists entries inside the selected workspace.
 - `read_file`: reads UTF-8 text files inside the selected workspace without
   going through shell.

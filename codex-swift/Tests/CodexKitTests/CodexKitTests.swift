@@ -128,6 +128,56 @@ func mobileBridgeBuildsResponsesRequest() throws {
     #expect(value?["prompt_cache_key"] as? String == "conversation-1")
 }
 
+@Test
+func webSearchOptionsBuildHostedToolDefinition() throws {
+    let webSearch = CodexWebSearchOptions(
+        mode: .live,
+        searchContextSize: .high,
+        allowedDomains: ["developer.apple.com"]
+    )
+    let body = try CodexMobileCoreBridge.buildResponsesRequest([
+        "model": "gpt-5.4",
+        "input": [],
+        "tools": [webSearch.responsesToolDefinition],
+        "stream": true,
+        "store": false,
+    ])
+    let value = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+    let tool = (value?["tools"] as? [[String: Any]])?.first
+    let filters = tool?["filters"] as? [String: Any]
+
+    #expect(tool?["type"] as? String == "web_search")
+    #expect(tool?["external_web_access"] as? Bool == true)
+    #expect(tool?["search_context_size"] as? String == "high")
+    #expect(filters?["allowed_domains"] as? [String] == ["developer.apple.com"])
+}
+
+@Test
+func codexSessionDecodesWebSearchEvents() throws {
+    let event = try CodexSession.decodeStreamEvent([
+        "type": "outputItemDone",
+        "item": [
+            "id": "ws_1",
+            "type": "web_search_call",
+            "status": "completed",
+            "action": [
+                "type": "find_in_page",
+                "url": "https://developer.apple.com/documentation/swiftui",
+                "pattern": "NavigationSplitView",
+            ],
+        ],
+    ])
+
+    guard case .webSearch(let call) = event else {
+        Issue.record("Expected webSearch event, got \(event)")
+        return
+    }
+    #expect(call.id == "ws_1")
+    #expect(call.isCompleted)
+    #expect(call.actionType == "find_in_page")
+    #expect(call.detail == "'NavigationSplitView' in https://developer.apple.com/documentation/swiftui")
+}
+
 #if os(macOS)
 @Test
 func mobileBridgeAppliesPatchWithoutMobileCoreOnMacOS() throws {

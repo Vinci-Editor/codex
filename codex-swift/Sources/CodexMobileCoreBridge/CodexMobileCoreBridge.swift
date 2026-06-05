@@ -1328,20 +1328,39 @@ public enum CodexMobileCoreBridge {
     }
 
     private static func fallbackAuthorizationCodeTokenRequest(_ input: [String: Any]) -> [String: Any] {
-        var components = URLComponents()
-        components.queryItems = [
-            URLQueryItem(name: "grant_type", value: "authorization_code"),
-            URLQueryItem(name: "code", value: input["code"] as? String),
-            URLQueryItem(name: "redirect_uri", value: input["redirectUri"] as? String),
-            URLQueryItem(name: "client_id", value: input["clientId"] as? String),
-            URLQueryItem(name: "code_verifier", value: input["codeVerifier"] as? String),
-        ]
+        let body = formEncoded([
+            ("grant_type", "authorization_code"),
+            ("code", input["code"] as? String),
+            ("redirect_uri", input["redirectUri"] as? String),
+            ("client_id", input["clientId"] as? String),
+            ("code_verifier", input["codeVerifier"] as? String),
+        ])
         return [
             "path": "/oauth/token",
             "method": "POST",
             "headers": ["Content-Type": "application/x-www-form-urlencoded"],
-            "body": components.percentEncodedQuery ?? "",
+            "body": body,
         ]
+    }
+
+    private static func formEncoded(_ pairs: [(String, String?)]) -> String {
+        pairs.map { key, value in
+            "\(formPercentEncoded(key))=\(formPercentEncoded(value ?? ""))"
+        }
+        .joined(separator: "&")
+    }
+
+    private static func formPercentEncoded(_ value: String) -> String {
+        let allowed = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~".utf8)
+        var encoded = ""
+        for byte in value.utf8 {
+            if allowed.contains(byte) {
+                encoded.append(Character(UnicodeScalar(byte)))
+            } else {
+                encoded += String(format: "%%%02X", byte)
+            }
+        }
+        return encoded
     }
 
     private static func fallbackParseChatGPTTokenClaims(token: String) throws -> [String: Any] {
