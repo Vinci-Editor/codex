@@ -427,7 +427,8 @@ public actor CodexSession {
         _ status: CodexSubagentStatus,
         to handler: CodexSubagentStatusHandler?
     ) async {
-        await subagentRegistry.update(status)
+        let owner = subagents[status.agentID]?.path == status.path ? self : nil
+        await subagentRegistry.update(status, owner: owner)
         if let handler {
             await handler(status)
         }
@@ -2375,6 +2376,9 @@ public actor CodexSession {
         guard !message.isEmpty else {
             return CodexToolResult(output: "Missing message.", success: false)
         }
+        if subagentID(for: target) == nil, let owner = await routedSubagentOwner(for: target) {
+            return try await owner.executeSendMessage(call, subagentStatus: subagentStatus)
+        }
         guard let id = subagentID(for: target), var record = subagents[id] else {
             return CodexToolResult(output: "\(target): agent not found.", success: false)
         }
@@ -2405,6 +2409,13 @@ public actor CodexSession {
         let interrupt = Self.boolValue(arguments["interrupt"])
         guard !message.isEmpty else {
             return CodexToolResult(output: "Missing message or text input items.", success: false)
+        }
+        if subagentID(for: target) == nil, let owner = await routedSubagentOwner(for: target) {
+            return try await owner.executeSendInput(
+                call,
+                subagentStatus: subagentStatus,
+                subagentEvent: subagentEvent
+            )
         }
         guard let id = subagentID(for: target), var record = subagents[id] else {
             return CodexToolResult(output: "\(target): agent not found.", success: false)
@@ -2459,6 +2470,9 @@ public actor CodexSession {
         }
         let arguments = try Self.decodeArguments(call.arguments)
         let target = arguments["id"] as? String ?? arguments["target"] as? String ?? ""
+        if subagentID(for: target) == nil, let owner = await routedSubagentOwner(for: target) {
+            return try await owner.executeResumeAgent(call, subagentStatus: subagentStatus)
+        }
         guard let id = subagentID(for: target), var record = subagents[id] else {
             return CodexToolResult(output: "\(target): agent not found.", success: false)
         }
@@ -2493,6 +2507,13 @@ public actor CodexSession {
         let message = (arguments["message"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else {
             return CodexToolResult(output: "Missing message.", success: false)
+        }
+        if subagentID(for: target) == nil, let owner = await routedSubagentOwner(for: target) {
+            return try await owner.executeFollowupTask(
+                call,
+                subagentStatus: subagentStatus,
+                subagentEvent: subagentEvent
+            )
         }
         guard let id = subagentID(for: target), var record = subagents[id] else {
             return CodexToolResult(output: "\(target): agent not found.", success: false)
@@ -2532,6 +2553,11 @@ public actor CodexSession {
         let arguments = try Self.decodeArguments(call.arguments)
         let target = arguments["target"] as? String
         let timeout = waitTimeoutMilliseconds(from: arguments)
+        if let target, !target.isEmpty,
+           subagentID(for: target) == nil,
+           let owner = await routedSubagentOwner(for: target) {
+            return try await owner.executeWaitAgent(call)
+        }
 
         let id: String?
         if let target, !target.isEmpty {
@@ -2586,6 +2612,9 @@ public actor CodexSession {
         }
         let arguments = try Self.decodeArguments(call.arguments)
         let target = arguments["target"] as? String ?? ""
+        if subagentID(for: target) == nil, let owner = await routedSubagentOwner(for: target) {
+            return try await owner.executeCloseAgent(call, subagentStatus: subagentStatus)
+        }
         guard let id = subagentID(for: target), var record = subagents[id] else {
             return CodexToolResult(output: "\(target): agent not found.", success: false)
         }
@@ -2796,6 +2825,16 @@ public actor CodexSession {
         }
         let canonical = target.hasPrefix("/") ? target : Self.subagentPath(parent: agentPath, taskName: target)
         return subagents.values.first(where: { $0.path == canonical })?.id
+    }
+
+    private func routedSubagentOwner(for rawTarget: String) async -> CodexSession? {
+        let target = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty,
+              let owner = await subagentRegistry.owner(for: target, relativeTo: agentPath),
+              owner !== self else {
+            return nil
+        }
+        return owner
     }
 
     private func subagentRole(named name: String) -> CodexSubagentRole? {
@@ -3445,6 +3484,7 @@ private actor CodexSubagentRegistry {
     private var openAgentIDs: Set<String> = []
     private var statusByID: [String: CodexSubagentStatus] = [:]
     private var orderByID: [String: Int] = [:]
+    private var ownerByID: [String: WeakCodexSessionReference] = [:]
 
     func reserveAgent(maxOpenAgents: Int) -> String? {
         guard openAgentIDs.count < maxOpenAgents else {
@@ -3472,8 +3512,11 @@ private actor CodexSubagentRegistry {
         return true
     }
 
-    func update(_ status: CodexSubagentStatus) {
+    func update(_ status: CodexSubagentStatus, owner: CodexSession? = nil) {
         statusByID[status.agentID] = status
+        if let owner {
+            ownerByID[status.agentID] = WeakCodexSessionReference(owner)
+        }
         if orderByID[status.agentID] == nil {
             sequence += 1
             orderByID[status.agentID] = sequence
@@ -3483,6 +3526,24 @@ private actor CodexSubagentRegistry {
         } else {
             openAgentIDs.insert(status.agentID)
         }
+    }
+
+    func owner(for rawTarget: String, relativeTo agentPath: String) -> CodexSession? {
+        let target = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else {
+            return nil
+        }
+        if let owner = ownerByID[target]?.session {
+            return owner
+        }
+
+        let path = target.hasPrefix("/")
+            ? target
+            : (agentPath == "/" ? "/\(target)" : "\(agentPath)/\(target)")
+        guard let status = statusByID.values.first(where: { $0.path == path }) else {
+            return nil
+        }
+        return ownerByID[status.agentID]?.session
     }
 
     func statusSnapshot() -> [CodexSubagentStatus] {
@@ -3496,6 +3557,14 @@ private actor CodexSubagentRegistry {
                 }
                 return lhs.path < rhs.path
             }
+    }
+}
+
+private final class WeakCodexSessionReference: @unchecked Sendable {
+    weak var session: CodexSession?
+
+    init(_ session: CodexSession) {
+        self.session = session
     }
 }
 

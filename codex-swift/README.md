@@ -330,7 +330,10 @@ Spawned agents inherit the same configuration, workspace, registered tools,
 approval handler, and auth context. `fork_turns` can be `none`, `all`, or a
 positive integer string to control how much parent history is copied into the
 child session. Set `maxDepth` to cap recursive agent nesting; `nil` leaves
-nesting unlimited.
+nesting unlimited. Targeted tools accept direct child IDs, descendant agent IDs,
+and canonical task paths such as `/task/subtask`, so a parent session can route
+messages, follow-ups, waits, resumes, and closes to nested agents discovered via
+`list_agents`.
 
 `spawn_agent` accepts `agent_type` for configured roles. Roles can add
 role-specific developer instructions, lock a child model/reasoning/service tier,
