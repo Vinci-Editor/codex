@@ -5,8 +5,8 @@ import ImageIO
 import UniformTypeIdentifiers
 
 private let maxSubagentModelOverrideDescriptions = 8
-private typealias CodexSubagentStatusHandler = @Sendable (CodexSubagentStatus) -> Void
-private typealias CodexSubagentEventHandler = @Sendable (CodexSubagentEvent) -> Void
+private typealias CodexSubagentStatusHandler = @Sendable (CodexSubagentStatus) async -> Void
+private typealias CodexSubagentEventHandler = @Sendable (CodexSubagentEvent) async -> Void
 
 public struct CodexCompactionOptions: Codable, Sendable, Equatable, Hashable {
     public let automaticTriggerApproxTokens: Int?
@@ -300,6 +300,7 @@ public actor CodexSession {
     private let toolsByName: [String: any CodexTool]
     private var subagents: [String: SubagentRecord] = [:]
     private var subagentSequence = 0
+    private var subagentEventContinuations: [UUID: AsyncStream<CodexStreamEvent>.Continuation] = [:]
     private var activeTurnOptions: CodexTurnOptions?
     private var approvedShellPrefixRules: [[String]] = []
 
@@ -336,6 +337,76 @@ public actor CodexSession {
     public func snapshot() throws -> CodexSessionSnapshot {
         let data = try JSONSerialization.data(withJSONObject: history, options: [.sortedKeys])
         return CodexSessionSnapshot(historyJSON: data)
+    }
+
+    public nonisolated func subagentEvents() -> AsyncStream<CodexStreamEvent> {
+        AsyncStream { continuation in
+            let id = UUID()
+            Task {
+                await self.addSubagentEventContinuation(id: id, continuation: continuation)
+            }
+            continuation.onTermination = { _ in
+                Task {
+                    await self.removeSubagentEventContinuation(id: id)
+                }
+            }
+        }
+    }
+
+    public func cancelSubagents() {
+        for id in Array(subagents.keys) {
+            guard var record = subagents[id] else {
+                continue
+            }
+            record.task?.cancel()
+            record.task = nil
+            if record.status == .running {
+                record.status = .failed
+                record.errorMessage = "cancelled"
+            }
+            subagents[id] = record
+            yieldSubagentStreamEvent(.subagentStatus(Self.subagentStatus(record)))
+        }
+    }
+
+    private func addSubagentEventContinuation(
+        id: UUID,
+        continuation: AsyncStream<CodexStreamEvent>.Continuation
+    ) {
+        subagentEventContinuations[id] = continuation
+        for record in subagents.values.sorted(by: { $0.createdOrder < $1.createdOrder }) {
+            continuation.yield(.subagentStatus(Self.subagentStatus(record)))
+        }
+    }
+
+    private func removeSubagentEventContinuation(id: UUID) {
+        subagentEventContinuations[id] = nil
+    }
+
+    private func yieldSubagentStreamEvent(_ event: CodexStreamEvent) {
+        for continuation in subagentEventContinuations.values {
+            continuation.yield(event)
+        }
+    }
+
+    private func emitSubagentStatus(
+        _ status: CodexSubagentStatus,
+        to handler: CodexSubagentStatusHandler?
+    ) async {
+        if let handler {
+            await handler(status)
+        }
+        yieldSubagentStreamEvent(.subagentStatus(status))
+    }
+
+    private func emitSubagentEvent(
+        _ event: CodexSubagentEvent,
+        to handler: CodexSubagentEventHandler?
+    ) async {
+        if let handler {
+            await handler(event)
+        }
+        yieldSubagentStreamEvent(.subagentEvent(event))
     }
 
     public func compactHistory(options: CodexTurnOptions? = nil) async throws -> CodexCompactionResult {
@@ -1445,11 +1516,11 @@ public actor CodexSession {
                 subagentEvent: subagentEvent
             )
         case "send_input":
-            return try executeSendInput(call, subagentStatus: subagentStatus, subagentEvent: subagentEvent)
+            return try await executeSendInput(call, subagentStatus: subagentStatus, subagentEvent: subagentEvent)
         case "send_message":
-            return try executeSendMessage(call, subagentStatus: subagentStatus)
+            return try await executeSendMessage(call, subagentStatus: subagentStatus)
         case "resume_agent":
-            return try executeResumeAgent(call, subagentStatus: subagentStatus)
+            return try await executeResumeAgent(call, subagentStatus: subagentStatus)
         case "followup_task":
             return try await executeFollowupTask(call, subagentStatus: subagentStatus, subagentEvent: subagentEvent)
         case "wait_agent":
@@ -1457,7 +1528,7 @@ public actor CodexSession {
         case "list_agents":
             return try executeListAgents(call)
         case "close_agent":
-            return try executeCloseAgent(call, subagentStatus: subagentStatus)
+            return try await executeCloseAgent(call, subagentStatus: subagentStatus)
         default:
             throw CodexSessionError.unknownTool(call.name)
         }
@@ -2014,7 +2085,7 @@ public actor CodexSession {
             turnOptions: options,
             createdOrder: subagentSequence
         )
-        startSubagentTurn(
+        await startSubagentTurn(
             id: id,
             message: message,
             options: options,
@@ -2032,7 +2103,7 @@ public actor CodexSession {
         ]))
     }
 
-    private func executeSendMessage(_ call: CodexToolCall, subagentStatus: CodexSubagentStatusHandler?) throws -> CodexToolResult {
+    private func executeSendMessage(_ call: CodexToolCall, subagentStatus: CodexSubagentStatusHandler?) async throws -> CodexToolResult {
         guard configuration.subagentOptions.isEnabled else {
             return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
         }
@@ -2051,7 +2122,7 @@ public actor CodexSession {
 
         record.queuedMessages.append(message)
         subagents[id] = record
-        subagentStatus?(Self.subagentStatus(record))
+        await emitSubagentStatus(Self.subagentStatus(record), to: subagentStatus)
         return CodexToolResult(output: try Self.jsonString([
             "target": record.path,
             "status": "queued",
@@ -2062,7 +2133,7 @@ public actor CodexSession {
         _ call: CodexToolCall,
         subagentStatus: CodexSubagentStatusHandler?,
         subagentEvent: CodexSubagentEventHandler?
-    ) throws -> CodexToolResult {
+    ) async throws -> CodexToolResult {
         guard configuration.subagentOptions.isEnabled else {
             return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
         }
@@ -2083,7 +2154,7 @@ public actor CodexSession {
         if record.status == .running, !interrupt {
             record.queuedMessages.append(message)
             subagents[id] = record
-            subagentStatus?(Self.subagentStatus(record))
+            await emitSubagentStatus(Self.subagentStatus(record), to: subagentStatus)
             return CodexToolResult(output: try Self.jsonString([
                 "target": record.path,
                 "status": "queued",
@@ -2095,7 +2166,7 @@ public actor CodexSession {
             record.queuedFollowups.insert(message, at: 0)
             record.task?.cancel()
             subagents[id] = record
-            subagentStatus?(Self.subagentStatus(record))
+            await emitSubagentStatus(Self.subagentStatus(record), to: subagentStatus)
             return CodexToolResult(output: try Self.jsonString([
                 "target": record.path,
                 "status": "interrupt_queued",
@@ -2106,7 +2177,7 @@ public actor CodexSession {
         record.finalAnswer = nil
         record.errorMessage = nil
         subagents[id] = record
-        startSubagentTurn(
+        await startSubagentTurn(
             id: id,
             message: message,
             options: record.turnOptions,
@@ -2120,7 +2191,7 @@ public actor CodexSession {
         ]))
     }
 
-    private func executeResumeAgent(_ call: CodexToolCall, subagentStatus: CodexSubagentStatusHandler?) throws -> CodexToolResult {
+    private func executeResumeAgent(_ call: CodexToolCall, subagentStatus: CodexSubagentStatusHandler?) async throws -> CodexToolResult {
         guard configuration.subagentOptions.isEnabled else {
             return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
         }
@@ -2144,7 +2215,7 @@ public actor CodexSession {
         guard let latest = subagents[id] else {
             return CodexToolResult(output: "\(target): agent not found.", success: false)
         }
-        subagentStatus?(Self.subagentStatus(latest))
+        await emitSubagentStatus(Self.subagentStatus(latest), to: subagentStatus)
         return CodexToolResult(output: try Self.jsonString(Self.subagentStatusPayload(latest)))
     }
 
@@ -2172,7 +2243,7 @@ public actor CodexSession {
         if record.status == .running {
             record.queuedFollowups.append(message)
             subagents[id] = record
-            subagentStatus?(Self.subagentStatus(record))
+            await emitSubagentStatus(Self.subagentStatus(record), to: subagentStatus)
             return CodexToolResult(output: try Self.jsonString([
                 "target": record.path,
                 "status": "queued",
@@ -2180,7 +2251,7 @@ public actor CodexSession {
         }
 
         subagents[id] = record
-        startSubagentTurn(
+        await startSubagentTurn(
             id: id,
             message: message,
             options: record.turnOptions,
@@ -2249,7 +2320,7 @@ public actor CodexSession {
         return CodexToolResult(output: try Self.jsonString(["agents": agents]))
     }
 
-    private func executeCloseAgent(_ call: CodexToolCall, subagentStatus: CodexSubagentStatusHandler?) throws -> CodexToolResult {
+    private func executeCloseAgent(_ call: CodexToolCall, subagentStatus: CodexSubagentStatusHandler?) async throws -> CodexToolResult {
         guard configuration.subagentOptions.isEnabled else {
             return CodexToolResult(output: "Subagents are not enabled for this session.", success: false)
         }
@@ -2264,7 +2335,7 @@ public actor CodexSession {
         record.statusBeforeClose = previousStatus
         record.status = .closed
         subagents[id] = record
-        subagentStatus?(Self.subagentStatus(record))
+        await emitSubagentStatus(Self.subagentStatus(record), to: subagentStatus)
         return CodexToolResult(output: try Self.jsonString([
             "target": record.path,
             "previous_status": previousStatus.rawValue,
@@ -2353,7 +2424,7 @@ public actor CodexSession {
         options: CodexTurnOptions?,
         subagentStatus: CodexSubagentStatusHandler?,
         subagentEvent: CodexSubagentEventHandler?
-    ) {
+    ) async {
         guard var record = subagents[id], !record.status.isClosed else {
             return
         }
@@ -2376,8 +2447,12 @@ public actor CodexSession {
                 let output = try await Self.collectFinalText(
                     from: child.submit(userText: prompt, options: options),
                     agent: agentStatus,
-                    subagentStatus: subagentStatus,
-                    subagentEvent: subagentEvent
+                    subagentStatus: { status in
+                        await self.emitSubagentStatus(status, to: subagentStatus)
+                    },
+                    subagentEvent: { event in
+                        await self.emitSubagentEvent(event, to: subagentEvent)
+                    }
                 )
                 await self.finishSubagentTurn(
                     id: id,
@@ -2406,7 +2481,7 @@ public actor CodexSession {
         }
         record.task = task
         subagents[id] = record
-        subagentStatus?(Self.subagentStatus(record))
+        await emitSubagentStatus(Self.subagentStatus(record), to: subagentStatus)
     }
 
     private func finishSubagentTurn(
@@ -2415,7 +2490,7 @@ public actor CodexSession {
         errorMessage: String?,
         subagentStatus: CodexSubagentStatusHandler?,
         subagentEvent: CodexSubagentEventHandler?
-    ) {
+    ) async {
         guard var record = subagents[id], record.status == .running else {
             return
         }
@@ -2432,8 +2507,8 @@ public actor CodexSession {
             let next = record.queuedFollowups.removeFirst()
             let options = record.turnOptions
             subagents[id] = record
-            subagentStatus?(Self.subagentStatus(record))
-            startSubagentTurn(
+            await emitSubagentStatus(Self.subagentStatus(record), to: subagentStatus)
+            await startSubagentTurn(
                 id: id,
                 message: next,
                 options: options,
@@ -2444,7 +2519,7 @@ public actor CodexSession {
         }
 
         subagents[id] = record
-        subagentStatus?(Self.subagentStatus(record))
+        await emitSubagentStatus(Self.subagentStatus(record), to: subagentStatus)
     }
 
     private func subagentID(for rawTarget: String) -> String? {
@@ -2500,12 +2575,16 @@ public actor CodexSession {
         for try await event in stream {
             switch event {
             case .subagentStatus(let status):
-                subagentStatus?(status)
+                if let subagentStatus {
+                    await subagentStatus(status)
+                }
             case .subagentEvent(let event):
-                subagentEvent?(event)
+                if let subagentEvent {
+                    await subagentEvent(event)
+                }
             default:
-                if let agent {
-                    subagentEvent?(CodexSubagentEvent(agent: agent, event: event))
+                if let agent, let subagentEvent {
+                    await subagentEvent(CodexSubagentEvent(agent: agent, event: event))
                 }
             }
 
