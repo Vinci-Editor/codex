@@ -1163,6 +1163,41 @@ func portableShellSupportsAbsoluteUnixCommandEntrypoints() async throws {
 }
 
 @Test
+func portableShellSupportsJavaScriptRuntimeEntrypoints() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "CodexPortableShellJS-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    try """
+    import path from "node:path";
+    console.log(path.basename(process.argv[2]));
+    """.write(to: root.appending(path: "script.mjs"), atomically: true, encoding: .utf8)
+
+    let response = await CodexMobileCoreBridge.emulatePortableShellForTesting([
+        "workspaceRoot": root.path,
+        "command": #"""
+        js-exec -c 'console.log(1 + 2)'
+        node -e 'console.log(require("node:path").join("alpha", "beta"))'
+        node -p '21 * 2'
+        node --input-type=module -e 'import path from "node:path"; console.log(path.extname("file.swift"))'
+        node script.mjs /tmp/report.txt
+        """#,
+        "maxOutputBytes": 64 * 1024,
+    ])
+
+    #expect(response["exit_code"] as? Int == 0)
+    let output = response["output"] as? String ?? ""
+    #expect(output.contains("3\n"))
+    #expect(output.contains("alpha/beta\n"))
+    #expect(output.contains("42\n"))
+    #expect(output.contains(".swift\n"))
+    #expect(output.contains("report.txt\n"))
+}
+
+@Test
 func mutatingBuiltinWorkspaceToolsRequireApproval() async throws {
     let root = FileManager.default.temporaryDirectory
         .appending(path: UUID().uuidString, directoryHint: .isDirectory)

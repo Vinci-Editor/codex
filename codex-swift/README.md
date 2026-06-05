@@ -241,8 +241,9 @@ On iOS, shell execution prefers the pinned `JustBash` package through a
 Codex-owned disk filesystem adapter rooted at the active workspace. That keeps
 CodexKit responsible for workspace mapping, output limits, timeout reporting,
 and jail enforcement while gaining a much broader in-process bash surface. The
-Rust mobile core remains the fallback shell emulator when `JustBash` is not
-available.
+bridge also registers `JustBashJavaScript` so `js-exec` and common `node`
+launcher forms run through JavaScriptCore inside the same jail. The Rust mobile
+core remains the fallback shell emulator when `JustBash` is not available.
 
 ## Load Project Instructions
 
@@ -536,8 +537,8 @@ the stream when the user stops a turn or leaves the screen.
   without changing the workspace.
 - `shell_command`: runs a one-shot shell-like command. On macOS this runs
   `/bin/zsh` inside the selected workspace, using a login shell by default and
-  honoring `login: false` with `-c`. On iOS this uses the deterministic Rust
-  shell emulator, not arbitrary process execution.
+  honoring `login: false` with `-c`. On iOS this uses the deterministic
+  JustBash-backed shell emulator, not arbitrary process execution.
 - `exec_command`: accepts Codex unified exec-style arguments for one-shot
   commands, including `timeout_ms`, output caps, `login`, and approval metadata.
   On macOS it uses the same native shell runner; on iOS it uses the deterministic
@@ -556,11 +557,17 @@ It supports common read and edit commands such as `pwd`, `ls`, `find`, `cat`,
 also answers command lookup probes such as `command -v`, `command -V`, `which`,
 and `type` for the supported emulator commands.
 
+When `JustBashJavaScript` is available, the iOS shell also exposes `js-exec` and
+thin `node` launchers for `node -e`, `node -p`, `node --input-type=module -e`,
+and script-file execution. This is JavaScriptCore-backed Node compatibility for
+agent helper scripts; it is still in-process and does not provide npm, native
+Node modules, or arbitrary OS child processes.
+
 Unsupported iOS shell features fail with normal command-style stderr and exit
-status. Examples include arbitrary binaries, interpreters, package managers,
-network commands, background jobs, command substitution, subshells, PTYs, and
-long-running interactive sessions. Command input is capped at 32 KiB, and long
-outputs are truncated on UTF-8 character boundaries.
+status. Examples include arbitrary binaries, unsupported interpreter binaries,
+package managers, network commands, background jobs, command substitution,
+subshells, PTYs, and long-running interactive sessions. Command input is capped
+at 32 KiB, and long outputs are truncated on UTF-8 character boundaries.
 
 ## Add A Custom Swift Tool
 

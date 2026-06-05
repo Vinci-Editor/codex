@@ -10,7 +10,10 @@ let hasMobileCoreArtifact = FileManager.default.fileExists(
 )
 
 let mobileCoreBridgeDependencies: [Target.Dependency] = (hasMobileCoreArtifact ? [.target(name: "CodexMobileCore")] : [])
-    + [.product(name: "JustBash", package: "just-bash-swift")]
+    + [
+        .product(name: "JustBash", package: "just-bash-swift"),
+        .product(name: "JustBashJavaScript", package: "just-bash-swift"),
+    ]
 
 var targets: [Target] = [
     .target(

@@ -7,7 +7,11 @@ import CodexMobileCore
 #endif
 #if canImport(JustBash) && canImport(JustBashFS)
 import JustBash
+import JustBashCommands
 import JustBashFS
+#endif
+#if canImport(JustBashJavaScript)
+import JustBashJavaScript
 #endif
 
 public enum CodexMobileCoreBridge {
@@ -903,7 +907,8 @@ public enum CodexMobileCoreBridge {
             executionLimits: executionLimits,
             customCommands: justBashHostCompatibilityCommands(),
             filesystem: fileSystem,
-            allowedURLPrefixes: []
+            allowedURLPrefixes: [],
+            embeddedRuntimes: justBashEmbeddedRuntimes()
         ))
         await seedJailedCommandStubs(from: bash, into: fileSystem)
 
@@ -1033,6 +1038,9 @@ public enum CodexMobileCoreBridge {
             justBashShellLauncherCommand(named: "/usr/bin/bash"),
             justBashEnvCommand(named: "/usr/bin/env"),
             justBashEnvCommand(named: "/bin/env"),
+            justBashNodeCommand(named: "node"),
+            justBashNodeCommand(named: "/bin/node"),
+            justBashNodeCommand(named: "/usr/bin/node"),
         ]
         var seen = Set(commands.map(\.name))
         for name in justBashPathAliasCommandNames {
@@ -1045,6 +1053,14 @@ public enum CodexMobileCoreBridge {
             }
         }
         return commands
+    }
+
+    private static func justBashEmbeddedRuntimes() -> [any EmbeddedRuntime] {
+        #if canImport(JustBashJavaScript)
+        return [JavaScriptRuntime()]
+        #else
+        return []
+        #endif
     }
 
     private static func justBashPathAliasCommand(named alias: String, targetName: String) -> AnyBashCommand {
@@ -1099,6 +1115,111 @@ public enum CodexMobileCoreBridge {
             let commandScript = parsed.commandArguments.map(shellQuoteForJustBash).joined(separator: " ")
             return await executeSubshell(scriptWithInheritedEnvironment(commandScript, environment: environment))
         }
+    }
+
+    private static func justBashNodeCommand(named name: String) -> AnyBashCommand {
+        AnyBashCommand(name: name) { args, context in
+            guard let executeSubshell = context.executeSubshell else {
+                return ExecResult.failure("\(name): shell execution unavailable", exitCode: 126)
+            }
+
+            switch nodeJSExecArguments(from: args, stdin: context.stdin, commandName: name) {
+            case .arguments(let jsExecArguments):
+                let script = (["js-exec"] + jsExecArguments).map(shellQuoteForJustBash).joined(separator: " ")
+                return await executeSubshell(scriptWithInheritedEnvironment(script, environment: context.environment))
+            case .result(let result):
+                return result
+            }
+        }
+    }
+
+    private static func nodeJSExecArguments(
+        from args: [String],
+        stdin: String,
+        commandName: String
+    ) -> NodeLauncherResolution {
+        guard !args.isEmpty else {
+            return stdin.isEmpty ? .arguments(["-c", ""]) : .arguments(["-c", stdin])
+        }
+
+        var isModule = false
+        var index = 0
+        while index < args.count {
+            let argument = args[index]
+            if argument == "--" {
+                index += 1
+                break
+            }
+
+            switch argument {
+            case "-v", "--version":
+                return .result(ExecResult.success("v20.0.0-justbash\n"))
+            case "-h", "--help":
+                return .result(ExecResult.success("""
+                Usage: node [options] [script.js] [arguments]
+
+                iOS Codex routes node-compatible JavaScript through JustBashJavaScript.
+                Supported: -e/--eval, -p/--print, --input-type=module, script files.
+
+                """))
+            case "-e", "--eval":
+                guard index + 1 < args.count else {
+                    return .result(ExecResult.failure("\(commandName): \(argument) requires an argument", exitCode: 2))
+                }
+                var jsExecArguments = isModule ? ["-m"] : []
+                jsExecArguments += ["-c", args[index + 1]]
+                jsExecArguments += Array(args.dropFirst(index + 2))
+                return .arguments(jsExecArguments)
+            case "-p", "--print":
+                guard index + 1 < args.count else {
+                    return .result(ExecResult.failure("\(commandName): \(argument) requires an argument", exitCode: 2))
+                }
+                var jsExecArguments = isModule ? ["-m"] : []
+                jsExecArguments += ["-c", "console.log(\(args[index + 1]));"]
+                jsExecArguments += Array(args.dropFirst(index + 2))
+                return .arguments(jsExecArguments)
+            case "--input-type=module", "--experimental-modules":
+                isModule = true
+                index += 1
+                continue
+            case "--input-type=commonjs", "--no-warnings", "--enable-source-maps", "--trace-warnings":
+                index += 1
+                continue
+            case "--input-type":
+                guard index + 1 < args.count else {
+                    return .result(ExecResult.failure("\(commandName): --input-type requires an argument", exitCode: 2))
+                }
+                let value = args[index + 1]
+                if value == "module" {
+                    isModule = true
+                } else if value != "commonjs" {
+                    return .result(ExecResult.failure("\(commandName): unsupported --input-type=\(value)", exitCode: 2))
+                }
+                index += 2
+                continue
+            case "-":
+                return stdin.isEmpty ? .arguments(isModule ? ["-m", "-c", ""] : ["-c", ""]) : .arguments(isModule ? ["-m", "-c", stdin] : ["-c", stdin])
+            default:
+                if argument.hasPrefix("-") {
+                    return .result(ExecResult.failure("\(commandName): unsupported option \(argument)", exitCode: 125))
+                }
+            }
+            break
+        }
+
+        guard index < args.count else {
+            return stdin.isEmpty ? .arguments(isModule ? ["-m", "-c", ""] : ["-c", ""]) : .arguments(isModule ? ["-m", "-c", stdin] : ["-c", stdin])
+        }
+
+        var jsExecArguments = isModule ? ["-m"] : []
+        jsExecArguments.append(args[index])
+        jsExecArguments += Array(args.dropFirst(index + 1))
+        return .arguments(jsExecArguments)
+    }
+
+    private enum NodeLauncherResolution {
+        case arguments([String])
+        case result(ExecResult)
     }
 
     private static func shellLauncherScript(
