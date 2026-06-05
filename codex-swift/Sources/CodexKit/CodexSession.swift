@@ -128,6 +128,7 @@ public enum CodexStreamEvent: Sendable, Equatable {
     case outputItemAdded(Data)
     case outputItemDone(Data)
     case completed(Data, CodexTokenUsage?)
+    case planUpdated(CodexPlanUpdate)
     case toolCall(CodexToolCall)
     case toolResult(CodexToolCall, String, Bool)
     case error(String)
@@ -257,6 +258,9 @@ public actor CodexSession {
                     continuation.yield(.toolOutputDelta(call, delta))
                 }
                 appendToolOutput(call: call, result: toolResult)
+                if let planUpdate = toolResult.planUpdate {
+                    continuation.yield(.planUpdated(planUpdate))
+                }
                 continuation.yield(.toolResult(call, toolResult.output, toolResult.success))
             }
         }
@@ -771,6 +775,8 @@ public actor CodexSession {
             return try executeWriteFile(call)
         case "view_image":
             return try executeViewImage(call)
+        case "update_plan":
+            return try executeUpdatePlan(call)
         case "spawn_agent":
             return try await executeSpawnAgent(call)
         case "send_message":
@@ -1082,6 +1088,45 @@ public actor CodexSession {
                 )
             }
         }
+    }
+
+    private func executeUpdatePlan(_ call: CodexToolCall) throws -> CodexToolResult {
+        let arguments = try Self.decodeArguments(call.arguments)
+        let explanation = (arguments["explanation"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let rawPlan = arguments["plan"] as? [[String: Any]] else {
+            return CodexToolResult(output: "Missing plan.", success: false)
+        }
+
+        var items: [CodexPlanItem] = []
+        var inProgressCount = 0
+        for rawItem in rawPlan {
+            let step = (rawItem["step"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !step.isEmpty else {
+                return CodexToolResult(output: "update_plan step cannot be empty.", success: false)
+            }
+            let statusValue = rawItem["status"] as? String ?? ""
+            guard let status = CodexPlanItem.Status(rawValue: statusValue) else {
+                return CodexToolResult(output: "Unsupported update_plan status: \(statusValue)", success: false)
+            }
+            if status == .inProgress {
+                inProgressCount += 1
+            }
+            items.append(CodexPlanItem(step: step, status: status))
+        }
+
+        guard inProgressCount <= 1 else {
+            return CodexToolResult(output: "At most one plan step can be in_progress.", success: false)
+        }
+
+        return CodexToolResult(
+            output: "Plan updated",
+            planUpdate: CodexPlanUpdate(
+                explanation: explanation?.isEmpty == true ? nil : explanation,
+                items: items
+            )
+        )
     }
 
     private func executeSpawnAgent(_ call: CodexToolCall) async throws -> CodexToolResult {

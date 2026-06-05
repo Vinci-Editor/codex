@@ -72,6 +72,7 @@ mod tests {
                 "list_dir",
                 "apply_patch",
                 "view_image",
+                "update_plan",
                 "shell_command",
                 "exec_command"
             ]

@@ -25,11 +25,18 @@ public struct CodexToolResult: Sendable, Equatable {
     public let output: String
     public let success: Bool
     public let responseOutput: CodexToolResponseOutput?
+    public let planUpdate: CodexPlanUpdate?
 
-    public init(output: String, success: Bool = true, responseOutput: CodexToolResponseOutput? = nil) {
+    public init(
+        output: String,
+        success: Bool = true,
+        responseOutput: CodexToolResponseOutput? = nil,
+        planUpdate: CodexPlanUpdate? = nil
+    ) {
         self.output = output
         self.success = success
         self.responseOutput = responseOutput
+        self.planUpdate = planUpdate
     }
 }
 
@@ -51,6 +58,34 @@ public enum CodexToolResponseOutput: Sendable, Equatable {
             }
             return [item]
         }
+    }
+}
+
+public struct CodexPlanUpdate: Codable, Sendable, Equatable, Hashable {
+    public let explanation: String?
+    public let items: [CodexPlanItem]
+
+    public init(explanation: String? = nil, items: [CodexPlanItem]) {
+        self.explanation = explanation
+        self.items = items
+    }
+}
+
+public struct CodexPlanItem: Codable, Sendable, Equatable, Hashable, Identifiable {
+    public enum Status: String, Codable, Sendable, Equatable, Hashable {
+        case pending
+        case inProgress = "in_progress"
+        case completed
+    }
+
+    public let id: UUID
+    public let step: String
+    public let status: Status
+
+    public init(id: UUID = UUID(), step: String, status: Status) {
+        self.id = id
+        self.step = step
+        self.status = status
     }
 }
 

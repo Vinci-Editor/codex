@@ -384,6 +384,9 @@ for try await event in stream {
     case .toolResult(let call, let output, let success):
         showToolFinished(name: call.name, output: output, success: success)
 
+    case .planUpdated(let plan):
+        showPlan(plan)
+
     case .completed(_, let tokenUsage):
         if let tokenUsage {
             showTokenUsage(
@@ -427,6 +430,9 @@ the stream when the user stops a turn or leaves the screen.
   request can visually inspect the image. Pass selected model input modalities in
   `CodexTurnOptions.inputModalities`; `CodexKit` hides `view_image` when the
   current model is known to be text-only.
+- `update_plan`: lets the model publish the current turn checklist. `CodexKit`
+  validates the submitted steps, emits `.planUpdated`, and returns a tool result
+  without changing the workspace.
 - `shell_command`: runs a shell-like command. On macOS this runs `/bin/zsh -lc`
   inside the selected workspace. On iOS this uses the deterministic Rust shell
   emulator, not arbitrary process execution.

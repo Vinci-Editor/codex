@@ -322,6 +322,41 @@ public enum CodexMobileCoreBridge {
                 ]
             ),
             functionTool(
+                name: "update_plan",
+                description: """
+                Updates the task plan.
+                Provide an optional explanation and a list of plan items, each with a step and status.
+                At most one step can be in_progress at a time.
+                """,
+                required: ["plan"],
+                properties: [
+                    "explanation": [
+                        "type": "string",
+                        "description": "Optional explanation for this plan update.",
+                    ],
+                    "plan": [
+                        "type": "array",
+                        "description": "The list of steps",
+                        "items": [
+                            "type": "object",
+                            "properties": [
+                                "step": [
+                                    "type": "string",
+                                    "description": "Task step text.",
+                                ],
+                                "status": [
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Step status.",
+                                ],
+                            ],
+                            "required": ["step", "status"],
+                            "additionalProperties": false,
+                        ],
+                    ],
+                ]
+            ),
+            functionTool(
                 name: "shell_command",
                 description: "Runs a shell command. On macOS this uses /bin/zsh -lc; on iOS this is a deterministic Codex emulator.",
                 required: ["command"],

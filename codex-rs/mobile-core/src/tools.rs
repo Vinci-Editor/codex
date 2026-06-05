@@ -8,6 +8,7 @@ pub fn builtin_tools_json() -> String {
             list_dir_tool(),
             apply_patch_tool(),
             view_image_tool(),
+            update_plan_tool(),
             shell_command_tool(),
             exec_command_tool(),
         ]
@@ -98,6 +99,46 @@ fn view_image_tool() -> Value {
                 }
             },
             "required": ["image_url", "detail"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn update_plan_tool() -> Value {
+    json!({
+        "type": "function",
+        "name": "update_plan",
+        "description": "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.\n",
+        "strict": false,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "explanation": {
+                    "type": "string",
+                    "description": "Optional explanation for this plan update."
+                },
+                "plan": {
+                    "type": "array",
+                    "description": "The list of steps",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {
+                                "type": "string",
+                                "description": "Task step text."
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "Step status."
+                            }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["plan"],
             "additionalProperties": false
         }
     })
