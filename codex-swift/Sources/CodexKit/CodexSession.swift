@@ -1055,6 +1055,51 @@ public actor CodexSession {
         return nil
     }
 
+    static func subagentSpawnArgumentsValidationError(
+        arguments: [String: Any],
+        parentOptions: CodexTurnOptions?
+    ) -> String? {
+        if arguments["fork_context"] != nil {
+            return "fork_context is not supported; use fork_turns instead."
+        }
+        if let forkTurnsError = subagentForkTurnsValidationError(arguments: arguments) {
+            return forkTurnsError
+        }
+        if subagentUsesFullHistoryFork(arguments: arguments) {
+            let requestedModel = trimmedNonEmpty(arguments["model"] as? String)
+            let requestedReasoningEffort = trimmedNonEmpty(arguments["reasoning_effort"] as? String)
+            if requestedModel != nil || requestedReasoningEffort != nil {
+                return "Full-history forked agents inherit the parent model and reasoning effort; omit model and reasoning_effort, or spawn with fork_turns set to none or a positive integer string."
+            }
+        }
+        return subagentTurnOptionsValidationError(arguments: arguments, parentOptions: parentOptions)
+    }
+
+    private static func subagentForkTurnsValidationError(arguments: [String: Any]) -> String? {
+        guard let rawForkTurns = arguments["fork_turns"] else {
+            return nil
+        }
+        guard let forkTurns = rawForkTurns as? String else {
+            return "fork_turns must be `none`, `all`, or a positive integer string."
+        }
+        let normalized = forkTurns.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty, normalized != "none", normalized != "all" else {
+            return nil
+        }
+        guard let value = Int(normalized), value > 0 else {
+            return "fork_turns must be `none`, `all`, or a positive integer string."
+        }
+        return nil
+    }
+
+    private static func subagentUsesFullHistoryFork(arguments: [String: Any]) -> Bool {
+        guard let forkTurns = arguments["fork_turns"] as? String else {
+            return true
+        }
+        let normalized = forkTurns.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty || normalized == "all"
+    }
+
     private static func availableValuesDescription(_ values: [String]) -> String {
         let uniqueValues = orderedUnique(values)
         guard !uniqueValues.isEmpty else {
@@ -1163,6 +1208,7 @@ public actor CodexSession {
             "Spawn a child agent to work on the specified task. The child inherits the same workspace and tools and runs in the background.",
             Self.subagentModelOverrideDescription(options: options),
             Self.subagentInheritedModelGuidance(options: options),
+            "The default `fork_turns` is `all`. Full-history forked agents inherit the parent model and reasoning effort; omit `model` and `reasoning_effort` unless `fork_turns` is `none` or a positive integer string.",
             "This session allows up to \(configuration.subagentOptions.maxOpenAgents) open subagents.",
         ]
             .filter { !$0.isEmpty }
@@ -1183,14 +1229,14 @@ public actor CodexSession {
                     ],
                     "fork_turns": [
                         "type": "string",
-                        "description": "Optional history fork depth. Use none, all, or a positive integer string.",
+                        "description": "Optional history fork depth. Use none, all, or a positive integer string. Defaults to all.",
                     ],
                     "model": Self.schemaStringProperty(
-                        description: "Optional model override. Omit to inherit the parent turn model.",
+                        description: "Optional model override. Omit to inherit the parent turn model. Only set when fork_turns is none or a positive integer string.",
                         enumValues: modelValues
                     ),
                     "reasoning_effort": Self.schemaStringProperty(
-                        description: "Optional reasoning effort override. Omit to inherit the parent turn default.",
+                        description: "Optional reasoning effort override. Omit to inherit the parent turn default. Only set when fork_turns is none or a positive integer string.",
                         enumValues: reasoningEffortValues
                     ),
                     "service_tier": Self.schemaStringProperty(
@@ -2054,7 +2100,7 @@ public actor CodexSession {
         guard !message.isEmpty else {
             return CodexToolResult(output: "Missing message.", success: false)
         }
-        if let validationError = Self.subagentTurnOptionsValidationError(arguments: arguments, parentOptions: activeTurnOptions) {
+        if let validationError = Self.subagentSpawnArgumentsValidationError(arguments: arguments, parentOptions: activeTurnOptions) {
             return CodexToolResult(output: validationError, success: false)
         }
 

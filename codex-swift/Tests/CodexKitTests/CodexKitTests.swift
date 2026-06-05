@@ -810,6 +810,74 @@ func subagentTurnOptionValidationRejectsUnavailableOverrides() {
 }
 
 @Test
+func subagentSpawnValidationRejectsFullHistoryModelOverrides() {
+    let options = CodexTurnOptions(
+        model: "gpt-5.5",
+        reasoningEffort: "medium",
+        serviceTier: "priority",
+        availableModelOptions: [
+            CodexModelOption(
+                id: "gpt-5.5",
+                model: "gpt-5.5",
+                displayName: "GPT-5.5",
+                defaultReasoningEffort: "medium",
+                supportedReasoningEfforts: [
+                    CodexReasoningEffortOption(reasoningEffort: "low"),
+                    CodexReasoningEffortOption(reasoningEffort: "medium"),
+                ],
+                serviceTiers: [
+                    CodexServiceTierOption(id: "priority", name: "Priority"),
+                ]
+            ),
+        ]
+    )
+
+    let defaultForkModelOverride = CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["model": "gpt-5.4"],
+        parentOptions: options
+    )
+    let explicitFullForkReasoningOverride = CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["fork_turns": "all", "reasoning_effort": "low"],
+        parentOptions: options
+    )
+
+    #expect(defaultForkModelOverride?.contains("Full-history forked agents inherit") == true)
+    #expect(explicitFullForkReasoningOverride?.contains("Full-history forked agents inherit") == true)
+    #expect(CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["fork_turns": "none", "model": "gpt-5.5"],
+        parentOptions: options
+    ) == nil)
+    #expect(CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["fork_turns": "2", "reasoning_effort": "low"],
+        parentOptions: options
+    ) == nil)
+    #expect(CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["fork_turns": "all", "service_tier": "priority"],
+        parentOptions: options
+    ) == nil)
+}
+
+@Test
+func subagentSpawnValidationRejectsInvalidForkTurns() {
+    #expect(CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["fork_context": true],
+        parentOptions: nil
+    ) == "fork_context is not supported; use fork_turns instead.")
+    #expect(CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["fork_turns": "banana"],
+        parentOptions: nil
+    ) == "fork_turns must be `none`, `all`, or a positive integer string.")
+    #expect(CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["fork_turns": "0"],
+        parentOptions: nil
+    ) == "fork_turns must be `none`, `all`, or a positive integer string.")
+    #expect(CodexSession.subagentSpawnArgumentsValidationError(
+        arguments: ["fork_turns": "1"],
+        parentOptions: nil
+    ) == nil)
+}
+
+@Test
 func subagentTurnOptionValidationAllowsSparseLocalModelCatalogs() {
     #expect(CodexSession.subagentTurnOptionsValidationError(
         arguments: ["model": "local-model", "reasoning_effort": "high", "service_tier": "priority"],
