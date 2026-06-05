@@ -38,6 +38,15 @@ impl Workspace {
         &self.root
     }
 
+    pub fn change_dir(&mut self, raw: &str) -> Result<(), String> {
+        let path = self.resolve_existing(raw)?;
+        if !path.is_dir() {
+            return Err(format!("{raw}: not a directory"));
+        }
+        self.cwd = path;
+        Ok(())
+    }
+
     pub fn resolve_existing(&self, raw: &str) -> Result<PathBuf, String> {
         let path = self.lexical_path(raw)?;
         let canonical = path

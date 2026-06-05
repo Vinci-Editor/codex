@@ -62,4 +62,32 @@ public struct CodexWorkspace: Sendable, Equatable {
         }
         return try operation(url)
     }
+
+    public func withSecurityScope<T>(_ operation: (URL) async throws -> T) async throws -> T {
+        var stale = false
+        let url: URL
+        if let bookmarkData {
+            #if os(macOS)
+            let options: URL.BookmarkResolutionOptions = [.withSecurityScope]
+            #else
+            let options: URL.BookmarkResolutionOptions = []
+            #endif
+            url = try URL(
+                resolvingBookmarkData: bookmarkData,
+                options: options,
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            )
+        } else {
+            url = rootURL
+        }
+
+        let started = url.startAccessingSecurityScopedResource()
+        defer {
+            if started {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        return try await operation(url)
+    }
 }

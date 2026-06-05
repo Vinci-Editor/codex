@@ -237,8 +237,12 @@ try workspace.withSecurityScope { rootURL in
 }
 ```
 
-The Rust mobile core remains responsible for path normalization, symlink checks,
-and workspace jail enforcement for Rust-backed shell operations.
+On iOS, shell execution prefers the pinned `JustBash` package through a
+Codex-owned disk filesystem adapter rooted at the active workspace. That keeps
+CodexKit responsible for workspace mapping, output limits, timeout reporting,
+and jail enforcement while gaining a much broader in-process bash surface. The
+Rust mobile core remains the fallback shell emulator when `JustBash` is not
+available.
 
 ## Start A Session
 

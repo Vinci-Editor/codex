@@ -4,9 +4,9 @@ use std::fs;
 use std::path::Path;
 
 const SUPPORTED_COMMANDS: &[&str] = &[
-    "cat", "command", "cp", "echo", "egrep", "fgrep", "find", "git", "grep", "head", "ls", "mkdir",
-    "mv", "printf", "pwd", "rg", "rm", "sed", "sort", "tail", "touch", "type", "uniq", "wc",
-    "which",
+    "[", "basename", "cat", "cd", "command", "cp", "dirname", "echo", "egrep", "false", "fgrep",
+    "find", "git", "grep", "head", "ls", "mkdir", "mv", "nl", "printf", "pwd", "rg", "rm",
+    "sed", "sort", "tail", "tee", "test", "touch", "true", "type", "uniq", "wc", "which",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,7 +43,7 @@ impl CommandRunner {
         Self { workspace }
     }
 
-    pub fn run_pipeline(&self, commands: &[ParsedCommand]) -> CommandResult {
+    pub fn run_pipeline(&mut self, commands: &[ParsedCommand]) -> CommandResult {
         let mut input = String::new();
         let mut last = CommandResult::success(String::new());
 
@@ -77,20 +77,27 @@ impl CommandRunner {
         last
     }
 
-    fn run_command(&self, command: &ParsedCommand, stdin: &str) -> CommandResult {
+    fn run_command(&mut self, command: &ParsedCommand, stdin: &str) -> CommandResult {
         let Some(name) = command.argv.first().map(String::as_str) else {
             return CommandResult::success(stdin.to_string());
         };
         match name {
+            "cd" => self.cd(&command.argv[1..]),
             "pwd" => CommandResult::success(format!(
                 "{}\n",
                 self.workspace.display_path(self.workspace.cwd())
             )),
+            "true" => CommandResult::success(String::new()),
+            "false" => CommandResult::failure(1, ""),
+            "test" => self.test(&command.argv[1..], false),
+            "[" => self.test(&command.argv[1..], true),
             "command" => self.command_lookup(&command.argv[1..]),
             "which" => self.which(&command.argv[1..]),
             "type" => self.type_command(&command.argv[1..]),
             "echo" => CommandResult::success(format!("{}\n", command.argv[1..].join(" "))),
             "printf" => self.printf(&command.argv[1..]),
+            "basename" => self.basename(&command.argv[1..]),
+            "dirname" => self.dirname(&command.argv[1..]),
             "ls" => self.ls(&command.argv[1..]),
             "find" => self.find(&command.argv[1..]),
             "cat" => self.cat(&command.argv[1..], stdin),
@@ -100,6 +107,8 @@ impl CommandRunner {
             "grep" | "egrep" | "fgrep" | "rg" => self.grep(name, &command.argv[1..], stdin),
             "sort" => self.sort(stdin),
             "uniq" => self.uniq(stdin),
+            "nl" => self.nl(stdin),
+            "tee" => self.tee(&command.argv[1..], stdin),
             "sed" => self.sed(&command.argv[1..], stdin),
             "mkdir" => self.mkdir(&command.argv[1..]),
             "touch" => self.touch(&command.argv[1..]),
@@ -111,6 +120,54 @@ impl CommandRunner {
                 127,
                 &format!("{other}: unsupported command in Codex iOS shell emulator\n"),
             ),
+        }
+    }
+
+    fn cd(&mut self, args: &[String]) -> CommandResult {
+        let target = args
+            .iter()
+            .find(|arg| !arg.starts_with('-'))
+            .map_or(".", String::as_str);
+        match self.workspace.change_dir(target) {
+            Ok(()) => CommandResult::success(String::new()),
+            Err(error) => CommandResult::failure(1, &format!("cd: {error}\n")),
+        }
+    }
+
+    fn test(&self, args: &[String], bracket: bool) -> CommandResult {
+        let args = if bracket {
+            let Some(last) = args.last() else {
+                return CommandResult::failure(2, "[: missing ]\n");
+            };
+            if last != "]" {
+                return CommandResult::failure(2, "[: missing ]\n");
+            }
+            &args[..args.len() - 1]
+        } else {
+            args
+        };
+
+        let result = match args {
+            [] => false,
+            [value] => !value.is_empty(),
+            [op, path] if op == "-e" => self.workspace.resolve_existing(path).is_ok(),
+            [op, path] if op == "-f" => self
+                .workspace
+                .resolve_existing(path)
+                .is_ok_and(|path| path.is_file()),
+            [op, path] if op == "-d" => self
+                .workspace
+                .resolve_existing(path)
+                .is_ok_and(|path| path.is_dir()),
+            [lhs, op, rhs] if op == "=" || op == "==" => lhs == rhs,
+            [lhs, op, rhs] if op == "!=" => lhs != rhs,
+            _ => return CommandResult::failure(2, "test: unsupported expression\n"),
+        };
+
+        if result {
+            CommandResult::success(String::new())
+        } else {
+            CommandResult::failure(1, "")
         }
     }
 
@@ -247,6 +304,31 @@ impl CommandRunner {
             output.push_str(&args[1..].join(" "));
         }
         CommandResult::success(output)
+    }
+
+    fn basename(&self, args: &[String]) -> CommandResult {
+        let Some(path) = args.iter().find(|arg| !arg.starts_with('-')) else {
+            return CommandResult::failure(1, "basename: missing operand\n");
+        };
+        let trimmed = path.trim_end_matches('/');
+        let name = Path::new(if trimmed.is_empty() { "/" } else { trimmed })
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(trimmed);
+        CommandResult::success(format!("{name}\n"))
+    }
+
+    fn dirname(&self, args: &[String]) -> CommandResult {
+        let Some(path) = args.iter().find(|arg| !arg.starts_with('-')) else {
+            return CommandResult::failure(1, "dirname: missing operand\n");
+        };
+        let trimmed = path.trim_end_matches('/');
+        let parent = Path::new(if trimmed.is_empty() { "/" } else { trimmed })
+            .parent()
+            .and_then(Path::to_str)
+            .filter(|parent| !parent.is_empty())
+            .unwrap_or(".");
+        CommandResult::success(format!("{parent}\n"))
     }
 
     fn find(&self, args: &[String]) -> CommandResult {
@@ -401,6 +483,35 @@ impl CommandRunner {
             }
         }
         CommandResult::success(format!("{}\n", lines.join("\n")))
+    }
+
+    fn nl(&self, stdin: &str) -> CommandResult {
+        let output = stdin
+            .lines()
+            .enumerate()
+            .map(|(index, line)| format!("{:>6}\t{}", index + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        CommandResult::success(format!("{output}\n"))
+    }
+
+    fn tee(&self, args: &[String], stdin: &str) -> CommandResult {
+        let append = args
+            .iter()
+            .any(|arg| arg == "-a" || arg.contains('a') && arg.starts_with('-'));
+        let paths = args
+            .iter()
+            .filter(|arg| !arg.starts_with('-'))
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return CommandResult::success(stdin.to_string());
+        }
+        for path in paths {
+            if let Err(error) = self.write_file(path, stdin, append) {
+                return CommandResult::failure(1, &format!("{error}\n"));
+            }
+        }
+        CommandResult::success(stdin.to_string())
     }
 
     fn sed(&self, args: &[String], stdin: &str) -> CommandResult {
@@ -636,7 +747,7 @@ mod tests {
     fn command_lookup_reports_supported_command_path() {
         let dir = tempdir().expect("tempdir");
         let workspace = Workspace::new(&dir.path().display().to_string(), None).expect("workspace");
-        let runner = CommandRunner::new(workspace);
+        let mut runner = CommandRunner::new(workspace);
         let parsed = parse_script("command -v rg && command -V rg").expect("parse");
 
         let first = runner.run_pipeline(&parsed[0].commands);
@@ -644,5 +755,59 @@ mod tests {
 
         assert_eq!(first.stdout, "/usr/bin/rg\n");
         assert_eq!(second.stdout, "rg is /usr/bin/rg\n");
+    }
+
+    #[test]
+    fn cd_updates_workspace_for_later_commands() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("Sources")).expect("mkdir");
+        std::fs::write(dir.path().join("Sources").join("File.swift"), "value").expect("write");
+        let workspace = Workspace::new(&dir.path().display().to_string(), None).expect("workspace");
+        let mut runner = CommandRunner::new(workspace);
+        let parsed = parse_script("cd Sources && pwd && cat File.swift").expect("parse");
+
+        let cd = runner.run_pipeline(&parsed[0].commands);
+        let pwd = runner.run_pipeline(&parsed[1].commands);
+        let cat = runner.run_pipeline(&parsed[2].commands);
+
+        assert_eq!(cd, CommandResult::success(String::new()));
+        assert_eq!(pwd.stdout, "Sources\n");
+        assert_eq!(cat.stdout, "value");
+    }
+
+    #[test]
+    fn test_command_checks_workspace_paths() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("Sources")).expect("mkdir");
+        std::fs::write(dir.path().join("Sources").join("File.swift"), "value").expect("write");
+        let workspace = Workspace::new(&dir.path().display().to_string(), None).expect("workspace");
+        let mut runner = CommandRunner::new(workspace);
+        let parsed = parse_script("[ -d Sources ] && test -f Sources/File.swift").expect("parse");
+
+        let directory = runner.run_pipeline(&parsed[0].commands);
+        let file = runner.run_pipeline(&parsed[1].commands);
+
+        assert_eq!(directory, CommandResult::success(String::new()));
+        assert_eq!(file, CommandResult::success(String::new()));
+    }
+
+    #[test]
+    fn basename_dirname_nl_and_tee_cover_common_script_glue() {
+        let dir = tempdir().expect("tempdir");
+        let workspace = Workspace::new(&dir.path().display().to_string(), None).expect("workspace");
+        let mut runner = CommandRunner::new(workspace);
+        let parsed =
+            parse_script("printf 'a\\nb\\n' | tee out.txt | nl && basename Sources/File.swift && dirname Sources/File.swift")
+                .expect("parse");
+
+        let numbered = runner.run_pipeline(&parsed[0].commands);
+        let basename = runner.run_pipeline(&parsed[1].commands);
+        let dirname = runner.run_pipeline(&parsed[2].commands);
+        let written = std::fs::read_to_string(dir.path().join("out.txt")).expect("read");
+
+        assert_eq!(numbered.stdout, "     1\ta\n     2\tb\n");
+        assert_eq!(written, "a\nb\n");
+        assert_eq!(basename.stdout, "File.swift\n");
+        assert_eq!(dirname.stdout, "Sources\n");
     }
 }

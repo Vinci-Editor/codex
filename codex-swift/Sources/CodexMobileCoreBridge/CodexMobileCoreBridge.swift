@@ -5,6 +5,10 @@ import Darwin
 #if canImport(CodexMobileCore)
 import CodexMobileCore
 #endif
+#if canImport(JustBash) && canImport(JustBashFS)
+import JustBash
+import JustBashFS
+#endif
 
 public enum CodexMobileCoreBridge {
     public static func version() -> [String: Any] {
@@ -74,18 +78,20 @@ public enum CodexMobileCoreBridge {
         return fallbackToolOutput(callID: callID, output: output, success: success, custom: custom, name: name)
     }
 
-    public static func emulateShell(_ input: [String: Any]) throws -> [String: Any] {
-        try emulateShell(input, outputHandler: nil)
+    public static func emulateShell(_ input: [String: Any]) async throws -> [String: Any] {
+        try await emulateShell(input, outputHandler: nil)
     }
 
     public static func emulateShell(
         _ input: [String: Any],
         outputHandler: (@Sendable (String) -> Void)?
-    ) throws -> [String: Any] {
+    ) async throws -> [String: Any] {
         #if os(macOS)
         return runNativeShell(input, outputHandler: outputHandler)
         #else
-        #if canImport(CodexMobileCore)
+        #if canImport(JustBash) && canImport(JustBashFS)
+        return await runJustBashShell(input, outputHandler: outputHandler)
+        #elseif canImport(CodexMobileCore)
         let data = try rustData(input: input, codex_mobile_emulate_shell_json)
         let object = try decodeObject(data)
         if let output = object["output"] as? String, !output.isEmpty {
@@ -452,6 +458,144 @@ public enum CodexMobileCoreBridge {
         ]
     }
 
+    private static func shellOutputLimit(_ input: [String: Any]) -> Int {
+        max(1, intValue(input["maxOutputBytes"])
+            ?? intValue(input["max_output_bytes"])
+            ?? intValue(input["max_output_tokens"]).map { $0 * 4 }
+            ?? 64 * 1024)
+    }
+
+    private static func shellWorkspaceRoot(_ input: [String: Any]) throws -> URL {
+        let rootPath = input["workspaceRoot"] as? String
+            ?? input["workspace_root"] as? String
+            ?? FileManager.default.currentDirectoryPath
+        let root = URL(fileURLWithPath: rootPath, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw CocoaError(.fileNoSuchFile, userInfo: [
+                NSFilePathErrorKey: root.path,
+                NSLocalizedDescriptionKey: "\(root.path): no such directory",
+            ])
+        }
+        return root
+    }
+
+    private static func shellWorkingDirectory(_ input: [String: Any]) throws -> URL {
+        let root = try shellWorkspaceRoot(input)
+        let rawWorkdir = input["workdir"] as? String ?? input["cwd"] as? String ?? ""
+        let candidate = rawWorkdir.isEmpty
+            ? root
+            : rawWorkdir.hasPrefix("/")
+                ? URL(fileURLWithPath: rawWorkdir)
+                : root.appending(path: rawWorkdir, directoryHint: .isDirectory)
+        let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath()
+        guard resolved.path == root.path || resolved.path.hasPrefix(root.path + "/") else {
+            throw CocoaError(.fileReadNoPermission, userInfo: [
+                NSFilePathErrorKey: resolved.path,
+                NSLocalizedDescriptionKey: "\(resolved.path): escapes workspace",
+            ])
+        }
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw CocoaError(.fileNoSuchFile, userInfo: [
+                NSFilePathErrorKey: resolved.path,
+                NSLocalizedDescriptionKey: "\(resolved.path): no such directory",
+            ])
+        }
+        return resolved
+    }
+
+    private static func virtualShellWorkingDirectory(root: URL, workdir: URL) -> String {
+        let rootPath = root.path
+        let workdirPath = workdir.path
+        guard workdirPath != rootPath else {
+            return "/"
+        }
+        let relativePath = workdirPath.dropFirst(rootPath.count).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return relativePath.isEmpty ? "/" : "/\(relativePath)"
+    }
+
+    private static func shellResponse(
+        exitCode: Int,
+        stdout: String,
+        stderr: String,
+        started: Date,
+        truncated: Bool
+    ) -> [String: Any] {
+        let output: String
+        if stderr.isEmpty {
+            output = stdout
+        } else if stdout.isEmpty {
+            output = stderr
+        } else {
+            output = stdout + stderr
+        }
+        return [
+            "exit_code": exitCode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "output": output,
+            "wall_time_seconds": Date().timeIntervalSince(started),
+            "truncated": truncated,
+        ]
+    }
+
+    private static func limitedShellText(_ text: String, maxBytes: Int) -> (text: String, truncated: Bool) {
+        let collector = ShellOutputCollector(maxBytes: maxBytes)
+        collector.append(Data(text.utf8))
+        return (collector.string(), collector.wasTruncated)
+    }
+
+    private final class ShellOutputCollector: @unchecked Sendable {
+        private let maxBytes: Int
+        private let lock = NSLock()
+        private var data = Data()
+        private var truncated = false
+
+        init(maxBytes: Int) {
+            self.maxBytes = maxBytes
+        }
+
+        var wasTruncated: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return truncated
+        }
+
+        func append(_ chunk: Data) {
+            guard !chunk.isEmpty else {
+                return
+            }
+            lock.lock()
+            defer { lock.unlock() }
+
+            let remaining = maxBytes - data.count
+            if remaining > 0 {
+                data.append(chunk.prefix(remaining))
+            }
+            if chunk.count > remaining {
+                truncated = true
+            }
+        }
+
+        func string() -> String {
+            lock.lock()
+            let snapshot = data
+            let wasTruncated = truncated
+            lock.unlock()
+
+            var text = String(decoding: snapshot, as: UTF8.self)
+            if wasTruncated {
+                text += "\n[output truncated]\n"
+            }
+            return text
+        }
+    }
+
     #if os(macOS)
     private static func runNativeShell(
         _ input: [String: Any],
@@ -469,15 +613,12 @@ public enum CodexMobileCoreBridge {
             )
         }
 
-        let maxOutputBytes = max(1, intValue(input["maxOutputBytes"])
-            ?? intValue(input["max_output_bytes"])
-            ?? intValue(input["max_output_tokens"]).map { $0 * 4 }
-            ?? 64 * 1024)
+        let maxOutputBytes = shellOutputLimit(input)
         let timeoutMilliseconds = max(1, intValue(input["timeout_ms"]) ?? 120_000)
 
         let workdir: URL
         do {
-            workdir = try nativeShellWorkingDirectory(input)
+            workdir = try shellWorkingDirectory(input)
         } catch {
             return shellResponse(
                 exitCode: 1,
@@ -571,102 +712,492 @@ public enum CodexMobileCoreBridge {
             truncated: stdout.wasTruncated || stderr.wasTruncated
         )
     }
+    #endif
 
-    private static func nativeShellWorkingDirectory(_ input: [String: Any]) throws -> URL {
-        let rootPath = input["workspaceRoot"] as? String ?? input["workspace_root"] as? String ?? FileManager.default.currentDirectoryPath
-        let root = URL(fileURLWithPath: rootPath).standardizedFileURL.resolvingSymlinksInPath()
-        let rawWorkdir = input["workdir"] as? String ?? input["cwd"] as? String ?? ""
-        let candidate = rawWorkdir.isEmpty
-            ? root
-            : rawWorkdir.hasPrefix("/")
-                ? URL(fileURLWithPath: rawWorkdir)
-                : root.appending(path: rawWorkdir, directoryHint: .isDirectory)
-        let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath()
-        guard resolved.path == root.path || resolved.path.hasPrefix(root.path + "/") else {
-            throw CocoaError(.fileReadNoPermission, userInfo: [
-                NSFilePathErrorKey: resolved.path,
-                NSLocalizedDescriptionKey: "\(resolved.path): escapes workspace",
-            ])
+    #if canImport(JustBash) && canImport(JustBashFS)
+    private static func runJustBashShell(
+        _ input: [String: Any],
+        outputHandler: (@Sendable (String) -> Void)?
+    ) async -> [String: Any] {
+        let started = Date()
+        let command = input["command"] as? String ?? input["cmd"] as? String ?? ""
+        guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return shellResponse(
+                exitCode: 64,
+                stdout: "",
+                stderr: "Missing command.\n",
+                started: started,
+                truncated: false
+            )
         }
 
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw CocoaError(.fileNoSuchFile, userInfo: [
-                NSFilePathErrorKey: resolved.path,
-                NSLocalizedDescriptionKey: "\(resolved.path): no such directory",
-            ])
+        let maxOutputBytes = shellOutputLimit(input)
+        let timeoutMilliseconds = max(1, intValue(input["timeout_ms"]) ?? 120_000)
+
+        let root: URL
+        let workdir: URL
+        do {
+            root = try shellWorkspaceRoot(input)
+            workdir = try shellWorkingDirectory(input)
+        } catch {
+            return shellResponse(
+                exitCode: 1,
+                stdout: "",
+                stderr: "\(error.localizedDescription)\n",
+                started: started,
+                truncated: false
+            )
         }
-        return resolved
+
+        let cwd = virtualShellWorkingDirectory(root: root, workdir: workdir)
+        let fileSystem = CodexJailedBashFileSystem(rootURL: root)
+        let executionLimits = ExecutionLimits(
+            maxInputLength: max(256_000, command.utf8.count + 1024),
+            maxTokenCount: 16_000,
+            maxCommandCount: 10_000,
+            maxOutputLength: max(1_048_576, maxOutputBytes * 2),
+            maxPipelineLength: 64,
+            maxCallDepth: 100,
+            maxLoopIterations: 10_000,
+            maxSubstitutionDepth: 50
+        )
+        let bash = Bash(options: BashOptions(
+            env: [
+                "HOME": "/",
+                "USER": "coder",
+                "LOGNAME": "coder",
+                "PWD": cwd,
+                "OLDPWD": cwd,
+                "TMPDIR": cwd,
+                "PATH": "/usr/bin:/bin",
+                "SHELL": "/bin/bash",
+                "TERM": "xterm-256color",
+                "LANG": "en_US.UTF-8",
+            ],
+            cwd: cwd,
+            executionLimits: executionLimits,
+            filesystem: fileSystem,
+            allowedURLPrefixes: []
+        ))
+
+        let outcome = await runJustBash(command: command, bash: bash, timeoutMilliseconds: timeoutMilliseconds)
+        let exitCode: Int
+        let rawStdout: String
+        let rawStderr: String
+        switch outcome {
+        case .completed(let result):
+            exitCode = result.exitCode
+            rawStdout = result.stdout
+            rawStderr = result.stderr
+        case .timedOut:
+            exitCode = 124
+            rawStdout = ""
+            rawStderr = "Command timed out after \(timeoutMilliseconds) ms.\n"
+        }
+
+        let stdout = limitedShellText(rawStdout, maxBytes: maxOutputBytes)
+        let stderr = limitedShellText(rawStderr, maxBytes: maxOutputBytes)
+        let response = shellResponse(
+            exitCode: exitCode,
+            stdout: stdout.text,
+            stderr: stderr.text,
+            started: started,
+            truncated: stdout.truncated || stderr.truncated
+        )
+        if let output = response["output"] as? String, !output.isEmpty {
+            outputHandler?(output)
+        }
+        return response
     }
 
-    private static func shellResponse(
-        exitCode: Int,
-        stdout: String,
-        stderr: String,
-        started: Date,
-        truncated: Bool
-    ) -> [String: Any] {
-        let output: String
-        if stderr.isEmpty {
-            output = stdout
-        } else if stdout.isEmpty {
-            output = stderr
-        } else {
-            output = stdout + stderr
-        }
-        return [
-            "exit_code": exitCode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "output": output,
-            "wall_time_seconds": Date().timeIntervalSince(started),
-            "truncated": truncated,
-        ]
+    private enum JustBashExecutionOutcome: Sendable {
+        case completed(ExecResult)
+        case timedOut
     }
 
-    private final class ShellOutputCollector: @unchecked Sendable {
-        private let maxBytes: Int
+    private final class JustBashExecutionRace: @unchecked Sendable {
         private let lock = NSLock()
-        private var data = Data()
-        private var truncated = false
+        private var continuation: CheckedContinuation<JustBashExecutionOutcome, Never>?
+        private var timeoutTask: Task<Void, Never>?
 
-        init(maxBytes: Int) {
-            self.maxBytes = maxBytes
+        init(_ continuation: CheckedContinuation<JustBashExecutionOutcome, Never>) {
+            self.continuation = continuation
         }
 
-        var wasTruncated: Bool {
+        func setTimeoutTask(_ task: Task<Void, Never>) {
+            let shouldCancel: Bool
             lock.lock()
-            defer { lock.unlock() }
-            return truncated
-        }
-
-        func append(_ chunk: Data) {
-            guard !chunk.isEmpty else {
-                return
+            if continuation == nil {
+                shouldCancel = true
+            } else {
+                timeoutTask = task
+                shouldCancel = false
             }
-            lock.lock()
-            defer { lock.unlock() }
-
-            let remaining = maxBytes - data.count
-            if remaining > 0 {
-                data.append(chunk.prefix(remaining))
-            }
-            if chunk.count > remaining {
-                truncated = true
-            }
-        }
-
-        func string() -> String {
-            lock.lock()
-            let snapshot = data
-            let wasTruncated = truncated
             lock.unlock()
 
-            var text = String(decoding: snapshot, as: UTF8.self)
-            if wasTruncated {
-                text += "\n[output truncated]\n"
+            if shouldCancel {
+                task.cancel()
             }
-            return text
+        }
+
+        func finish(_ outcome: JustBashExecutionOutcome) {
+            let continuationToResume: CheckedContinuation<JustBashExecutionOutcome, Never>?
+            let timeoutTaskToCancel: Task<Void, Never>?
+            lock.lock()
+            continuationToResume = continuation
+            continuation = nil
+            timeoutTaskToCancel = timeoutTask
+            timeoutTask = nil
+            lock.unlock()
+
+            timeoutTaskToCancel?.cancel()
+            continuationToResume?.resume(returning: outcome)
+        }
+    }
+
+    private static func runJustBash(
+        command: String,
+        bash: Bash,
+        timeoutMilliseconds: Int
+    ) async -> JustBashExecutionOutcome {
+        await withCheckedContinuation { continuation in
+            let race = JustBashExecutionRace(continuation)
+            let execTask = Task {
+                let result = await bash.exec(command)
+                race.finish(.completed(result))
+            }
+            let timeoutTask = Task {
+                let timeout = UInt64(min(timeoutMilliseconds, 3_600_000)) * 1_000_000
+                do {
+                    try await Task.sleep(nanoseconds: timeout)
+                } catch {
+                    return
+                }
+                execTask.cancel()
+                race.finish(.timedOut)
+            }
+            race.setTimeoutTask(timeoutTask)
+        }
+    }
+
+    private final class CodexJailedBashFileSystem: @unchecked Sendable, BashFilesystem {
+        private let rootURL: URL
+        private let rootPath: String
+        private let fileManager = FileManager.default
+        private let lock = NSLock()
+        private var commandStubs = Set<String>()
+
+        init(rootURL: URL) {
+            self.rootURL = rootURL.standardizedFileURL.resolvingSymlinksInPath()
+            self.rootPath = self.rootURL.path
+        }
+
+        func seedCommandStub(named name: String) {
+            lock.lock()
+            commandStubs.insert("/bin/\(name)")
+            commandStubs.insert("/usr/bin/\(name)")
+            lock.unlock()
+        }
+
+        func readFile(path: String, relativeTo: String) throws -> Data {
+            let normalized = normalizePath(path, relativeTo: relativeTo)
+            if isCommandStub(normalized) {
+                return Data()
+            }
+            let info = try fileInfo(path: normalized, relativeTo: "/")
+            guard info.kind != .directory else {
+                throw FilesystemError.isDirectory(normalized)
+            }
+            let url = try urlForExistingPath(normalized)
+            do {
+                return try Data(contentsOf: url)
+            } catch {
+                throw FilesystemError.ioError("cannot read \(normalized): \(error.localizedDescription)")
+            }
+        }
+
+        func writeFile(path: String, content: Data, relativeTo: String) throws {
+            let normalized = normalizePath(path, relativeTo: relativeTo)
+            guard !isCommandStub(normalized) else {
+                throw FilesystemError.permissionDenied(normalized)
+            }
+            if fileExists(path: normalized, relativeTo: "/") {
+                let info = try fileInfo(path: normalized, relativeTo: "/")
+                guard info.kind != .directory else {
+                    throw FilesystemError.isDirectory(normalized)
+                }
+                _ = try urlForExistingPath(normalized)
+            }
+            try ensureWritableParent(for: normalized)
+            let url = try url(forNormalizedPath: normalized)
+            do {
+                try content.write(to: url)
+            } catch {
+                throw FilesystemError.ioError("cannot write \(normalized): \(error.localizedDescription)")
+            }
+        }
+
+        func deleteFile(path: String, relativeTo: String, recursive: Bool, force: Bool) throws {
+            let normalized = normalizePath(path, relativeTo: relativeTo)
+            guard normalized != "/" else {
+                throw FilesystemError.invalidPath(normalized)
+            }
+            guard !isCommandStub(normalized) else {
+                throw FilesystemError.permissionDenied(normalized)
+            }
+            guard fileExists(path: normalized, relativeTo: "/") else {
+                if force {
+                    return
+                }
+                throw FilesystemError.notFound(normalized)
+            }
+            let info = try fileInfo(path: normalized, relativeTo: "/")
+            if info.kind == .directory && !recursive {
+                let entries = try listDirectory(path: normalized, relativeTo: "/")
+                if !entries.isEmpty {
+                    throw FilesystemError.directoryNotEmpty(normalized)
+                }
+            }
+            let url = try urlForExistingPath(normalized)
+            do {
+                try fileManager.removeItem(at: url)
+            } catch {
+                throw FilesystemError.ioError("cannot delete \(normalized): \(error.localizedDescription)")
+            }
+        }
+
+        func fileExists(path: String, relativeTo: String) -> Bool {
+            let normalized = normalizePath(path, relativeTo: relativeTo)
+            if isCommandStub(normalized) {
+                return true
+            }
+            guard let url = try? url(forNormalizedPath: normalized) else {
+                return false
+            }
+            guard fileManager.fileExists(atPath: url.path) else {
+                return false
+            }
+            return (try? ensureResolvedURLIsInsideJail(url, normalizedPath: normalized)) != nil
+        }
+
+        func isDirectory(path: String, relativeTo: String) -> Bool {
+            (try? fileInfo(path: path, relativeTo: relativeTo).kind) == .directory
+        }
+
+        func listDirectory(path: String, relativeTo: String) throws -> [String] {
+            let normalized = normalizePath(path, relativeTo: relativeTo)
+            let info = try fileInfo(path: normalized, relativeTo: "/")
+            guard info.kind == .directory else {
+                throw FilesystemError.notDirectory(normalized)
+            }
+            let url = try urlForExistingPath(normalized)
+            do {
+                return try fileManager.contentsOfDirectory(atPath: url.path).sorted()
+            } catch {
+                throw FilesystemError.ioError("cannot list \(normalized): \(error.localizedDescription)")
+            }
+        }
+
+        func createDirectory(path: String, relativeTo: String, recursive: Bool) throws {
+            let normalized = normalizePath(path, relativeTo: relativeTo)
+            guard normalized != "/" else {
+                return
+            }
+            if fileExists(path: normalized, relativeTo: "/") {
+                guard isDirectory(path: normalized, relativeTo: "/") else {
+                    throw FilesystemError.notDirectory(normalized)
+                }
+                return
+            }
+            if recursive {
+                try ensureNearestExistingAncestorIsInsideJail(for: normalized)
+            } else {
+                try ensureWritableParent(for: normalized)
+            }
+            let url = try url(forNormalizedPath: normalized)
+            do {
+                try fileManager.createDirectory(at: url, withIntermediateDirectories: recursive)
+            } catch {
+                throw FilesystemError.ioError("cannot create directory \(normalized): \(error.localizedDescription)")
+            }
+        }
+
+        func fileInfo(path: String, relativeTo: String) throws -> FileInfo {
+            let normalized = normalizePath(path, relativeTo: relativeTo)
+            if isCommandStub(normalized) {
+                return FileInfo(path: normalized, kind: .file, size: 0)
+            }
+            let url = try url(forNormalizedPath: normalized)
+            guard fileManager.fileExists(atPath: url.path) else {
+                throw FilesystemError.notFound(normalized)
+            }
+            _ = try ensureResolvedURLIsInsideJail(url, normalizedPath: normalized)
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey])
+            if values.isSymbolicLink == true {
+                let target = (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) ?? ""
+                return FileInfo(path: normalized, kind: .symlink, size: target.utf8.count)
+            }
+            if values.isDirectory == true {
+                let count = (try? fileManager.contentsOfDirectory(atPath: url.path).count) ?? 0
+                return FileInfo(path: normalized, kind: .directory, size: count)
+            }
+            return FileInfo(path: normalized, kind: .file, size: values.fileSize ?? 0)
+        }
+
+        func createSymlink(_ target: String, at path: String, relativeTo: String) throws {
+            let normalized = normalizePath(path, relativeTo: relativeTo)
+            guard !isCommandStub(normalized) else {
+                throw FilesystemError.permissionDenied(normalized)
+            }
+            try ensureWritableParent(for: normalized)
+            let url = try url(forNormalizedPath: normalized)
+            let hostTarget: String
+            if target.hasPrefix("/") {
+                hostTarget = try self.url(forNormalizedPath: normalizePath(target, relativeTo: "/")).path
+            } else {
+                hostTarget = target
+            }
+            do {
+                try fileManager.createSymbolicLink(atPath: url.path, withDestinationPath: hostTarget)
+            } catch {
+                throw FilesystemError.ioError("cannot create symlink \(normalized): \(error.localizedDescription)")
+            }
+        }
+
+        func readlink(_ path: String, relativeTo: String) throws -> String {
+            let normalized = normalizePath(path, relativeTo: relativeTo)
+            guard !isCommandStub(normalized) else {
+                throw FilesystemError.invalidPath(normalized)
+            }
+            let url = try url(forNormalizedPath: normalized)
+            guard fileManager.fileExists(atPath: url.path) else {
+                throw FilesystemError.notFound(normalized)
+            }
+            do {
+                let target = try fileManager.destinationOfSymbolicLink(atPath: url.path)
+                guard target.hasPrefix(rootPath + "/") || target == rootPath else {
+                    return target
+                }
+                let relative = target.dropFirst(rootPath.count).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                return relative.isEmpty ? "/" : "/\(relative)"
+            } catch {
+                throw FilesystemError.ioError("cannot readlink \(normalized): \(error.localizedDescription)")
+            }
+        }
+
+        func walk(path: String, relativeTo: String) throws -> [String] {
+            let normalized = normalizePath(path, relativeTo: relativeTo)
+            let info = try fileInfo(path: normalized, relativeTo: "/")
+            guard info.kind == .directory else {
+                return [normalized]
+            }
+            var result = [normalized]
+            for name in try listDirectory(path: normalized, relativeTo: "/") {
+                let child = normalized == "/" ? "/\(name)" : "\(normalized)/\(name)"
+                result.append(contentsOf: try walk(path: child, relativeTo: "/"))
+            }
+            return result
+        }
+
+        func normalizePath(_ path: String, relativeTo: String) -> String {
+            VirtualPath.normalize(path, relativeTo: relativeTo)
+        }
+
+        func glob(_ pattern: String, relativeTo: String, dotglob: Bool, extglob: Bool) -> [String] {
+            let normalizedPattern = VirtualPath.normalize(pattern, relativeTo: relativeTo)
+            let components = normalizedPattern.split(separator: "/").map(String.init)
+            guard !components.isEmpty else {
+                return fileExists(path: "/", relativeTo: "/") ? ["/"] : []
+            }
+
+            var results: [String] = []
+            func descend(path: String, remaining: ArraySlice<String>) {
+                guard let segment = remaining.first else {
+                    if fileExists(path: path, relativeTo: "/") {
+                        results.append(path)
+                    }
+                    return
+                }
+
+                guard isDirectory(path: path, relativeTo: "/") else {
+                    return
+                }
+
+                if !segment.contains("*") && !segment.contains("?") && !segment.contains("[") {
+                    let child = path == "/" ? "/\(segment)" : "\(path)/\(segment)"
+                    descend(path: child, remaining: remaining.dropFirst())
+                    return
+                }
+
+                guard let entries = try? listDirectory(path: path, relativeTo: "/") else {
+                    return
+                }
+                for name in entries {
+                    if !dotglob && !segment.hasPrefix(".") && name.hasPrefix(".") {
+                        continue
+                    }
+                    if VirtualFileSystem.globMatch(name: name, pattern: segment, extglob: extglob) {
+                        let child = path == "/" ? "/\(name)" : "\(path)/\(name)"
+                        descend(path: child, remaining: remaining.dropFirst())
+                    }
+                }
+            }
+
+            descend(path: "/", remaining: ArraySlice(components))
+            return Array(Set(results)).sorted()
+        }
+
+        private func isCommandStub(_ normalizedPath: String) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return commandStubs.contains(normalizedPath)
+        }
+
+        private func url(forNormalizedPath normalizedPath: String) throws -> URL {
+            let normalizedPath = VirtualPath.normalize(normalizedPath, relativeTo: "/")
+            let url = normalizedPath == "/"
+                ? rootURL
+                : rootURL.appendingPathComponent(String(normalizedPath.dropFirst()))
+            let standardized = url.standardizedFileURL
+            guard standardized.path == rootPath || standardized.path.hasPrefix(rootPath + "/") else {
+                throw FilesystemError.permissionDenied(normalizedPath)
+            }
+            return standardized
+        }
+
+        private func urlForExistingPath(_ normalizedPath: String) throws -> URL {
+            let url = try url(forNormalizedPath: normalizedPath)
+            _ = try ensureResolvedURLIsInsideJail(url, normalizedPath: normalizedPath)
+            return url
+        }
+
+        private func ensureResolvedURLIsInsideJail(_ url: URL, normalizedPath: String) throws -> URL {
+            let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+            guard resolved.path == rootPath || resolved.path.hasPrefix(rootPath + "/") else {
+                throw FilesystemError.permissionDenied(normalizedPath)
+            }
+            return resolved
+        }
+
+        private func ensureWritableParent(for normalizedPath: String) throws {
+            let parent = VirtualPath.dirname(normalizedPath)
+            guard isDirectory(path: parent, relativeTo: "/") else {
+                throw FilesystemError.notFound(parent)
+            }
+            let parentURL = try url(forNormalizedPath: parent)
+            _ = try ensureResolvedURLIsInsideJail(parentURL, normalizedPath: parent)
+        }
+
+        private func ensureNearestExistingAncestorIsInsideJail(for normalizedPath: String) throws {
+            var ancestor = VirtualPath.dirname(normalizedPath)
+            while ancestor != "/" && !fileExists(path: ancestor, relativeTo: "/") {
+                ancestor = VirtualPath.dirname(ancestor)
+            }
+            guard isDirectory(path: ancestor, relativeTo: "/") else {
+                throw FilesystemError.notDirectory(ancestor)
+            }
+            let ancestorURL = try url(forNormalizedPath: ancestor)
+            _ = try ensureResolvedURLIsInsideJail(ancestorURL, normalizedPath: ancestor)
         }
     }
     #endif

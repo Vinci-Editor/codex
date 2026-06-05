@@ -596,7 +596,7 @@ public actor CodexSession {
         case "search_files":
             return try executeSearchFiles(call)
         case "shell_command", "exec_command":
-            return try executeShell(call, progress: progress)
+            return try await executeShell(call, progress: progress)
         case "apply_patch":
             return try executeApplyPatch(call)
         case "write_file":
@@ -758,7 +758,7 @@ public actor CodexSession {
     private func executeShell(
         _ call: CodexToolCall,
         progress: CodexToolProgressHandler? = nil
-    ) throws -> CodexToolResult {
+    ) async throws -> CodexToolResult {
         let arguments = try Self.decodeArguments(call.arguments)
         let command = arguments["command"] as? String ?? arguments["cmd"] as? String ?? ""
         guard !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -768,7 +768,7 @@ public actor CodexSession {
             return CodexToolResult(output: "No workspace selected.", success: false)
         }
 
-        return try workspace.withSecurityScope { root in
+        return try await workspace.withSecurityScope { root in
             var input: [String: Any] = [
                 "workspaceRoot": root.path,
                 "command": command,
@@ -783,7 +783,7 @@ public actor CodexSession {
             if let timeoutMilliseconds = Self.intValue(arguments["timeout_ms"]) {
                 input["timeout_ms"] = timeoutMilliseconds
             }
-            let response = try CodexMobileCoreBridge.emulateShell(input) { delta in
+            let response = try await CodexMobileCoreBridge.emulateShell(input) { delta in
                 progress?(.outputDelta(delta))
             }
             let exitCode = Self.intValue(response["exit_code"]) ?? 1

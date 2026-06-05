@@ -9,10 +9,13 @@ let hasMobileCoreArtifact = FileManager.default.fileExists(
     atPath: packageDirectory.appending(path: artifactPath).path
 )
 
+let mobileCoreBridgeDependencies: [Target.Dependency] = (hasMobileCoreArtifact ? [.target(name: "CodexMobileCore")] : [])
+    + [.product(name: "JustBash", package: "just-bash-swift")]
+
 var targets: [Target] = [
     .target(
         name: "CodexMobileCoreBridge",
-        dependencies: hasMobileCoreArtifact ? ["CodexMobileCore"] : [],
+        dependencies: mobileCoreBridgeDependencies,
         path: "Sources/CodexMobileCoreBridge",
         linkerSettings: [
             .linkedFramework("SystemConfiguration", .when(platforms: [.iOS, .macOS])),
@@ -43,6 +46,9 @@ let package = Package(
     ],
     products: [
         .library(name: "CodexKit", targets: ["CodexKit"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/mweinbach/just-bash-swift.git", revision: "a750ab6df2582a1fd4044b8877a76b61800d9544"),
     ],
     targets: targets
 )

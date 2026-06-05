@@ -96,7 +96,7 @@ fn run_script(
     }
 
     let workspace = Workspace::new(workspace_root, workdir)?;
-    let runner = CommandRunner::new(workspace);
+    let mut runner = CommandRunner::new(workspace);
     let sequence = parse_script(script)?;
     let mut last = commands::CommandResult::success(String::new());
     let mut previous_op = SequenceOp::Always;
