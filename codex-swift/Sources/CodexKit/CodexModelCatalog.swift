@@ -24,6 +24,7 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
     public let isHidden: Bool
     public let isDefault: Bool
     public let supportsPersonality: Bool
+    public let usesResponsesLite: Bool
     public let inputModalities: [String]
 
     public init(
@@ -36,6 +37,7 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         isHidden: Bool = false,
         isDefault: Bool = false,
         supportsPersonality: Bool = false,
+        usesResponsesLite: Bool = false,
         inputModalities: [String] = ["text"]
     ) {
         self.id = id
@@ -47,7 +49,55 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         self.isHidden = isHidden
         self.isDefault = isDefault
         self.supportsPersonality = supportsPersonality
+        self.usesResponsesLite = usesResponsesLite
         self.inputModalities = inputModalities
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case model
+        case displayName
+        case description
+        case defaultReasoningEffort
+        case supportedReasoningEfforts
+        case isHidden
+        case isDefault
+        case supportsPersonality
+        case usesResponsesLite
+        case inputModalities
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.model = try container.decode(String.self, forKey: .model)
+        self.displayName = try container.decode(String.self, forKey: .displayName)
+        self.description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
+        self.defaultReasoningEffort = try container.decodeIfPresent(String.self, forKey: .defaultReasoningEffort)
+        self.supportedReasoningEfforts = try container.decodeIfPresent(
+            [CodexReasoningEffortOption].self,
+            forKey: .supportedReasoningEfforts
+        ) ?? []
+        self.isHidden = try container.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false
+        self.isDefault = try container.decodeIfPresent(Bool.self, forKey: .isDefault) ?? false
+        self.supportsPersonality = try container.decodeIfPresent(Bool.self, forKey: .supportsPersonality) ?? false
+        self.usesResponsesLite = try container.decodeIfPresent(Bool.self, forKey: .usesResponsesLite) ?? false
+        self.inputModalities = try container.decodeIfPresent([String].self, forKey: .inputModalities) ?? ["text"]
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(model, forKey: .model)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encode(description, forKey: .description)
+        try container.encodeIfPresent(defaultReasoningEffort, forKey: .defaultReasoningEffort)
+        try container.encode(supportedReasoningEfforts, forKey: .supportedReasoningEfforts)
+        try container.encode(isHidden, forKey: .isHidden)
+        try container.encode(isDefault, forKey: .isDefault)
+        try container.encode(supportsPersonality, forKey: .supportsPersonality)
+        try container.encode(usesResponsesLite, forKey: .usesResponsesLite)
+        try container.encode(inputModalities, forKey: .inputModalities)
     }
 
     public static func custom(id: String) -> CodexModelOption {
@@ -216,6 +266,7 @@ public final class CodexModelCatalog: @unchecked Sendable {
                     supportedReasoningEfforts: reasoningEfforts(model["supported_reasoning_levels"]),
                     isHidden: visibility != "list",
                     supportsPersonality: bool(model["supports_personality"]),
+                    usesResponsesLite: bool(model["use_responses_lite"]),
                     inputModalities: stringArray(model["input_modalities"], fallback: ["text"])
                 ),
                 priority: int(model["priority"])
@@ -252,6 +303,9 @@ public final class CodexModelCatalog: @unchecked Sendable {
             isHidden: bool(model["hidden"]),
             isDefault: bool(model["isDefault"]),
             supportsPersonality: bool(model["supportsPersonality"]),
+            usesResponsesLite: bool(model["usesResponsesLite"])
+                || bool(model["useResponsesLite"])
+                || bool(model["use_responses_lite"]),
             inputModalities: stringArray(model["inputModalities"], fallback: ["text"])
         )
     }
@@ -288,6 +342,7 @@ public final class CodexModelCatalog: @unchecked Sendable {
                 isHidden: option.isHidden,
                 isDefault: option.id == defaultID,
                 supportsPersonality: option.supportsPersonality,
+                usesResponsesLite: option.usesResponsesLite,
                 inputModalities: option.inputModalities
             )
         }

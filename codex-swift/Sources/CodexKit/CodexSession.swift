@@ -248,6 +248,7 @@ public actor CodexSession {
     private let toolsByName: [String: any CodexTool]
     private var subagents: [String: SubagentRecord] = [:]
     private var subagentSequence = 0
+    private var activeTurnOptions: CodexTurnOptions?
 
     public init(configuration: CodexSessionConfiguration) {
         self.configuration = configuration
@@ -334,6 +335,12 @@ public actor CodexSession {
         options: CodexTurnOptions?,
         continuation: AsyncThrowingStream<CodexStreamEvent, Error>.Continuation
     ) async throws {
+        let previousTurnOptions = activeTurnOptions
+        activeTurnOptions = options
+        defer {
+            activeTurnOptions = previousTurnOptions
+        }
+
         if let compactionResult = try await automaticCompactionIfNeeded(options: options) {
             continuation.yield(.contextCompacted(compactionResult))
         }
@@ -401,12 +408,6 @@ public actor CodexSession {
         from baseHistory: [[String: Any]],
         options: CodexTurnOptions?
     ) async throws -> String {
-        let reasoning: Any
-        if let reasoningEffort = options?.reasoningEffort {
-            reasoning = ["effort": reasoningEffort]
-        } else {
-            reasoning = NSNull()
-        }
         let compactionInput = requestInputHistory(from: baseHistory) + [
             Self.message(role: "user", textType: "input_text", text: Self.compactionSummaryPrompt)
         ]
@@ -417,7 +418,7 @@ public actor CodexSession {
             "tools": [],
             "stream": true,
             "store": false,
-            "reasoning": reasoning,
+            "reasoning": Self.reasoningParameter(options: options),
             "toolChoice": "none",
             "parallelToolCalls": false,
             "promptCacheKey": "\(conversationID)-compact",
@@ -502,16 +503,43 @@ public actor CodexSession {
         throw CodexSessionError.compactionUnavailable("Compaction stream closed before completion.")
     }
 
+    static func reasoningParameter(options: CodexTurnOptions?) -> Any {
+        var reasoning: [String: Any] = [:]
+        if let reasoningEffort = options?.reasoningEffort {
+            reasoning["effort"] = reasoningEffort
+        }
+        if options?.usesResponsesLite == true {
+            reasoning["context"] = "all_turns"
+        }
+        return reasoning.isEmpty ? NSNull() : reasoning
+    }
+
+    static func parallelToolCallsParameter(options: CodexTurnOptions?) -> Bool {
+        (options?.parallelToolCalls ?? true) && options?.usesResponsesLite != true
+    }
+
+    static func subagentTurnOptions(
+        arguments: [String: Any],
+        parentOptions: CodexTurnOptions?
+    ) -> CodexTurnOptions {
+        let modelOverride = arguments["model"] as? String
+        let inheritsParentModelMetadata = modelOverride == nil || modelOverride == parentOptions?.model
+        return CodexTurnOptions(
+            model: modelOverride ?? parentOptions?.model,
+            reasoningEffort: arguments["reasoning_effort"] as? String ?? parentOptions?.reasoningEffort,
+            serviceTier: arguments["service_tier"] as? String ?? parentOptions?.serviceTier,
+            toolChoice: parentOptions?.toolChoice,
+            parallelToolCalls: parentOptions?.parallelToolCalls,
+            usesResponsesLite: inheritsParentModelMetadata ? parentOptions?.usesResponsesLite ?? false : false,
+            inputModalities: parentOptions?.inputModalities,
+            webSearch: parentOptions?.webSearch
+        )
+    }
+
     private func streamOneRequest(
         options: CodexTurnOptions?,
         continuation: AsyncThrowingStream<CodexStreamEvent, Error>.Continuation
     ) async throws -> TurnStreamResult {
-        let reasoning: Any
-        if let reasoningEffort = options?.reasoningEffort {
-            reasoning = ["effort": reasoningEffort]
-        } else {
-            reasoning = NSNull()
-        }
         var input: [String: Any] = [
             "model": options?.model ?? configuration.model,
             "instructions": buildInstructions(),
@@ -519,9 +547,9 @@ public actor CodexSession {
             "tools": buildToolDefinitions(options: options),
             "stream": true,
             "store": false,
-            "reasoning": reasoning,
+            "reasoning": Self.reasoningParameter(options: options),
             "toolChoice": options?.toolChoice ?? "auto",
-            "parallelToolCalls": options?.parallelToolCalls ?? true,
+            "parallelToolCalls": Self.parallelToolCallsParameter(options: options),
             "promptCacheKey": conversationID,
             "metadata": ["codex_client": "CodexKit"],
         ]
@@ -1493,11 +1521,7 @@ public actor CodexSession {
         let id = "agent-\(subagentSequence)"
         let snapshot = try forkedSnapshot(forkTurns: arguments["fork_turns"] as? String)
         let child = CodexSession(configuration: configuration, snapshot: snapshot, agentPath: childPath)
-        let options = CodexTurnOptions(
-            model: arguments["model"] as? String,
-            reasoningEffort: arguments["reasoning_effort"] as? String,
-            serviceTier: arguments["service_tier"] as? String
-        )
+        let options = Self.subagentTurnOptions(arguments: arguments, parentOptions: activeTurnOptions)
 
         subagents[id] = SubagentRecord(
             id: id,

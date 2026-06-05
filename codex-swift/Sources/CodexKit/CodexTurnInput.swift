@@ -56,6 +56,7 @@ public struct CodexTurnOptions: Sendable, Equatable {
     public let serviceTier: String?
     public let toolChoice: String?
     public let parallelToolCalls: Bool?
+    public let usesResponsesLite: Bool
     public let inputModalities: [String]?
     public let webSearch: CodexWebSearchOptions?
 
@@ -65,6 +66,7 @@ public struct CodexTurnOptions: Sendable, Equatable {
         serviceTier: String? = nil,
         toolChoice: String? = nil,
         parallelToolCalls: Bool? = nil,
+        usesResponsesLite: Bool = false,
         inputModalities: [String]? = nil,
         webSearch: CodexWebSearchOptions? = nil
     ) {
@@ -73,6 +75,7 @@ public struct CodexTurnOptions: Sendable, Equatable {
         self.serviceTier = serviceTier
         self.toolChoice = toolChoice
         self.parallelToolCalls = parallelToolCalls
+        self.usesResponsesLite = usesResponsesLite
         self.inputModalities = inputModalities
         self.webSearch = webSearch
     }

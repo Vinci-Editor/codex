@@ -39,6 +39,7 @@ func modelCatalogDecodesCodexBackendModels() throws {
           ],
           "visibility": "list",
           "supported_in_api": true,
+          "use_responses_lite": true,
           "priority": 2,
           "input_modalities": ["text", "image"]
         }
@@ -52,7 +53,50 @@ func modelCatalogDecodesCodexBackendModels() throws {
     #expect(models[0].isDefault)
     #expect(models[0].defaultReasoningEffort == "medium")
     #expect(models[0].supportedReasoningEfforts.map(\.reasoningEffort) == ["low", "xhigh"])
+    #expect(models[0].usesResponsesLite)
     #expect(models[0].inputModalities == ["text", "image"])
+}
+
+@Test
+func modelCatalogDecodesAppServerResponsesLiteModels() throws {
+    let data = Data("""
+    {
+      "data": [
+        {
+          "id": "gpt-5.4",
+          "displayName": "GPT-5.4",
+          "supportedReasoningEfforts": [
+            {"reasoningEffort": "medium", "description": "Medium"}
+          ],
+          "usesResponsesLite": true,
+          "inputModalities": ["text", "image"]
+        }
+      ]
+    }
+    """.utf8)
+
+    let models = try CodexModelCatalog.decodeModelsResponse(data, provider: .openAI)
+
+    #expect(models.map(\.id) == ["gpt-5.4"])
+    #expect(models[0].usesResponsesLite)
+    #expect(models[0].inputModalities == ["text", "image"])
+}
+
+@Test
+func modelOptionDecodesOlderPersistedValuesWithoutResponsesLiteFlag() throws {
+    let data = Data("""
+    {
+      "id": "gpt-5.4",
+      "model": "gpt-5.4",
+      "displayName": "GPT-5.4",
+      "inputModalities": ["text"]
+    }
+    """.utf8)
+
+    let option = try JSONDecoder().decode(CodexModelOption.self, from: data)
+
+    #expect(option.usesResponsesLite == false)
+    #expect(option.inputModalities == ["text"])
 }
 
 @Test
@@ -490,6 +534,46 @@ func mobileBridgeBuildsTurnOptionsAndMultipartInput() throws {
     #expect((value?["reasoning"] as? [String: Any])?["effort"] as? String == "low")
     #expect(content?[0]["text"] as? String == "look")
     #expect(content?[1]["image_url"] as? String == "data:image/png;base64,AAEC")
+}
+
+@Test
+func sessionResponsesLiteTurnOptionsUsePersistentReasoningAndSerialTools() throws {
+    let options = CodexTurnOptions(
+        reasoningEffort: "medium",
+        parallelToolCalls: true,
+        usesResponsesLite: true
+    )
+    let reasoning = try #require(CodexSession.reasoningParameter(options: options) as? [String: Any])
+
+    #expect(reasoning["effort"] as? String == "medium")
+    #expect(reasoning["context"] as? String == "all_turns")
+    #expect(CodexSession.parallelToolCallsParameter(options: options) == false)
+}
+
+@Test
+func sessionDefaultTurnOptionsOmitResponsesLiteContext() throws {
+    #expect(CodexSession.reasoningParameter(options: CodexTurnOptions()) is NSNull)
+    #expect(CodexSession.parallelToolCallsParameter(options: CodexTurnOptions()) == true)
+}
+
+@Test
+func subagentTurnOptionsInheritResponsesLiteMetadataWithoutModelOverride() {
+    let parent = CodexTurnOptions(
+        model: "gpt-5.4",
+        reasoningEffort: "medium",
+        parallelToolCalls: true,
+        usesResponsesLite: true,
+        inputModalities: ["text", "image"]
+    )
+
+    let inherited = CodexSession.subagentTurnOptions(arguments: [:], parentOptions: parent)
+    let overridden = CodexSession.subagentTurnOptions(arguments: ["model": "local-model"], parentOptions: parent)
+
+    #expect(inherited.model == "gpt-5.4")
+    #expect(inherited.usesResponsesLite)
+    #expect(inherited.inputModalities == ["text", "image"])
+    #expect(overridden.model == "local-model")
+    #expect(overridden.usesResponsesLite == false)
 }
 
 @Test
