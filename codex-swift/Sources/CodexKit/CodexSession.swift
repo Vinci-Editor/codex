@@ -300,6 +300,7 @@ public actor CodexSession {
     private let agentPath: String
     private var history: [[String: Any]] = []
     private let toolsByName: [String: any CodexTool]
+    private let subagentRegistry: CodexSubagentRegistry
     private var subagents: [String: SubagentRecord] = [:]
     private var subagentSequence = 0
     private var subagentEventContinuations: [UUID: AsyncStream<CodexStreamEvent>.Continuation] = [:]
@@ -310,22 +311,30 @@ public actor CodexSession {
         self.configuration = configuration
         self.agentPath = "/root"
         self.toolsByName = Dictionary(uniqueKeysWithValues: configuration.tools.map { ($0.name, $0) })
+        self.subagentRegistry = CodexSubagentRegistry()
     }
 
     public init(configuration: CodexSessionConfiguration, snapshot: CodexSessionSnapshot?) {
         self.configuration = configuration
         self.agentPath = "/root"
         self.toolsByName = Dictionary(uniqueKeysWithValues: configuration.tools.map { ($0.name, $0) })
+        self.subagentRegistry = CodexSubagentRegistry()
         if let snapshot,
            let object = try? JSONSerialization.jsonObject(with: snapshot.historyJSON) as? [[String: Any]] {
             self.history = object
         }
     }
 
-    private init(configuration: CodexSessionConfiguration, snapshot: CodexSessionSnapshot?, agentPath: String) {
+    private init(
+        configuration: CodexSessionConfiguration,
+        snapshot: CodexSessionSnapshot?,
+        agentPath: String,
+        subagentRegistry: CodexSubagentRegistry
+    ) {
         self.configuration = configuration
         self.agentPath = agentPath
         self.toolsByName = Dictionary(uniqueKeysWithValues: configuration.tools.map { ($0.name, $0) })
+        self.subagentRegistry = subagentRegistry
         if let snapshot,
            let object = try? JSONSerialization.jsonObject(with: snapshot.historyJSON) as? [[String: Any]] {
             self.history = object
@@ -368,7 +377,23 @@ public actor CodexSession {
                 record.errorMessage = "cancelled"
             }
             subagents[id] = record
-            yieldSubagentStreamEvent(.subagentStatus(Self.subagentStatus(record)))
+            await emitSubagentStatus(Self.subagentStatus(record), to: nil)
+        }
+    }
+
+    private func closeSubagents() async {
+        for id in Array(subagents.keys) {
+            guard var record = subagents[id] else {
+                continue
+            }
+            await record.session.closeSubagents()
+            let previousStatus = record.status
+            record.task?.cancel()
+            record.task = nil
+            record.statusBeforeClose = previousStatus
+            record.status = .closed
+            subagents[id] = record
+            await emitSubagentStatus(Self.subagentStatus(record), to: nil)
         }
     }
 
@@ -396,6 +421,7 @@ public actor CodexSession {
         _ status: CodexSubagentStatus,
         to handler: CodexSubagentStatusHandler?
     ) async {
+        await subagentRegistry.update(status)
         if let handler {
             await handler(status)
         }
@@ -2205,8 +2231,8 @@ public actor CodexSession {
         guard !subagents.values.contains(where: { $0.path == childPath }) else {
             return CodexToolResult(output: "\(childPath): agent already exists.", success: false)
         }
-        let openAgents = subagents.values.filter { !$0.status.isClosed }.count
-        guard openAgents < configuration.subagentOptions.maxOpenAgents else {
+        let snapshot = try forkedSnapshot(forkTurns: arguments["fork_turns"] as? String)
+        guard let id = await subagentRegistry.reserveAgent(maxOpenAgents: configuration.subagentOptions.maxOpenAgents) else {
             return CodexToolResult(
                 output: "Subagent limit reached (\(configuration.subagentOptions.maxOpenAgents) open agents).",
                 success: false
@@ -2214,9 +2240,12 @@ public actor CodexSession {
         }
 
         subagentSequence += 1
-        let id = "agent-\(subagentSequence)"
-        let snapshot = try forkedSnapshot(forkTurns: arguments["fork_turns"] as? String)
-        let child = CodexSession(configuration: configuration, snapshot: snapshot, agentPath: childPath)
+        let child = CodexSession(
+            configuration: configuration,
+            snapshot: snapshot,
+            agentPath: childPath,
+            subagentRegistry: subagentRegistry
+        )
         let options = Self.subagentTurnOptions(arguments: arguments, parentOptions: activeTurnOptions)
 
         subagents[id] = SubagentRecord(
@@ -2344,8 +2373,7 @@ public actor CodexSession {
             return CodexToolResult(output: "\(target): agent not found.", success: false)
         }
         if record.status.isClosed {
-            let openAgents = subagents.values.filter { !$0.status.isClosed }.count
-            guard openAgents < configuration.subagentOptions.maxOpenAgents else {
+            guard await subagentRegistry.reserveAgent(id: id, maxOpenAgents: configuration.subagentOptions.maxOpenAgents) else {
                 return CodexToolResult(
                     output: "Subagent limit reached (\(configuration.subagentOptions.maxOpenAgents) open agents).",
                     success: false
@@ -2473,7 +2501,7 @@ public actor CodexSession {
             return CodexToolResult(output: "\(target): agent not found.", success: false)
         }
         let previousStatus = record.status
-        await record.session.cancelSubagents()
+        await record.session.closeSubagents()
         record.task?.cancel()
         record.task = nil
         record.statusBeforeClose = previousStatus
@@ -3215,6 +3243,40 @@ private enum SubagentStatus: String {
 
     var isClosed: Bool {
         self == .closed
+    }
+}
+
+private actor CodexSubagentRegistry {
+    private var sequence = 0
+    private var openAgentIDs: Set<String> = []
+
+    func reserveAgent(maxOpenAgents: Int) -> String? {
+        guard openAgentIDs.count < maxOpenAgents else {
+            return nil
+        }
+        sequence += 1
+        let id = "agent-\(sequence)"
+        openAgentIDs.insert(id)
+        return id
+    }
+
+    func reserveAgent(id: String, maxOpenAgents: Int) -> Bool {
+        if openAgentIDs.contains(id) {
+            return true
+        }
+        guard openAgentIDs.count < maxOpenAgents else {
+            return false
+        }
+        openAgentIDs.insert(id)
+        return true
+    }
+
+    func update(_ status: CodexSubagentStatus) {
+        if status.status == SubagentStatus.closed.rawValue {
+            openAgentIDs.remove(status.agentID)
+        } else {
+            openAgentIDs.insert(status.agentID)
+        }
     }
 }
 
