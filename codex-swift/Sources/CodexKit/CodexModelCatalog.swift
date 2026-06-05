@@ -208,7 +208,7 @@ public final class CodexModelCatalog: @unchecked Sendable {
 
     public static func fallbackModels(for provider: CodexProvider) -> [CodexModelOption] {
         switch provider.id {
-        case "openai":
+        case "openai", "openai-api":
             return [
                 CodexModelOption(
                     id: "gpt-5.5",

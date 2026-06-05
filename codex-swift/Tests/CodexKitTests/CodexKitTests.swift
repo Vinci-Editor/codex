@@ -182,9 +182,16 @@ func modelCatalogDecodesOpenAICompatibleModels() throws {
 @Test
 func modelCatalogFallbacksTrackBundledCodexDefaults() {
     let openAI = CodexModelCatalog.fallbackModels(for: .openAI)
+    let openAIAPI = CodexModelCatalog.fallbackModels(for: .custom(
+        id: "openai-api",
+        name: "OpenAI API",
+        baseURL: URL(string: "https://api.openai.com/v1")!,
+        authMode: .apiKey
+    ))
     let local = CodexModelCatalog.fallbackModels(for: .ollama())
 
     #expect(openAI.first?.id == "gpt-5.5")
+    #expect(openAIAPI.first?.id == "gpt-5.5")
     #expect(openAI.map(\.id).contains("gpt-5.3-codex"))
     #expect(openAI.first?.supportedReasoningEfforts.map(\.reasoningEffort) == ["low", "medium", "high", "xhigh"])
     #expect(openAI.first?.supportsReasoningSummaries == true)
