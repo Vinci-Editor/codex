@@ -14,6 +14,18 @@ public struct CodexReasoningEffortOption: Sendable, Codable, Equatable, Hashable
     }
 }
 
+public struct CodexServiceTierOption: Sendable, Codable, Equatable, Hashable, Identifiable {
+    public let id: String
+    public let name: String
+    public let description: String
+
+    public init(id: String, name: String, description: String = "") {
+        self.id = id
+        self.name = name
+        self.description = description
+    }
+}
+
 public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifiable {
     public let id: String
     public let model: String
@@ -26,6 +38,8 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
     public let supportsPersonality: Bool
     public let usesResponsesLite: Bool
     public let inputModalities: [String]
+    public let serviceTiers: [CodexServiceTierOption]
+    public let defaultServiceTier: String?
 
     public init(
         id: String,
@@ -38,7 +52,9 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         isDefault: Bool = false,
         supportsPersonality: Bool = false,
         usesResponsesLite: Bool = false,
-        inputModalities: [String] = ["text"]
+        inputModalities: [String] = ["text"],
+        serviceTiers: [CodexServiceTierOption] = [],
+        defaultServiceTier: String? = nil
     ) {
         self.id = id
         self.model = model
@@ -51,6 +67,8 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         self.supportsPersonality = supportsPersonality
         self.usesResponsesLite = usesResponsesLite
         self.inputModalities = inputModalities
+        self.serviceTiers = serviceTiers
+        self.defaultServiceTier = defaultServiceTier
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -65,6 +83,8 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         case supportsPersonality
         case usesResponsesLite
         case inputModalities
+        case serviceTiers
+        case defaultServiceTier
     }
 
     public init(from decoder: Decoder) throws {
@@ -83,6 +103,8 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         self.supportsPersonality = try container.decodeIfPresent(Bool.self, forKey: .supportsPersonality) ?? false
         self.usesResponsesLite = try container.decodeIfPresent(Bool.self, forKey: .usesResponsesLite) ?? false
         self.inputModalities = try container.decodeIfPresent([String].self, forKey: .inputModalities) ?? ["text"]
+        self.serviceTiers = try container.decodeIfPresent([CodexServiceTierOption].self, forKey: .serviceTiers) ?? []
+        self.defaultServiceTier = try container.decodeIfPresent(String.self, forKey: .defaultServiceTier)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -98,6 +120,8 @@ public struct CodexModelOption: Sendable, Codable, Equatable, Hashable, Identifi
         try container.encode(supportsPersonality, forKey: .supportsPersonality)
         try container.encode(usesResponsesLite, forKey: .usesResponsesLite)
         try container.encode(inputModalities, forKey: .inputModalities)
+        try container.encode(serviceTiers, forKey: .serviceTiers)
+        try container.encodeIfPresent(defaultServiceTier, forKey: .defaultServiceTier)
     }
 
     public static func custom(id: String) -> CodexModelOption {
@@ -267,7 +291,12 @@ public final class CodexModelCatalog: @unchecked Sendable {
                     isHidden: visibility != "list",
                     supportsPersonality: bool(model["supports_personality"]),
                     usesResponsesLite: bool(model["use_responses_lite"]),
-                    inputModalities: stringArray(model["input_modalities"], fallback: ["text"])
+                    inputModalities: stringArray(model["input_modalities"], fallback: ["text"]),
+                    serviceTiers: serviceTiers(
+                        model["service_tiers"],
+                        additionalSpeedTiers: stringArray(model["additional_speed_tiers"], fallback: [])
+                    ),
+                    defaultServiceTier: normalizedServiceTier(string(model["default_service_tier"]))
                 ),
                 priority: int(model["priority"])
             )
@@ -306,7 +335,17 @@ public final class CodexModelCatalog: @unchecked Sendable {
             usesResponsesLite: bool(model["usesResponsesLite"])
                 || bool(model["useResponsesLite"])
                 || bool(model["use_responses_lite"]),
-            inputModalities: stringArray(model["inputModalities"], fallback: ["text"])
+            inputModalities: stringArray(model["inputModalities"], fallback: ["text"]),
+            serviceTiers: serviceTiers(
+                model["serviceTiers"] ?? model["service_tiers"],
+                additionalSpeedTiers: stringArray(
+                    model["additionalSpeedTiers"] ?? model["additional_speed_tiers"],
+                    fallback: []
+                )
+            ),
+            defaultServiceTier: normalizedServiceTier(
+                string(model["defaultServiceTier"]) ?? string(model["default_service_tier"])
+            )
         )
     }
 
@@ -343,7 +382,9 @@ public final class CodexModelCatalog: @unchecked Sendable {
                 isDefault: option.id == defaultID,
                 supportsPersonality: option.supportsPersonality,
                 usesResponsesLite: option.usesResponsesLite,
-                inputModalities: option.inputModalities
+                inputModalities: option.inputModalities,
+                serviceTiers: option.serviceTiers,
+                defaultServiceTier: option.defaultServiceTier
             )
         }
     }
@@ -361,6 +402,65 @@ public final class CodexModelCatalog: @unchecked Sendable {
                 reasoningEffort: normalized,
                 description: string(item["description"]) ?? ""
             )
+        }
+    }
+
+    private static func serviceTiers(_ value: Any?, additionalSpeedTiers: [String]) -> [CodexServiceTierOption] {
+        var tiers: [CodexServiceTierOption] = []
+        if let values = value as? [[String: Any]] {
+            tiers = values.compactMap { item in
+                guard let id = normalizedServiceTier(string(item["id"])) else {
+                    return nil
+                }
+                return CodexServiceTierOption(
+                    id: id,
+                    name: string(item["name"]) ?? defaultServiceTierName(id),
+                    description: string(item["description"]) ?? ""
+                )
+            }
+        }
+
+        var seen = Set(tiers.map(\.id))
+        for speedTier in additionalSpeedTiers {
+            guard let id = normalizedServiceTier(speedTier),
+                  seen.insert(id).inserted else {
+                continue
+            }
+            tiers.append(CodexServiceTierOption(
+                id: id,
+                name: defaultServiceTierName(id),
+                description: ""
+            ))
+        }
+        return tiers
+    }
+
+    private static func normalizedServiceTier(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else {
+            return nil
+        }
+        let normalized = value.lowercased()
+        switch normalized {
+        case "fast":
+            return "priority"
+        default:
+            return normalized
+        }
+    }
+
+    private static func defaultServiceTierName(_ id: String) -> String {
+        switch id {
+        case "priority":
+            return "Priority"
+        case "flex":
+            return "Flex"
+        case "default":
+            return "Standard"
+        default:
+            return id
+                .split(separator: "_")
+                .map { $0.capitalized }
+                .joined(separator: " ")
         }
     }
 

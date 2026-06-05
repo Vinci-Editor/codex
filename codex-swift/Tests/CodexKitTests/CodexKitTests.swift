@@ -40,6 +40,10 @@ func modelCatalogDecodesCodexBackendModels() throws {
           "visibility": "list",
           "supported_in_api": true,
           "use_responses_lite": true,
+          "service_tiers": [
+            {"id": "priority", "name": "Priority", "description": "Faster"}
+          ],
+          "default_service_tier": "priority",
           "priority": 2,
           "input_modalities": ["text", "image"]
         }
@@ -55,6 +59,8 @@ func modelCatalogDecodesCodexBackendModels() throws {
     #expect(models[0].supportedReasoningEfforts.map(\.reasoningEffort) == ["low", "xhigh"])
     #expect(models[0].usesResponsesLite)
     #expect(models[0].inputModalities == ["text", "image"])
+    #expect(models[0].serviceTiers.map(\.id) == ["priority"])
+    #expect(models[0].defaultServiceTier == "priority")
 }
 
 @Test
@@ -69,6 +75,10 @@ func modelCatalogDecodesAppServerResponsesLiteModels() throws {
             {"reasoningEffort": "medium", "description": "Medium"}
           ],
           "usesResponsesLite": true,
+          "serviceTiers": [
+            {"id": "flex", "name": "Flex", "description": "Flexible throughput"}
+          ],
+          "defaultServiceTier": "flex",
           "inputModalities": ["text", "image"]
         }
       ]
@@ -80,6 +90,36 @@ func modelCatalogDecodesAppServerResponsesLiteModels() throws {
     #expect(models.map(\.id) == ["gpt-5.4"])
     #expect(models[0].usesResponsesLite)
     #expect(models[0].inputModalities == ["text", "image"])
+    #expect(models[0].serviceTiers.map(\.id) == ["flex"])
+    #expect(models[0].defaultServiceTier == "flex")
+}
+
+@Test
+func modelCatalogDecodesDeprecatedAdditionalSpeedTiers() throws {
+    let data = Data("""
+    {
+      "models": [
+        {
+          "slug": "gpt-5.4",
+          "display_name": "GPT-5.4",
+          "default_reasoning_level": "medium",
+          "supported_reasoning_levels": [],
+          "visibility": "list",
+          "supported_in_api": true,
+          "additional_speed_tiers": ["fast"],
+          "default_service_tier": "fast",
+          "priority": 1,
+          "input_modalities": ["text"]
+        }
+      ]
+    }
+    """.utf8)
+
+    let models = try CodexModelCatalog.decodeModelsResponse(data, provider: .openAI)
+
+    #expect(models[0].serviceTiers.map(\.id) == ["priority"])
+    #expect(models[0].serviceTiers[0].name == "Priority")
+    #expect(models[0].defaultServiceTier == "priority")
 }
 
 @Test
@@ -97,6 +137,8 @@ func modelOptionDecodesOlderPersistedValuesWithoutResponsesLiteFlag() throws {
 
     #expect(option.usesResponsesLite == false)
     #expect(option.inputModalities == ["text"])
+    #expect(option.serviceTiers.isEmpty)
+    #expect(option.defaultServiceTier == nil)
 }
 
 @Test
