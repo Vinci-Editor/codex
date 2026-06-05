@@ -178,6 +178,51 @@ func codexSessionDecodesWebSearchEvents() throws {
     #expect(call.detail == "'NavigationSplitView' in https://developer.apple.com/documentation/swiftui")
 }
 
+@Test
+func codexSessionBuildsCompactedHistoryFromUserMessagesAndSummary() throws {
+    let history: [[String: Any]] = [
+        [
+            "type": "message",
+            "role": "user",
+            "content": [["type": "input_text", "text": "Build a SwiftUI chat UI."]],
+        ],
+        [
+            "type": "message",
+            "role": "assistant",
+            "content": [["type": "output_text", "text": "Implemented the first pass."]],
+        ],
+        [
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "tool output",
+        ],
+        [
+            "type": "message",
+            "role": "user",
+            "content": [["type": "input_text", "text": "\(CodexSession.compactionSummaryPrefix)\nOld summary"]],
+        ],
+        [
+            "type": "message",
+            "role": "user",
+            "content": [["type": "input_text", "text": "Add context compaction."]],
+        ],
+    ]
+
+    let compacted = CodexSession.compactedHistory(summary: "Compaction summary.", from: history)
+    let texts = compacted.compactMap { item -> String? in
+        guard let content = item["content"] as? [Any],
+              let first = content.first as? [String: Any] else {
+            return nil
+        }
+        return first["text"] as? String
+    }
+
+    #expect(compacted.count == 3)
+    #expect(texts[0] == "Build a SwiftUI chat UI.")
+    #expect(texts[1] == "Add context compaction.")
+    #expect(texts[2] == "\(CodexSession.compactionSummaryPrefix)\nCompaction summary.")
+}
+
 #if os(macOS)
 @Test
 func mobileBridgeAppliesPatchWithoutMobileCoreOnMacOS() throws {

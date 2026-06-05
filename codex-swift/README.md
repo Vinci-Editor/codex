@@ -340,6 +340,23 @@ with the same prior user, assistant, tool-call, and tool-output items. Apps
 still own resumability policy for in-flight turns; do not assume an interrupted
 stream can be reconnected after app relaunch.
 
+Long-running conversations can compact their canonical Responses history before
+the next turn:
+
+```swift
+let result = try await session.compactHistory(options: CodexTurnOptions(
+    model: "gpt-5.4",
+    reasoningEffort: "low"
+))
+let snapshot = try await session.snapshot()
+```
+
+Compaction sends the existing history plus Codex's checkpoint prompt through the
+selected model with tools disabled, then replaces session history with bounded
+recent user prompts and the generated handoff summary. Persist the new snapshot
+after a successful compaction. `CodexCompactionResult` reports the summary and
+the before/after history item counts for host UI.
+
 ## Stream A Turn
 
 `submit(userText:)` returns an `AsyncThrowingStream<CodexStreamEvent, Error>`.
@@ -528,6 +545,8 @@ the model can recover from. Throw an error for unexpected app/runtime failures.
 - `unknownTool(String)`: the model requested a tool that is not registered.
 - `workspacePathError(String)`: a requested path is missing, invalid, or outside
   the workspace.
+- `compactionUnavailable(String)`: history compaction could not start or the
+  compaction stream ended without a usable summary.
 - `toolLoopLimitExceeded`: the model kept requesting tools beyond the session
   loop limit.
 

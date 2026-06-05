@@ -167,9 +167,36 @@ public struct CodexSessionSnapshot: Codable, Sendable, Equatable, Hashable {
     }
 }
 
+public struct CodexCompactionResult: Codable, Sendable, Equatable, Hashable {
+    public let summary: String
+    public let originalItemCount: Int
+    public let compactedItemCount: Int
+
+    public init(summary: String, originalItemCount: Int, compactedItemCount: Int) {
+        self.summary = summary
+        self.originalItemCount = originalItemCount
+        self.compactedItemCount = compactedItemCount
+    }
+}
+
 public actor CodexSession {
     private static let viewImageMaxBytes = 25 * 1024 * 1024
     private static let viewImageHighMaxPixelDimension = 2_048
+    static let compactionSummaryPrompt = """
+    You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
+
+    Include:
+    - Current progress and key decisions made
+    - Important context, constraints, or user preferences
+    - What remains to be done (clear next steps)
+    - Any critical data, examples, or references needed to continue
+
+    Be concise, structured, and focused on helping the next LLM seamlessly continue the work.
+    """
+    static let compactionSummaryPrefix = """
+    Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:
+    """
+    private static let compactUserMessageMaxApproxTokens = 20_000
 
     private let configuration: CodexSessionConfiguration
     private let conversationID = UUID().uuidString
@@ -212,6 +239,24 @@ public actor CodexSession {
     public func snapshot() throws -> CodexSessionSnapshot {
         let data = try JSONSerialization.data(withJSONObject: history, options: [.sortedKeys])
         return CodexSessionSnapshot(historyJSON: data)
+    }
+
+    public func compactHistory(options: CodexTurnOptions? = nil) async throws -> CodexCompactionResult {
+        guard !history.isEmpty else {
+            throw CodexSessionError.compactionUnavailable("No session history to compact.")
+        }
+
+        let originalHistory = history
+        let summary = try await requestCompactionSummary(from: originalHistory, options: options)
+        let normalizedSummary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalSummary = normalizedSummary.isEmpty ? "(no summary available)" : normalizedSummary
+        let compactedHistory = Self.compactedHistory(summary: finalSummary, from: originalHistory)
+        history = compactedHistory
+        return CodexCompactionResult(
+            summary: finalSummary,
+            originalItemCount: originalHistory.count,
+            compactedItemCount: compactedHistory.count
+        )
     }
 
     public func executeToolCall(_ call: CodexToolCall) async throws -> Data {
@@ -290,6 +335,111 @@ public actor CodexSession {
         }
 
         throw CodexSessionError.toolLoopLimitExceeded
+    }
+
+    private func requestCompactionSummary(
+        from baseHistory: [[String: Any]],
+        options: CodexTurnOptions?
+    ) async throws -> String {
+        let reasoning: Any
+        if let reasoningEffort = options?.reasoningEffort {
+            reasoning = ["effort": reasoningEffort]
+        } else {
+            reasoning = NSNull()
+        }
+        let compactionInput = baseHistory + [
+            Self.message(role: "user", textType: "input_text", text: Self.compactionSummaryPrompt)
+        ]
+        var input: [String: Any] = [
+            "model": options?.model ?? configuration.model,
+            "instructions": buildInstructions(),
+            "input": compactionInput,
+            "tools": [],
+            "stream": true,
+            "store": false,
+            "reasoning": reasoning,
+            "toolChoice": "none",
+            "parallelToolCalls": false,
+            "promptCacheKey": "\(conversationID)-compact",
+            "metadata": [
+                "codex_client": "CodexKit",
+                "request_kind": "compaction",
+            ],
+        ]
+        if let serviceTier = options?.serviceTier {
+            input["serviceTier"] = serviceTier
+        }
+        let body = try CodexMobileCoreBridge.buildResponsesRequest(input)
+        input.removeAll(keepingCapacity: false)
+
+        var request = URLRequest(url: configuration.provider.responsesURL())
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        for (key, value) in configuration.provider.defaultHeaders {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        try await CodexAuthorization.apply(
+            to: &request,
+            provider: configuration.provider,
+            authStore: configuration.authStore,
+            apiKeyStore: configuration.apiKeyStore,
+            chatGPTAuthenticator: configuration.chatGPTAuthenticator,
+            missingAuthentication: CodexSessionError.missingAuthentication
+        )
+        request.httpBody = body
+
+        var outputTextByItemID: [String: String] = [:]
+        var outputItemOrder: [String] = []
+        var fallbackText = ""
+        let (bytes, response) = try await configuration.urlSession.bytes(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let body = try await Self.errorBody(from: bytes)
+            throw CodexSessionError.httpStatus(http.statusCode, body)
+        }
+
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            guard line.hasPrefix("data: ") else {
+                continue
+            }
+            let payload = String(line.dropFirst("data: ".count))
+            let normalized = try CodexMobileCoreBridge.parseSSEEvent(Data(payload.utf8))
+            let event = try Self.decodeStreamEvent(normalized)
+            switch event {
+            case .outputTextDelta(let itemID, let delta):
+                guard !delta.isEmpty else {
+                    continue
+                }
+                if let itemID, !itemID.isEmpty {
+                    if outputTextByItemID[itemID] == nil {
+                        outputItemOrder.append(itemID)
+                        outputTextByItemID[itemID] = ""
+                    }
+                    outputTextByItemID[itemID, default: ""] += delta
+                } else {
+                    fallbackText += delta
+                }
+            case .outputItemCompleted(let item):
+                guard item.kind == .assistantMessage,
+                      let text = item.text,
+                      !text.isEmpty,
+                      outputTextByItemID[item.id, default: ""].isEmpty else {
+                    continue
+                }
+                outputItemOrder.append(item.id)
+                outputTextByItemID[item.id] = text
+            case .completed:
+                let joined = outputItemOrder.compactMap { outputTextByItemID[$0] }.joined(separator: "\n")
+                return (joined.isEmpty ? fallbackText : joined).trimmingCharacters(in: .whitespacesAndNewlines)
+            case .error(let message):
+                throw CodexSessionError.compactionUnavailable(message)
+            default:
+                break
+            }
+        }
+
+        throw CodexSessionError.compactionUnavailable("Compaction stream closed before completion.")
     }
 
     private func streamOneRequest(
@@ -1671,6 +1821,95 @@ public actor CodexSession {
         return String(decoding: data, as: UTF8.self)
     }
 
+    static func compactedHistory(summary: String, from history: [[String: Any]]) -> [[String: Any]] {
+        let userMessages = compactedUserMessages(from: history)
+        let selectedMessages = boundedCompactionUserMessages(userMessages)
+        var compacted = selectedMessages.map { message(role: "user", textType: "input_text", text: $0) }
+        compacted.append(message(role: "user", textType: "input_text", text: compactionSummaryText(summary)))
+        return compacted
+    }
+
+    private static func compactedUserMessages(from history: [[String: Any]]) -> [String] {
+        history.compactMap { item in
+            guard item["type"] as? String == "message",
+                  item["role"] as? String == "user",
+                  let content = item["content"] as? [Any] else {
+                return nil
+            }
+            let text = content.compactMap { rawPart -> String? in
+                guard let part = rawPart as? [String: Any] else {
+                    return nil
+                }
+                let type = part["type"] as? String
+                guard type == "input_text" || type == "text" else {
+                    return nil
+                }
+                return part["text"] as? String
+            }.joined(separator: "\n")
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !isCompactionSummaryMessage(trimmed) else {
+                return nil
+            }
+            return trimmed
+        }
+    }
+
+    private static func boundedCompactionUserMessages(_ messages: [String]) -> [String] {
+        var selected: [String] = []
+        var remaining = compactUserMessageMaxApproxTokens
+        for message in messages.reversed() {
+            guard remaining > 0 else {
+                break
+            }
+            let tokens = approximateTokenCount(message)
+            if tokens <= remaining {
+                selected.append(message)
+                remaining -= tokens
+            } else {
+                selected.append(truncated(message, approximateTokens: remaining))
+                break
+            }
+        }
+        return selected.reversed()
+    }
+
+    private static func compactionSummaryText(_ summary: String) -> String {
+        let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = trimmed.isEmpty ? "(no summary available)" : trimmed
+        if isCompactionSummaryMessage(body) {
+            return body
+        }
+        return "\(compactionSummaryPrefix)\n\(body)"
+    }
+
+    private static func isCompactionSummaryMessage(_ message: String) -> Bool {
+        message.hasPrefix("\(compactionSummaryPrefix)\n")
+    }
+
+    private static func approximateTokenCount(_ text: String) -> Int {
+        max((text.count + 3) / 4, 1)
+    }
+
+    private static func truncated(_ text: String, approximateTokens: Int) -> String {
+        let characterLimit = max(approximateTokens, 0) * 4
+        guard text.count > characterLimit else {
+            return text
+        }
+        guard characterLimit > 0 else {
+            return ""
+        }
+        let end = text.index(text.startIndex, offsetBy: characterLimit)
+        return String(text[..<end])
+    }
+
+    private static func message(role: String, textType: String, text: String) -> [String: Any] {
+        [
+            "type": "message",
+            "role": role,
+            "content": [["type": textType, "text": text]],
+        ]
+    }
+
     private static func resolveExistingWorkspaceURL(root: URL, rawPath: String) throws -> URL {
         try resolveWorkspaceURL(root: root, rawPath: rawPath, mustExist: true)
     }
@@ -1949,5 +2188,6 @@ public enum CodexSessionError: Error, Equatable {
     case httpStatus(Int, String)
     case unknownTool(String)
     case workspacePathError(String)
+    case compactionUnavailable(String)
     case toolLoopLimitExceeded
 }
