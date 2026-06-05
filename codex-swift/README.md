@@ -290,6 +290,29 @@ inherit the same configuration, workspace, registered tools, approval handler,
 and auth context. `fork_turns` can be `none`, `all`, or a positive integer
 string to control how much parent history is copied into the child session.
 
+## Thread Goals
+
+CodexKit includes Codex-compatible goal tools for host apps that want long-running
+objective tracking across turns. The app owns the current goal state by
+implementing `CodexGoalStore`, then registers the tool set on the session:
+
+```swift
+let goalStore: any CodexGoalStore = MyGoalStore(threadID: conversationID)
+
+let configuration = CodexSessionConfiguration(
+    provider: provider,
+    model: model,
+    workspace: workspace
+)
+.withAdditionalTools(CodexGoalTool.all(store: goalStore))
+```
+
+This exposes `get_goal`, `create_goal`, and `update_goal`. `create_goal` requires
+an explicit user request to start a concrete goal and can carry an optional
+positive token budget. `update_goal` only accepts `complete` or `blocked`; hosts
+should keep turn usage accounting in their store and only mark budget or usage
+limits from app-owned policy.
+
 ## Approve Mutating Tools
 
 `CodexKit` asks the host app for approval before running built-in tools that can

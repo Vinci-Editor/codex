@@ -84,6 +84,25 @@ public struct CodexSessionConfiguration: Sendable {
             toolApprovalHandler: handler
         )
     }
+
+    public func withAdditionalTools(_ additionalTools: [any CodexTool]) -> CodexSessionConfiguration {
+        CodexSessionConfiguration(
+            provider: provider,
+            model: model,
+            authStore: authStore,
+            apiKeyStore: apiKeyStore,
+            chatGPTAuthenticator: chatGPTAuthenticator,
+            workspace: workspace,
+            baseInstructionsOverride: baseInstructionsOverride,
+            additionalDeveloperInstructions: additionalDeveloperInstructions,
+            tools: tools + additionalTools,
+            subagentOptions: subagentOptions,
+            webSearch: webSearch,
+            compactionOptions: compactionOptions,
+            urlSession: urlSession,
+            toolApprovalHandler: toolApprovalHandler
+        )
+    }
 }
 
 public struct CodexOutputItem: Sendable, Equatable {
