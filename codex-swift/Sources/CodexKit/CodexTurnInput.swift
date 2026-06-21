@@ -84,6 +84,11 @@ public struct CodexTurnOptions: Sendable, Equatable {
     public let verbosity: CodexVerbosity?
     public let availableModelOptions: [CodexModelOption]
     public let webSearch: CodexWebSearchOptions?
+    /// Maximum number of model round-trips (tool-calling iterations) allowed in a
+    /// single turn. `nil` means unlimited — the turn runs until the model stops
+    /// requesting tools, matching the codex-rs reference behavior. A finite value
+    /// throws `CodexSessionError.toolLoopLimitExceeded` once reached.
+    public let maxToolIterations: Int?
 
     public init(
         model: String? = nil,
@@ -97,7 +102,8 @@ public struct CodexTurnOptions: Sendable, Equatable {
         inputModalities: [String]? = nil,
         verbosity: CodexVerbosity? = nil,
         availableModelOptions: [CodexModelOption] = [],
-        webSearch: CodexWebSearchOptions? = nil
+        webSearch: CodexWebSearchOptions? = nil,
+        maxToolIterations: Int? = nil
     ) {
         self.model = model
         self.reasoningEffort = reasoningEffort
@@ -111,6 +117,7 @@ public struct CodexTurnOptions: Sendable, Equatable {
         self.verbosity = verbosity
         self.availableModelOptions = availableModelOptions
         self.webSearch = webSearch
+        self.maxToolIterations = maxToolIterations
     }
 }
 

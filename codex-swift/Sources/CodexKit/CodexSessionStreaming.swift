@@ -20,17 +20,27 @@ extension CodexSession {
             activeTurnOptions = previousTurnOptions
         }
 
-        if let compactionResult = try await automaticCompactionIfNeeded(options: options) {
-            continuation.yield(.contextCompacted(compactionResult))
-        }
-
         history.append([
             "type": "message",
             "role": "user",
             "content": inputs.map(\.responsesContentPart),
         ])
 
-        for _ in 0..<8 {
+        // Run until the model stops requesting tools (matching the codex-rs
+        // reference loop). The only safety against runaway loops is token-based
+        // auto-compaction, re-checked each iteration. An optional
+        // `maxToolIterations` lets the caller impose a hard cap; `nil` = unlimited.
+        var iteration = 0
+        while true {
+            if let cap = options?.maxToolIterations, iteration >= cap {
+                throw CodexSessionError.toolLoopLimitExceeded
+            }
+            iteration += 1
+
+            if let compactionResult = try await automaticCompactionIfNeeded(options: options) {
+                continuation.yield(.contextCompacted(compactionResult))
+            }
+
             let result = try await streamOneRequest(options: options, continuation: continuation)
             for item in result.assistantTextItems where !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 history.append([
@@ -65,8 +75,6 @@ extension CodexSession {
                 continuation.yield(.toolResult(call, toolResult.output, toolResult.success))
             }
         }
-
-        throw CodexSessionError.toolLoopLimitExceeded
     }
 
 
@@ -128,7 +136,8 @@ extension CodexSession {
             inputModalities: inheritsParentModelMetadata ? parentOptions?.inputModalities : nil,
             verbosity: inheritsParentModelMetadata ? parentOptions?.verbosity : nil,
             availableModelOptions: parentOptions?.availableModelOptions ?? [],
-            webSearch: parentOptions?.webSearch
+            webSearch: parentOptions?.webSearch,
+            maxToolIterations: parentOptions?.maxToolIterations
         )
     }
 
