@@ -1,6 +1,6 @@
 # CodexMobileDemo
 
-Minimal iOS 26 demo app source for embedding `CodexKit`.
+Minimal iOS 27 demo app source for embedding `CodexKit`.
 
 This folder intentionally keeps the app narrow:
 

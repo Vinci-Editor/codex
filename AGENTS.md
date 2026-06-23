@@ -1,6 +1,6 @@
 # Fork Focus: Swift Integration
 
-This fork is focused on making Codex embeddable from Swift for iOS 26 and macOS 26.
+This fork is focused on making Codex embeddable from Swift for iOS 27 and macOS 27.
 Treat `codex-swift/` and `codex-rs/mobile-core/` as first-class project areas, not
 experimental throwaway code.
 

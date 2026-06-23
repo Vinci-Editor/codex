@@ -1,7 +1,7 @@
 # CodexKit
 
 `CodexKit` is a Swift package for embedding the Codex agent harness in an
-iOS 26 or macOS 26 app. It gives an app a Swift-native session API while keeping
+iOS 27 or macOS 27 app. It gives an app a Swift-native session API while keeping
 Codex request JSON, event normalization, auth helpers, provider defaults, and
 the iOS-safe tool engine in Rust.
 
@@ -689,7 +689,7 @@ It demonstrates:
 
 ## Current Limits
 
-- The Swift package expects iOS 26 and macOS 26.
+- The Swift package expects iOS 27 and macOS 27.
 - `CodexKit` does not include a full app product, background agent, or TUI.
 - The iOS shell backend is an emulator. It does not run arbitrary binaries.
 - The macOS shell backend runs `/bin/zsh -lc` with the working directory kept

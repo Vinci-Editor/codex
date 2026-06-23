@@ -1,4 +1,4 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 6.4
 
 import Foundation
 import PackageDescription
@@ -44,8 +44,8 @@ if hasMobileCoreArtifact {
 let package = Package(
     name: "codex-swift",
     platforms: [
-        .iOS("26.0"),
-        .macOS("26.0"),
+        .iOS(.v27),
+        .macOS(.v27),
     ],
     products: [
         .library(name: "CodexKit", targets: ["CodexKit"]),

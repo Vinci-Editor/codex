@@ -72,7 +72,7 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 
 This fork also contains [`codex-swift/`](./codex-swift) and
 [`codex-rs/mobile-core`](./codex-rs/mobile-core) for embedding Codex from Swift
-on iOS 26 and macOS 26.
+on iOS 27 and macOS 27.
 
 Credit: the mobile architecture and several Codex iOS portability patches were
 informed by [dnakov/litter](https://github.com/dnakov/litter), a native mobile

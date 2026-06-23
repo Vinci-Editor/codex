@@ -2,7 +2,7 @@ name: CodexMobileDemo
 options:
   minimumXcodeGenVersion: 2.45.0
   deploymentTarget:
-    iOS: "26.0"
+    iOS: "27.0"
 packages:
   CodexSwift:
     path: ../..
@@ -10,7 +10,7 @@ targets:
   CodexMobileDemo:
     type: application
     platform: iOS
-    deploymentTarget: "26.0"
+    deploymentTarget: "27.0"
     sources:
       - path: CodexMobileDemo
     info:
